@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from tiny_coder.file_agent import (
         AgentContext,
         LlmCallOutcome,
+        SyncAgentResult,
         _LlmCall,
     )
 
@@ -52,6 +53,7 @@ def resolve_agent_file_path(root: Path, path: Path) -> Path:
 _SystemPromptProvider: TypeAlias = str | Callable[["AgentContext"], str]
 _TemplateVars: TypeAlias = Mapping[str, Any] | Callable[["AgentContext", str], Mapping[str, Any]]
 UserTemplateVars: TypeAlias = Mapping[str, Any] | Callable[["AgentContext"], Mapping[str, Any]]
+_ResultHandlerCallback: TypeAlias = Callable[["AgentContext", "SyncAgentResult"], Awaitable[None]]
 _SessionTurnT = TypeVar("_SessionTurnT", bound=Mapping[str, Any])
 
 
@@ -115,6 +117,21 @@ class LlmSessionTurnPlugin(Generic[_SessionTurnT]):
         self.target_path.parent.mkdir(parents=True, exist_ok=True)
         with self.target_path.open("a", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(dict(turn), ensure_ascii=False) + "\n")
+
+
+@dataclass
+class ResultHandlerPlugin:
+    """Register a callback that handles each successfully written agent result."""
+
+    handler: _ResultHandlerCallback
+
+    def on_registered(self, context: AgentContext) -> None:
+        """Bind the shared agent context and register the runtime handler."""
+
+        async def handle_result(result: SyncAgentResult) -> None:
+            await self.handler(context, result)
+
+        context.result_handlers.append(handle_result)
 
 
 class DynamicOutputPathsPlugin:
@@ -549,6 +566,7 @@ __all__ = [
     "JsonFieldStreamLlmCallPlugin",
     "LabeledFileMapWriterPlugin",
     "ResponseOutputTypePlugin",
+    "ResultHandlerPlugin",
     "RetryPlugin",
     "resolve_agent_file_path",
     "LlmSessionTurnPlugin",

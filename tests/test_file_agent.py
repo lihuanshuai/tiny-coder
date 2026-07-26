@@ -16,6 +16,7 @@ from tiny_coder.file_agent import (
     AgentContext,
     BasicFileAgent,
     LlmCallOutcome,
+    SyncAgentResult,
     _agent_input_snapshots,
     _parse_structured_sync_output,
     content_to_yaml_text,
@@ -30,6 +31,7 @@ from tiny_coder.plugins import (
     LabeledFileMapWriterPlugin,
     LlmSessionTurnPlugin,
     ResponseOutputTypePlugin,
+    ResultHandlerPlugin,
     RetryPlugin,
     SilentLlmCallPlugin,
     StaticInputPathsPlugin,
@@ -384,6 +386,24 @@ def test_llm_session_turn_plugin_appends_call(
     assert [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()] == [
         {"cwd": workspace_tmp_path.name, "text": "原始响应"},
     ]
+
+
+def test_result_handler_plugin_registers_context_callback(workspace_tmp_path: Path) -> None:
+    received: list[tuple[AgentContext, SyncAgentResult]] = []
+
+    async def handle_result(context: AgentContext, result: SyncAgentResult) -> None:
+        received.append((context, result))
+
+    agent = BasicFileAgent(
+        cwd=workspace_tmp_path,
+        llm_config=SampleLlmConfig(),
+        plugins=[ResultHandlerPlugin(handle_result)],
+    )
+    result = SyncAgentResult(summary="done", written_paths=[workspace_tmp_path / "output.txt"])
+
+    asyncio.run(agent.context.result_handlers[0](result))
+
+    assert received == [(agent.context, result)]
 
 
 def test_json_field_stream_llm_call_registers_wrapped_call(
