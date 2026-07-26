@@ -1,0 +1,37 @@
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+  - id: check-case-conflict
+  - id: check-merge-conflict
+  - id: check-yaml
+  - id: check-toml
+  - id: check-json
+  - id: end-of-file-fixer
+  - id: trailing-whitespace
+  - id: detect-private-key
+
+- repo: local
+  hooks:
+  - id: ruff-check
+    name: ruff check
+    entry: python -m ruff check --fix --unsafe-fixes
+    language: system
+    types_or: [python, pyi]
+  - id: ruff-format
+    name: ruff format
+    entry: python -m ruff format
+    language: system
+    types_or: [python, pyi]
+  - id: mypy
+    name: mypy
+    entry: python -m mypy
+    language: system
+    files: ^(src|tests)/.*\.py$
+  - id: pytest
+    name: pytest
+    entry: python -m pytest
+    args: [tests]
+    language: system
+    files: ^(src|tests)/.*\.py$
+    always_run: true
