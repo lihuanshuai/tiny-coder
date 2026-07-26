@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, TypedDict, TypeVar, cast
@@ -55,7 +55,9 @@ class SyncAgentResult:
     written_paths: list[Path]
 
 
-_ResultHandler: TypeAlias = Callable[[SyncAgentResult], Coroutine[Any, Any, None]]
+_BeforeRunCallback: TypeAlias = Callable[["AgentContext"], Awaitable[None]]
+_LlmOutputResultHook: TypeAlias = Callable[[SyncAgentResult], Coroutine[Any, Any, None]]
+_AfterRunHook: TypeAlias = Callable[[SyncAgentResult], Coroutine[Any, Any, None]]
 _AfterLlmCallCallback: TypeAlias = Callable[
     ["AgentContext", "LlmCallOutcome"], Coroutine[Any, Any, None]
 ]
@@ -84,13 +86,15 @@ class AgentContext:
     llm_call_user_prompt: str = ""
     input_paths: list[Path] = field(default_factory=list)
     output_paths: list[Path] = field(default_factory=list)
+    before_run_hooks: list[_BeforeRunCallback] = field(default_factory=list)
+    after_run_hooks: list[_AfterRunHook] = field(default_factory=list)
     system_prompt_hooks: list[_SystemPromptCallback] = field(default_factory=list)
     user_prompt_hooks: list[_UserPromptCallback] = field(default_factory=list)
     after_llm_call_hooks: list[_AfterLlmCallCallback] = field(default_factory=list)
     llm_response_output_type: type[BaseModel] | None = None
     llm_response_output: BaseModel | None = None
     output_writer: _OutputWriterCallback | None = None
-    result_handlers: list[_ResultHandler] = field(default_factory=list)
+    llm_output_result_hooks: list[_LlmOutputResultHook] = field(default_factory=list)
     allow_overwrite_existing_paths: bool = True
     clean_up_paths: list[Path] = field(default_factory=list)
     extras: dict[str, Any] = field(default_factory=dict)
@@ -343,8 +347,13 @@ class BasicFileAgent:
     async def run(self) -> SyncAgentResult:
         """Run this agent through the single no-argument entrypoint."""
         self._clean_up_files()
+        for before_run_hook in self.context.before_run_hooks:
+            await before_run_hook(self.context)
         self._guard_existing_output_paths()
-        return await self.call_llm_and_apply_output_with_retries()
+        result = await self.call_llm_and_apply_output_with_retries()
+        for after_run_hook in self.context.after_run_hooks:
+            await after_run_hook(result)
+        return result
 
     async def call_llm_and_apply_output(
         self,
@@ -390,8 +399,8 @@ class BasicFileAgent:
                     system_prompt=resolved_system_prompt,
                     user_prompt=user_prompt,
                 )
-                for handler in self.context.result_handlers:
-                    await handler(result)
+                for output_result_hook in self.context.llm_output_result_hooks:
+                    await output_result_hook(result)
             except (ValueError, OSError) as e:
                 error_text = str(e)
                 retry_errors.append(error_text)

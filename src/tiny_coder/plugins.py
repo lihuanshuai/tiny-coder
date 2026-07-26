@@ -53,7 +53,9 @@ def resolve_agent_file_path(root: Path, path: Path) -> Path:
 _SystemPromptProvider: TypeAlias = str | Callable[["AgentContext"], str]
 _TemplateVars: TypeAlias = Mapping[str, Any] | Callable[["AgentContext", str], Mapping[str, Any]]
 UserTemplateVars: TypeAlias = Mapping[str, Any] | Callable[["AgentContext"], Mapping[str, Any]]
-_ResultHandlerCallback: TypeAlias = Callable[["AgentContext", "SyncAgentResult"], Awaitable[None]]
+_BeforeRunCallback: TypeAlias = Callable[["AgentContext"], Awaitable[None]]
+_LlmOutputResultCallback: TypeAlias = Callable[["AgentContext", "SyncAgentResult"], Awaitable[None]]
+_AfterRunCallback: TypeAlias = Callable[["AgentContext", "SyncAgentResult"], Awaitable[None]]
 _SessionTurnT = TypeVar("_SessionTurnT", bound=Mapping[str, Any])
 
 
@@ -120,18 +122,44 @@ class LlmSessionTurnPlugin(Generic[_SessionTurnT]):
 
 
 @dataclass
-class ResultHandlerPlugin:
-    """Register a callback that handles each successfully written agent result."""
+class BeforeRunPlugin:
+    """Register an asynchronous callback that prepares one agent run."""
 
-    handler: _ResultHandlerCallback
+    handler: _BeforeRunCallback
 
     def on_registered(self, context: AgentContext) -> None:
-        """Bind the shared agent context and register the runtime handler."""
+        """Append the callback to the shared run-preparation hooks."""
+        context.before_run_hooks.append(self.handler)
 
-        async def handle_result(result: SyncAgentResult) -> None:
+
+@dataclass
+class LlmOutputResultPlugin:
+    """Inspect one parsed and written LLM output inside the retry loop."""
+
+    handler: _LlmOutputResultCallback
+
+    def on_registered(self, context: AgentContext) -> None:
+        """Bind the context and register the output-result hook."""
+
+        async def handle_output_result(result: SyncAgentResult) -> None:
             await self.handler(context, result)
 
-        context.result_handlers.append(handle_result)
+        context.llm_output_result_hooks.append(handle_output_result)
+
+
+@dataclass
+class AfterRunPlugin:
+    """Run a callback after the retrying agent run succeeds."""
+
+    handler: _AfterRunCallback
+
+    def on_registered(self, context: AgentContext) -> None:
+        """Bind the context and register the post-run hook."""
+
+        async def after_run(result: SyncAgentResult) -> None:
+            await self.handler(context, result)
+
+        context.after_run_hooks.append(after_run)
 
 
 class DynamicOutputPathsPlugin:
@@ -559,14 +587,16 @@ def _write_text_file(path: Path, content: str) -> Path:
 
 
 __all__ = [
+    "AfterRunPlugin",
+    "BeforeRunPlugin",
     "DynamicOutputPathsPlugin",
     "ExistingPathGuardPlugin",
     "FileCleanupPlugin",
     "FileTreeInputPathsPlugin",
     "JsonFieldStreamLlmCallPlugin",
     "LabeledFileMapWriterPlugin",
+    "LlmOutputResultPlugin",
     "ResponseOutputTypePlugin",
-    "ResultHandlerPlugin",
     "RetryPlugin",
     "resolve_agent_file_path",
     "LlmSessionTurnPlugin",

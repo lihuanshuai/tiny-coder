@@ -23,15 +23,17 @@ from tiny_coder.file_agent import (
     read_agent_file,
 )
 from tiny_coder.plugins import (
+    AfterRunPlugin,
+    BeforeRunPlugin,
     DynamicOutputPathsPlugin,
     ExistingPathGuardPlugin,
     FileCleanupPlugin,
     FileTreeInputPathsPlugin,
     JsonFieldStreamLlmCallPlugin,
     LabeledFileMapWriterPlugin,
+    LlmOutputResultPlugin,
     LlmSessionTurnPlugin,
     ResponseOutputTypePlugin,
-    ResultHandlerPlugin,
     RetryPlugin,
     SilentLlmCallPlugin,
     StaticInputPathsPlugin,
@@ -388,7 +390,7 @@ def test_llm_session_turn_plugin_appends_call(
     ]
 
 
-def test_result_handler_plugin_registers_context_callback(workspace_tmp_path: Path) -> None:
+def test_llm_output_result_plugin_registers_context_callback(workspace_tmp_path: Path) -> None:
     received: list[tuple[AgentContext, SyncAgentResult]] = []
 
     async def handle_result(context: AgentContext, result: SyncAgentResult) -> None:
@@ -397,13 +399,83 @@ def test_result_handler_plugin_registers_context_callback(workspace_tmp_path: Pa
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[ResultHandlerPlugin(handle_result)],
+        plugins=[LlmOutputResultPlugin(handle_result)],
     )
     result = SyncAgentResult(summary="done", written_paths=[workspace_tmp_path / "output.txt"])
 
-    asyncio.run(agent.context.result_handlers[0](result))
+    asyncio.run(agent.context.llm_output_result_hooks[0](result))
 
     assert received == [(agent.context, result)]
+
+
+def test_before_run_plugin_prepares_after_cleanup(
+    workspace_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = workspace_tmp_path / "context.md"
+    input_path.write_text("stale\n", encoding="utf-8", newline="\n")
+    events: list[str] = []
+
+    async def prepare(context: AgentContext) -> None:
+        assert not input_path.exists()
+        input_path.write_text(context.cwd.name, encoding="utf-8", newline="\n")
+        events.append("prepare")
+
+    async def finish(context: AgentContext, result: SyncAgentResult) -> None:
+        assert context.cwd == workspace_tmp_path
+        assert result.summary == "done"
+        events.append("after")
+
+    agent = BasicFileAgent(
+        cwd=workspace_tmp_path,
+        llm_config=SampleLlmConfig(),
+        plugins=[
+            FileCleanupPlugin([input_path]),
+            BeforeRunPlugin(prepare),
+            AfterRunPlugin(finish),
+        ],
+    )
+    expected = SyncAgentResult(summary="done", written_paths=[])
+
+    async def run_agent() -> SyncAgentResult:
+        events.append("run")
+        return expected
+
+    monkeypatch.setattr(agent, "call_llm_and_apply_output_with_retries", run_agent)
+
+    result = asyncio.run(agent.run())
+
+    assert result is expected
+    assert events == ["prepare", "run", "after"]
+    assert input_path.read_text(encoding="utf-8") == workspace_tmp_path.name
+
+
+def test_after_run_plugin_failure_does_not_retry_agent(
+    workspace_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def fail_after_run(_context: AgentContext, _result: SyncAgentResult) -> None:
+        raise ValueError("post-run failure")
+
+    agent = BasicFileAgent(
+        cwd=workspace_tmp_path,
+        llm_config=SampleLlmConfig(),
+        plugins=[AfterRunPlugin(fail_after_run)],
+    )
+
+    async def run_agent() -> SyncAgentResult:
+        nonlocal calls
+        calls += 1
+        return SyncAgentResult(summary="done", written_paths=[])
+
+    monkeypatch.setattr(agent, "call_llm_and_apply_output_with_retries", run_agent)
+
+    with pytest.raises(ValueError, match="post-run failure"):
+        asyncio.run(agent.run())
+
+    assert calls == 1
 
 
 def test_json_field_stream_llm_call_registers_wrapped_call(
