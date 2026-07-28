@@ -4,6 +4,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Protocol
+from unicodedata import category, normalize
 
 _FUZZY_MIN_RATIO = 0.82
 _FUZZY_MIN_MARGIN = 0.05
@@ -38,8 +39,35 @@ def _normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _canonical_for_fuzzy_match(text: str) -> str:
-    return " ".join(_normalize_newlines(text).strip().split())
+def _canonical_for_fuzzy_match(
+    text: str,
+    *,
+    ignore_punctuation_and_symbols: bool,
+) -> str:
+    normalized = normalize("NFKC", _normalize_newlines(text))
+    if not ignore_punctuation_and_symbols:
+        return " ".join(normalized.strip().split())
+    return "".join(
+        char for char in normalized if not char.isspace() and category(char)[0] not in {"P", "S"}
+    )
+
+
+def _unique_canonical_span(
+    spans: list[tuple[int, int]],
+    *,
+    index: int,
+) -> tuple[int, int]:
+    minimal_spans = [
+        span
+        for span in spans
+        if not any(other != span and span[0] <= other[0] and other[1] <= span[1] for other in spans)
+    ]
+    if len(minimal_spans) > 1:
+        raise TextReplacementApplyError(
+            f"replacement {index} normalized from_text matched multiple locations; "
+            "refusing to apply"
+        )
+    return minimal_spans[0]
 
 
 def _line_windows(text: str, from_text: str) -> Iterator[tuple[int, int, str]]:
@@ -67,14 +95,25 @@ def _line_windows(text: str, from_text: str) -> Iterator[tuple[int, int, str]]:
             yield start, end, text[start:end]
 
 
-def _best_fuzzy_span(text: str, from_text: str, index: int) -> tuple[int, int]:
-    query = _canonical_for_fuzzy_match(from_text)
+def _best_fuzzy_span(
+    text: str,
+    from_text: str,
+    index: int,
+    *,
+    ignore_punctuation_and_symbols: bool,
+) -> tuple[int, int]:
+    query = _canonical_for_fuzzy_match(
+        from_text,
+        ignore_punctuation_and_symbols=ignore_punctuation_and_symbols,
+    )
     if len(query) < _FUZZY_MIN_CHARS:
         raise TextReplacementApplyError(
             f"replacement {index} from_text was not found; fuzzy fallback requires at least "
-            f"{_FUZZY_MIN_CHARS} non-whitespace characters"
+            f"{_FUZZY_MIN_CHARS} comparable characters"
         )
 
+    candidates: list[tuple[int, int, str]] = []
+    canonical_spans: list[tuple[int, int]] = []
     scored: list[tuple[float, int, int]] = []
     seen_spans: set[tuple[int, int]] = set()
     for start, end, candidate in _line_windows(text, from_text):
@@ -82,9 +121,20 @@ def _best_fuzzy_span(text: str, from_text: str, index: int) -> tuple[int, int]:
         if span in seen_spans:
             continue
         seen_spans.add(span)
-        candidate_text = _canonical_for_fuzzy_match(candidate)
+        candidate_text = _canonical_for_fuzzy_match(
+            candidate,
+            ignore_punctuation_and_symbols=ignore_punctuation_and_symbols,
+        )
         if not candidate_text:
             continue
+        candidates.append((start, end, candidate_text))
+        if candidate_text == query:
+            canonical_spans.append(span)
+
+    if canonical_spans:
+        return _unique_canonical_span(canonical_spans, index=index)
+
+    for start, end, candidate_text in candidates:
         ratio = SequenceMatcher(None, query, candidate_text).ratio()
         if ratio >= _FUZZY_MIN_RATIO:
             scored.append((ratio, start, end))
@@ -108,8 +158,10 @@ def _best_fuzzy_span(text: str, from_text: str, index: int) -> tuple[int, int]:
 def apply_text_replacements(
     original: str,
     replacements: Sequence[_TextReplacementLike],
+    *,
+    ignore_punctuation_and_symbols: bool = False,
 ) -> str:
-    """Apply single-hit text replacements in order and return updated LF text."""
+    """Apply single-hit replacements, optionally ignoring formatting during fallback matching."""
     if not replacements:
         raise TextReplacementApplyError("replacement list must not be empty")
     updated = _normalize_newlines(original)
@@ -122,7 +174,12 @@ def apply_text_replacements(
             raise TextReplacementApplyError(f"replacement {index} does not change text")
         count = updated.count(from_text)
         if count == 0:
-            start, end = _best_fuzzy_span(updated, from_text, index)
+            start, end = _best_fuzzy_span(
+                updated,
+                from_text,
+                index,
+                ignore_punctuation_and_symbols=ignore_punctuation_and_symbols,
+            )
             replacement_text = to_text
             if updated[start:end].endswith("\n") and not replacement_text.endswith("\n"):
                 replacement_text += "\n"

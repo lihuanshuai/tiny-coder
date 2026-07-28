@@ -70,6 +70,108 @@ def test_apply_text_replacements_uses_fuzzy_fallback_for_whitespace_drift() -> N
     )
 
 
+def test_apply_text_replacements_ignores_formatting_for_normalized_match() -> None:
+    original = (
+        "# Configuration\n"
+        "- **Output formats**: JSON, YAML, TOML\n"
+        "\n"
+        "## Validation\n"
+        "Keep this section.\n"
+    )
+    replacements = [
+        TextReplacement(
+            from_text="Output formats: JSON / YAML / TOML\n# Validation",
+            to_text="- **Output formats**: JSON, YAML, TOML, XML\n\n## Validation",
+        )
+    ]
+
+    assert apply_text_replacements(
+        original,
+        replacements,
+        ignore_punctuation_and_symbols=True,
+    ) == (
+        "# Configuration\n"
+        "- **Output formats**: JSON, YAML, TOML, XML\n"
+        "\n"
+        "## Validation\n"
+        "Keep this section.\n"
+    )
+
+
+def test_apply_text_replacements_prefers_normalized_exact_match() -> None:
+    original = (
+        "- **Output formats**: JSON, YAML, TOML\n"
+        "## Validation\n"
+        "First entry.\n"
+        "- **Output formats**: JSON, YAML, TOML-extra\n"
+        "## Validation\n"
+        "Second entry.\n"
+    )
+    replacements = [
+        TextReplacement(
+            from_text="Output formats: JSON / YAML / TOML\n# Validation",
+            to_text="- **Output formats**: updated\n## Validation",
+        )
+    ]
+
+    assert apply_text_replacements(
+        original,
+        replacements,
+        ignore_punctuation_and_symbols=True,
+    ) == (
+        "- **Output formats**: updated\n"
+        "## Validation\n"
+        "First entry.\n"
+        "- **Output formats**: JSON, YAML, TOML-extra\n"
+        "## Validation\n"
+        "Second entry.\n"
+    )
+
+
+def test_apply_text_replacements_rejects_ambiguous_normalized_match() -> None:
+    replacements = [
+        TextReplacement(
+            from_text="Output formats JSON YAML TOML",
+            to_text="Output formats: updated",
+        )
+    ]
+
+    with pytest.raises(TextReplacementApplyError, match="normalized.*multiple locations"):
+        apply_text_replacements(
+            "- **Output formats**: JSON, YAML, TOML\n- Output formats: JSON / YAML / TOML\n",
+            replacements,
+            ignore_punctuation_and_symbols=True,
+        )
+
+
+def test_normalized_match_rejects_duplicates_across_symbol_only_line() -> None:
+    replacements = [
+        TextReplacement(
+            from_text="Output formats JSON YAML TOML",
+            to_text="Output formats: updated",
+        )
+    ]
+
+    with pytest.raises(TextReplacementApplyError, match="normalized.*multiple locations"):
+        apply_text_replacements(
+            "- **Output formats**: JSON, YAML, TOML\n---\n- Output formats: JSON / YAML / TOML\n",
+            replacements,
+            ignore_punctuation_and_symbols=True,
+        )
+
+
+def test_default_matching_keeps_punctuation_and_symbols_significant() -> None:
+    replacements = [
+        TextReplacement(
+            from_text="value = alpha ++++++ beta",
+            to_text="value = total",
+        )
+    ]
+
+    with pytest.raises(TextReplacementApplyError, match="no safe fuzzy match"):
+        apply_text_replacements("value = alpha ------ beta\n", replacements)
+
+
 def test_apply_text_replacements_rejects_missing_from_text_without_safe_fuzzy_match() -> None:
     replacements = [TextReplacement(from_text="- missing", to_text="- new goal")]
 
