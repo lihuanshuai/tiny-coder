@@ -23,18 +23,21 @@ from tiny_coder.file_agent import (
     read_agent_file,
 )
 from tiny_coder.plugins import (
+    AfterIterationPlugin,
     AfterRunPlugin,
+    AgentRetryPolicyPlugin,
+    BeforeIterationPlugin,
     BeforeRunPlugin,
     DynamicOutputPathsPlugin,
     ExistingPathGuardPlugin,
     FileCleanupPlugin,
     FileTreeInputPathsPlugin,
+    IterativeRunPlugin,
     JsonFieldStreamLlmCallPlugin,
     LabeledFileMapWriterPlugin,
     LlmOutputResultPlugin,
     LlmSessionTurnPlugin,
     ResponseOutputTypePlugin,
-    RetryPlugin,
     SilentLlmCallPlugin,
     StaticInputPathsPlugin,
     StaticOutputPathsPlugin,
@@ -478,6 +481,74 @@ def test_after_run_plugin_failure_does_not_retry_agent(
     assert calls == 1
 
 
+def test_iterative_run_plugin_uses_context_items_and_aggregates_results(
+    workspace_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, int | None, object]] = []
+
+    async def prepare(context: AgentContext, item: object) -> None:
+        events.append(("before", context.iteration_index, item))
+
+    async def finish(
+        context: AgentContext,
+        item: object,
+        result: SyncAgentResult,
+    ) -> None:
+        assert result.summary == str(item)
+        events.append(("after", context.iteration_index, item))
+
+    agent = BasicFileAgent(
+        cwd=workspace_tmp_path,
+        llm_config=SampleLlmConfig(),
+        plugins=[
+            IterativeRunPlugin(items=["first", "second"]),
+            BeforeIterationPlugin(prepare),
+            AfterIterationPlugin(finish),
+        ],
+    )
+
+    async def run_iteration() -> SyncAgentResult:
+        item = agent.context.iteration_item
+        path = workspace_tmp_path / f"{item}.txt"
+        return SyncAgentResult(summary=str(item), written_paths=[path])
+
+    monkeypatch.setattr(agent, "call_llm_and_apply_output_with_retries", run_iteration)
+
+    result = asyncio.run(agent.run())
+
+    assert agent.context.iteration_items == ["first", "second"]
+    assert agent.context.iteration_index == 1
+    assert agent.context.iteration_item == "second"
+    assert events == [
+        ("before", 0, "first"),
+        ("after", 0, "first"),
+        ("before", 1, "second"),
+        ("after", 1, "second"),
+    ]
+    assert result == SyncAgentResult(
+        summary="",
+        written_paths=[
+            workspace_tmp_path / "first.txt",
+            workspace_tmp_path / "second.txt",
+        ],
+    )
+
+
+def test_iterative_run_plugin_rejects_multiple_iteration_sources(
+    workspace_tmp_path: Path,
+) -> None:
+    with pytest.raises(RuntimeError, match="only one IterativeRunPlugin"):
+        BasicFileAgent(
+            cwd=workspace_tmp_path,
+            llm_config=SampleLlmConfig(),
+            plugins=[
+                IterativeRunPlugin(items=[1]),
+                IterativeRunPlugin(items=[2]),
+            ],
+        )
+
+
 def test_json_field_stream_llm_call_registers_wrapped_call(
     workspace_tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -574,7 +645,7 @@ def test_retry_llm_call_retries_transient_errors(
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[ResponseOutputTypePlugin(SampleOutput), RetryPlugin()],
+        plugins=[ResponseOutputTypePlugin(SampleOutput), AgentRetryPolicyPlugin()],
     )
 
     result = asyncio.run(agent._call_llm({"system_prompt": "system", "user_prompt": "prompt"}))
@@ -599,7 +670,7 @@ def test_retry_llm_call_does_not_retry_deterministic_errors(
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[ResponseOutputTypePlugin(SampleOutput), RetryPlugin()],
+        plugins=[ResponseOutputTypePlugin(SampleOutput), AgentRetryPolicyPlugin()],
     )
 
     with pytest.raises(ValueError, match="invalid request"):
@@ -625,7 +696,7 @@ def test_retry_llm_call_stops_after_configured_attempts(
         llm_config=SampleLlmConfig(),
         plugins=[
             ResponseOutputTypePlugin(SampleOutput),
-            RetryPlugin(max_attempts=2),
+            AgentRetryPolicyPlugin(max_attempts=2),
         ],
     )
 
@@ -635,7 +706,7 @@ def test_retry_llm_call_stops_after_configured_attempts(
     assert calls == 2
 
 
-def test_retry_plugin_retries_invalid_structured_output(
+def test_agent_retry_policy_plugin_retries_invalid_structured_output(
     workspace_tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -663,7 +734,7 @@ def test_retry_plugin_retries_invalid_structured_output(
         plugins=[
             StaticOutputPathsPlugin([Path("output.txt")]),
             ResponseOutputTypePlugin(SampleFileMapOutput),
-            RetryPlugin(max_attempts=2),
+            AgentRetryPolicyPlugin(max_attempts=2),
             StaticSystemPromptPlugin("system"),
             TemplateUserPromptPlugin(
                 "user.jinja",

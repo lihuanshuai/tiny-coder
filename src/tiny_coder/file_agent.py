@@ -58,6 +58,10 @@ class SyncAgentResult:
 _BeforeRunCallback: TypeAlias = Callable[["AgentContext"], Awaitable[None]]
 _LlmOutputResultHook: TypeAlias = Callable[[SyncAgentResult], Coroutine[Any, Any, None]]
 _AfterRunHook: TypeAlias = Callable[[SyncAgentResult], Coroutine[Any, Any, None]]
+_BeforeIterationHook: TypeAlias = Callable[["AgentContext", object], Awaitable[None]]
+_AfterIterationHook: TypeAlias = Callable[
+    ["AgentContext", object, SyncAgentResult], Awaitable[None]
+]
 _AfterLlmCallCallback: TypeAlias = Callable[
     ["AgentContext", "LlmCallOutcome"], Coroutine[Any, Any, None]
 ]
@@ -97,6 +101,11 @@ class AgentContext:
     llm_output_result_hooks: list[_LlmOutputResultHook] = field(default_factory=list)
     allow_overwrite_existing_paths: bool = True
     clean_up_paths: list[Path] = field(default_factory=list)
+    iteration_items: list[object] | None = None
+    iteration_index: int | None = None
+    iteration_item: object | None = None
+    before_iteration_hooks: list[_BeforeIterationHook] = field(default_factory=list)
+    after_iteration_hooks: list[_AfterIterationHook] = field(default_factory=list)
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -349,11 +358,37 @@ class BasicFileAgent:
         self._clean_up_files()
         for before_run_hook in self.context.before_run_hooks:
             await before_run_hook(self.context)
-        self._guard_existing_output_paths()
-        result = await self.call_llm_and_apply_output_with_retries()
+
+        iteration_items = self.context.iteration_items
+        if iteration_items is None:
+            iteration_items = [None]
+        results: list[SyncAgentResult] = []
+        for iteration_index, iteration_item in enumerate(iteration_items):
+            self.context.iteration_index = iteration_index
+            self.context.iteration_item = iteration_item
+            for before_iteration_hook in self.context.before_iteration_hooks:
+                await before_iteration_hook(self.context, iteration_item)
+            self._guard_existing_output_paths()
+            result = await self.call_llm_and_apply_output_with_retries()
+            results.append(result)
+            for after_iteration_hook in self.context.after_iteration_hooks:
+                await after_iteration_hook(self.context, iteration_item, result)
+
+        if not results:
+            raise RuntimeError("agent run did not execute any iteration")
+        result = self._aggregate_results(results)
         for after_run_hook in self.context.after_run_hooks:
             await after_run_hook(result)
         return result
+
+    @staticmethod
+    def _aggregate_results(results: Sequence[SyncAgentResult]) -> SyncAgentResult:
+        if len(results) == 1:
+            return results[0]
+        return SyncAgentResult(
+            summary="",
+            written_paths=[path for result in results for path in result.written_paths],
+        )
 
     async def call_llm_and_apply_output(
         self,

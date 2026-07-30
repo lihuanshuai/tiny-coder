@@ -56,6 +56,10 @@ UserTemplateVars: TypeAlias = Mapping[str, Any] | Callable[["AgentContext"], Map
 _BeforeRunCallback: TypeAlias = Callable[["AgentContext"], Awaitable[None]]
 _LlmOutputResultCallback: TypeAlias = Callable[["AgentContext", "SyncAgentResult"], Awaitable[None]]
 _AfterRunCallback: TypeAlias = Callable[["AgentContext", "SyncAgentResult"], Awaitable[None]]
+_BeforeIterationCallback: TypeAlias = Callable[["AgentContext", object], Awaitable[None]]
+_AfterIterationCallback: TypeAlias = Callable[
+    ["AgentContext", object, "SyncAgentResult"], Awaitable[None]
+]
 _SessionTurnT = TypeVar("_SessionTurnT", bound=Mapping[str, Any])
 
 
@@ -160,6 +164,41 @@ class AfterRunPlugin:
             await self.handler(context, result)
 
         context.after_run_hooks.append(after_run)
+
+
+@dataclass
+class IterativeRunPlugin:
+    """Repeat the retrying agent run for context-owned iteration items."""
+
+    items: list[object]
+
+    def on_registered(self, context: AgentContext) -> None:
+        """Register one iteration source on the shared agent context."""
+        if context.iteration_items is not None:
+            raise RuntimeError("only one IterativeRunPlugin can be registered")
+        context.iteration_items = list(self.items)
+
+
+@dataclass
+class BeforeIterationPlugin:
+    """Run a callback before each context-owned iteration."""
+
+    handler: _BeforeIterationCallback
+
+    def on_registered(self, context: AgentContext) -> None:
+        """Register the callback on the shared iteration lifecycle."""
+        context.before_iteration_hooks.append(self.handler)
+
+
+@dataclass
+class AfterIterationPlugin:
+    """Run a callback after each context-owned iteration succeeds."""
+
+    handler: _AfterIterationCallback
+
+    def on_registered(self, context: AgentContext) -> None:
+        """Register the callback on the shared iteration lifecycle."""
+        context.after_iteration_hooks.append(self.handler)
 
 
 class DynamicOutputPathsPlugin:
@@ -404,8 +443,8 @@ class SilentLlmCallPlugin:
 
 
 @dataclass
-class RetryPlugin:
-    """Configure retries for LLM calls and structured output failures."""
+class AgentRetryPolicyPlugin:
+    """Configure the shared attempt limit for model calls and output handling."""
 
     max_attempts: int = 3
 
@@ -587,17 +626,20 @@ def _write_text_file(path: Path, content: str) -> Path:
 
 
 __all__ = [
+    "AgentRetryPolicyPlugin",
+    "AfterIterationPlugin",
     "AfterRunPlugin",
+    "BeforeIterationPlugin",
     "BeforeRunPlugin",
     "DynamicOutputPathsPlugin",
     "ExistingPathGuardPlugin",
     "FileCleanupPlugin",
     "FileTreeInputPathsPlugin",
+    "IterativeRunPlugin",
     "JsonFieldStreamLlmCallPlugin",
     "LabeledFileMapWriterPlugin",
     "LlmOutputResultPlugin",
     "ResponseOutputTypePlugin",
-    "RetryPlugin",
     "resolve_agent_file_path",
     "LlmSessionTurnPlugin",
     "SilentLlmCallPlugin",

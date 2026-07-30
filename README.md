@@ -25,9 +25,9 @@ from pydantic import BaseModel
 
 from tiny_coder.file_agent import AgentContext, BasicFileAgent
 from tiny_coder.plugins import (
+    AgentRetryPolicyPlugin,
     LabeledFileMapWriterPlugin,
     ResponseOutputTypePlugin,
-    RetryPlugin,
     StaticInputPathsPlugin,
     StaticOutputPathsPlugin,
     resolve_agent_file_path,
@@ -61,7 +61,7 @@ agent = BasicFileAgent(
         StaticInputPathsPlugin([Path("input.md")]),
         StaticOutputPathsPlugin([Path("output.md")]),
         ResponseOutputTypePlugin(FileOutput),
-        RetryPlugin(3),
+        AgentRetryPolicyPlugin(3),
         LabeledFileMapWriterPlugin(),
     ],
 )
@@ -69,6 +69,39 @@ agent = BasicFileAgent(
 
 Prefer importing from `tiny_coder.file_agent`, `tiny_coder.json_utils`, or
 `tiny_coder.yaml_utils` instead of relying on package-level re-exports.
+
+## Iterative Runs
+
+`IterativeRunPlugin` stores the iteration list on `AgentContext`. Register preparation and
+completion callbacks separately so each plugin has one lifecycle responsibility.
+
+```python
+from tiny_coder.file_agent import AgentContext, SyncAgentResult
+from tiny_coder.plugins import (
+    AfterIterationPlugin,
+    BeforeIterationPlugin,
+    IterativeRunPlugin,
+)
+
+
+async def prepare_iteration(context: AgentContext, item: object) -> None:
+    context.extras["current_item"] = item
+
+
+async def finish_iteration(
+    context: AgentContext,
+    item: object,
+    result: SyncAgentResult,
+) -> None:
+    print(context.iteration_index, item, result.written_paths)
+
+
+iteration_plugins = [
+    IterativeRunPlugin(items=["first", "second"]),
+    BeforeIterationPlugin(prepare_iteration),
+    AfterIterationPlugin(finish_iteration),
+]
+```
 
 ## Development
 
