@@ -155,6 +155,36 @@ def _best_fuzzy_span(
     return best_start, best_end
 
 
+def _first_content_indent(text: str) -> int:
+    for line in _normalize_newlines(text).splitlines():
+        if line.strip():
+            return len(line) - len(line.lstrip(" "))
+    return 0
+
+
+def _inherit_fuzzy_match_indentation(
+    replacement_text: str,
+    *,
+    from_text: str,
+    matched_text: str,
+) -> str:
+    """Keep a fuzzy replacement at the indentation level of its matched source."""
+    from_indent = _first_content_indent(from_text)
+    if _first_content_indent(replacement_text) != from_indent:
+        return replacement_text
+    indent_delta = _first_content_indent(matched_text) - from_indent
+    if not indent_delta:
+        return replacement_text
+
+    lines = replacement_text.splitlines(keepends=True)
+    if indent_delta > 0:
+        return "".join(" " * indent_delta + line if line.strip() else line for line in lines)
+    return "".join(
+        line[min(-indent_delta, len(line) - len(line.lstrip(" "))) :] if line.strip() else line
+        for line in lines
+    )
+
+
 def apply_text_replacements(
     original: str,
     replacements: Sequence[_TextReplacementLike],
@@ -180,7 +210,11 @@ def apply_text_replacements(
                 index,
                 ignore_punctuation_and_symbols=ignore_punctuation_and_symbols,
             )
-            replacement_text = to_text
+            replacement_text = _inherit_fuzzy_match_indentation(
+                to_text,
+                from_text=from_text,
+                matched_text=updated[start:end],
+            )
             if updated[start:end].endswith("\n") and not replacement_text.endswith("\n"):
                 replacement_text += "\n"
             updated = updated[:start] + replacement_text + updated[end:]

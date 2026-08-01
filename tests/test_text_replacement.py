@@ -66,7 +66,21 @@ def test_apply_text_replacements_uses_fuzzy_fallback_for_whitespace_drift() -> N
 
     assert (
         apply_text_replacements(original, replacements)
-        == "# Plan\n- new goal for chapter one\n- keep\n"
+        == "# Plan\n  - new goal for chapter one\n- keep\n"
+    )
+
+
+def test_fuzzy_replacement_preserves_nested_markdown_indentation() -> None:
+    original = "- section:\n  - existing item\n"
+    replacements = [
+        TextReplacement(
+            from_text="      - existing item",
+            to_text="      - replacement item\n        - nested detail",
+        )
+    ]
+
+    assert apply_text_replacements(original, replacements) == (
+        "- section:\n  - replacement item\n    - nested detail\n"
     )
 
 
