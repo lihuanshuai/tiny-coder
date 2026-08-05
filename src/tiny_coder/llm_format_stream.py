@@ -68,24 +68,26 @@ def _schema_response_format(schema: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _chunk_delta_content(packet: object) -> str:
+def _chunk_delta_text(packet: object) -> tuple[str, str]:
     choices = _get_value(packet, "choices")
     if not isinstance(choices, list) or not choices:
-        return ""
+        return "", ""
     choice = choices[0]
     delta = _get_value(choice, "delta")
     content = _get_value(delta, "content")
-    if content is None:
-        content = _get_value(delta, "reasoning_content")
-    if content is not None:
-        return str(content)
-    message = _get_value(choice, "message")
-    content = _get_value(message, "content")
-    return "" if content is None else str(content)
+    reasoning = _get_value(delta, "reasoning_content")
+    if reasoning is None:
+        reasoning = _get_value(delta, "reasoning")
+    return (
+        "" if content is None else str(content),
+        "" if reasoning is None else str(reasoning),
+    )
 
 
-def _llm_stream_chunk(packet: object) -> tuple[int | None, int | None, str]:
-    """Read metrics and content from one OpenAI-compatible stream packet."""
+def _llm_stream_chunk(
+    packet: object,
+) -> tuple[int | None, int | None, str, str, str | None]:
+    """Read metrics, output text, reasoning, and finish reason from one stream packet."""
     usage = _get_value(packet, "usage")
     prompt_eval_count = _nonneg_int_from_llm_field(_get_value(usage, "prompt_tokens"))
     eval_count = _nonneg_int_from_llm_field(_get_value(usage, "completion_tokens"))
@@ -93,15 +95,36 @@ def _llm_stream_chunk(packet: object) -> tuple[int | None, int | None, str]:
         prompt_eval_count = _nonneg_int_from_llm_field(_get_value(packet, "prompt_eval_count"))
     if eval_count is None:
         eval_count = _nonneg_int_from_llm_field(_get_value(packet, "eval_count"))
-    content = _chunk_delta_content(packet)
+    content, reasoning = _chunk_delta_text(packet)
+    choices = _get_value(packet, "choices")
+    finish_reason: str | None = None
+    if isinstance(choices, list) and choices:
+        finish_value = _get_value(choices[0], "finish_reason")
+        if isinstance(finish_value, str) and finish_value:
+            finish_reason = finish_value
     if not content:
         message = _get_value(packet, "message")
         value = _get_value(message, "content")
         content = "" if value is None else str(value)
-    return prompt_eval_count, eval_count, content
+    return prompt_eval_count, eval_count, content, reasoning, finish_reason
 
 
-def _llm_tail_metrics_dict(packet: object | None) -> dict[str, Any]:
+def _stream_error_message(packet: object) -> str | None:
+    error = _get_value(packet, "error")
+    if error is None:
+        return None
+    message = _get_value(error, "message")
+    if isinstance(message, str) and message:
+        return message
+    return str(error)
+
+
+def _llm_tail_metrics_dict(
+    packet: object | None,
+    *,
+    done_reason: str | None,
+    reasoning_chars: int,
+) -> dict[str, Any]:
     if packet is None:
         return {}
     metrics: dict[str, Any] = {}
@@ -116,11 +139,10 @@ def _llm_tail_metrics_dict(packet: object | None) -> dict[str, Any]:
     model = _get_value(packet, "model")
     if isinstance(model, str) and model:
         metrics["model"] = model
-    choices = _get_value(packet, "choices")
-    if isinstance(choices, list) and choices:
-        done_reason = _get_value(choices[0], "finish_reason")
-        if isinstance(done_reason, str) and done_reason:
-            metrics["done_reason"] = done_reason
+    if done_reason:
+        metrics["done_reason"] = done_reason
+    if reasoning_chars:
+        metrics["reasoning_chars"] = reasoning_chars
     metrics["provider"] = "openai-compatible"
     return metrics
 
@@ -166,6 +188,8 @@ async def stream_llm_chat_format(
     had_prompt_metric = False
     had_eval_metric = False
     last_packet: object | None = None
+    done_reason: str | None = None
+    reasoning_chars = 0
     collected: list[str] = []
 
     def dispatch_chunk(chunk: str) -> None:
@@ -195,13 +219,21 @@ async def stream_llm_chat_format(
             raise
         async for packet in stream_response:
             last_packet = packet
-            prompt_count, completion_count, content = _llm_stream_chunk(packet)
+            error_message = _stream_error_message(packet)
+            if error_message is not None:
+                raise RuntimeError(f"OpenAI-compatible LLM stream error: {error_message}")
+            prompt_count, completion_count, content, reasoning, finish_reason = _llm_stream_chunk(
+                packet
+            )
             if prompt_count is not None:
                 prompt_eval_count = prompt_count
                 had_prompt_metric = True
             if completion_count is not None:
                 eval_count = completion_count
                 had_eval_metric = True
+            reasoning_chars += len(reasoning)
+            if finish_reason is not None:
+                done_reason = finish_reason
             if content:
                 dispatch_chunk(content)
     finally:
@@ -223,7 +255,11 @@ async def stream_llm_chat_format(
         client_wall_time_ms=(time.perf_counter() - started) * 1000.0,
         started_at=started_at,
         completed_at=completed_at,
-        llm=_llm_tail_metrics_dict(last_packet),
+        llm=_llm_tail_metrics_dict(
+            last_packet,
+            done_reason=done_reason,
+            reasoning_chars=reasoning_chars,
+        ),
     )
 
 

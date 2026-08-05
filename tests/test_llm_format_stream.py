@@ -45,23 +45,13 @@ class FakeCompletions:
         type(self).kwargs = kwargs
         return FakeStream(
             [
-                {
-                    "choices": [
-                        {
-                            "delta": {"content": "hello"},
-                            "finish_reason": None,
-                        }
-                    ]
-                },
+                {"choices": [{"delta": {"content": "", "reasoning": "hidden"}}]},
+                {"choices": [{"delta": {"content": "hello"}, "finish_reason": None}]},
+                {"choices": [{"delta": {"content": " world"}, "finish_reason": "stop"}]},
                 {
                     "model": "sample-model",
                     "usage": {"prompt_tokens": 3, "completion_tokens": 4},
-                    "choices": [
-                        {
-                            "delta": {"content": " world"},
-                            "finish_reason": "stop",
-                        }
-                    ],
+                    "choices": [],
                 },
             ]
         )
@@ -91,16 +81,21 @@ def test_llm_stream_chunk_reads_openai_and_local_fields() -> None:
     assert _llm_stream_chunk(
         {
             "usage": {"prompt_tokens": 2, "completion_tokens": 5},
-            "choices": [{"delta": {"content": "chunk"}}],
+            "choices": [
+                {
+                    "delta": {"content": "chunk", "reasoning_content": "thought"},
+                    "finish_reason": "stop",
+                }
+            ],
         }
-    ) == (2, 5, "chunk")
+    ) == (2, 5, "chunk", "thought", "stop")
     assert _llm_stream_chunk(
         {
             "prompt_eval_count": 7,
             "eval_count": 9,
             "message": {"content": "fallback"},
         }
-    ) == (7, 9, "fallback")
+    ) == (7, 9, "fallback", "", None)
 
 
 def test_stream_llm_chat_format_forwards_schema_chunks_and_metrics(
@@ -129,6 +124,7 @@ def test_stream_llm_chat_format_forwards_schema_chunks_and_metrics(
         "eval_count": 4,
         "model": "sample-model",
         "done_reason": "stop",
+        "reasoning_chars": 6,
         "provider": "openai-compatible",
     }
     assert FakeCompletions.kwargs["response_format"] == {
@@ -145,3 +141,25 @@ def test_stream_llm_chat_format_forwards_schema_chunks_and_metrics(
         "think": False,
     }
     assert FakeAsyncOpenAI.closed is True
+
+
+def test_stream_llm_chat_format_raises_server_stream_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def create_error_stream(self: FakeCompletions, **kwargs: Any) -> FakeStream:
+        _ = self, kwargs
+        return FakeStream([{"error": {"message": "failed to parse grammar"}}])
+
+    monkeypatch.setattr(FakeCompletions, "create", create_error_stream)
+    monkeypatch.setattr(llm_format_stream, "AsyncOpenAI", FakeAsyncOpenAI)
+
+    with pytest.raises(RuntimeError, match="failed to parse grammar"):
+        asyncio.run(
+            stream_llm_chat_format(
+                llm_cfg=SampleOpenAIConfig(),
+                system="system",
+                prompt="prompt",
+                response_format={"type": "object"},
+                on_chunk=lambda _chunk: None,
+            )
+        )
