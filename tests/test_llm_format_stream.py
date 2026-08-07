@@ -140,6 +140,7 @@ def test_stream_llm_chat_format_forwards_schema_chunks_and_metrics(
         "repeat_penalty": 1.1,
         "think": False,
     }
+    assert FakeCompletions.kwargs["reasoning_effort"] == "none"
     assert FakeAsyncOpenAI.closed is True
 
 
@@ -154,6 +155,45 @@ def test_stream_llm_chat_format_raises_server_stream_error(
     monkeypatch.setattr(llm_format_stream, "AsyncOpenAI", FakeAsyncOpenAI)
 
     with pytest.raises(RuntimeError, match="failed to parse grammar"):
+        asyncio.run(
+            stream_llm_chat_format(
+                llm_cfg=SampleOpenAIConfig(),
+                system="system",
+                prompt="prompt",
+                response_format={"type": "object"},
+                on_chunk=lambda _chunk: None,
+            )
+        )
+
+
+def test_stream_llm_chat_format_rejects_reasoning_only_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def create_reasoning_stream(self: FakeCompletions, **kwargs: Any) -> FakeStream:
+        _ = self, kwargs
+        return FakeStream(
+            [
+                {
+                    "choices": [
+                        {
+                            "delta": {"content": "", "reasoning": "unfinished thought"},
+                            "finish_reason": "length",
+                        }
+                    ]
+                }
+            ]
+        )
+
+    monkeypatch.setattr(FakeCompletions, "create", create_reasoning_stream)
+    monkeypatch.setattr(llm_format_stream, "AsyncOpenAI", FakeAsyncOpenAI)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"returned no content \(finish_reason=length, prompt_eval_count=0, "
+            r"eval_count=0, reasoning_chars=18\)"
+        ),
+    ):
         asyncio.run(
             stream_llm_chat_format(
                 llm_cfg=SampleOpenAIConfig(),

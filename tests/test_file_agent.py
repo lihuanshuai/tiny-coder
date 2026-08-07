@@ -14,7 +14,6 @@ from pydantic import BaseModel
 from tiny_coder import file_agent
 from tiny_coder.file_agent import (
     AgentContext,
-    BasicFileAgent,
     LlmCallOutcome,
     SyncAgentResult,
     _agent_input_snapshots,
@@ -22,11 +21,16 @@ from tiny_coder.file_agent import (
     content_to_yaml_text,
     read_agent_file,
 )
+from tiny_coder.file_agent import (
+    BasicFileAgent as _BasicFileAgent,
+)
 from tiny_coder.plugins import (
     AfterIterationPlugin,
+    AfterLlmRequestPlugin,
     AfterRunPlugin,
     AgentRetryPolicyPlugin,
     BeforeIterationPlugin,
+    BeforeLlmRequestPlugin,
     BeforeRunPlugin,
     DynamicOutputPathsPlugin,
     ExistingPathGuardPlugin,
@@ -35,7 +39,9 @@ from tiny_coder.plugins import (
     IterativeRunPlugin,
     JsonFieldStreamLlmCallPlugin,
     LabeledFileMapWriterPlugin,
+    LlmConfigPlugin,
     LlmOutputResultPlugin,
+    LlmRequestGroupPlugin,
     LlmSessionTurnPlugin,
     ResponseOutputTypePlugin,
     SilentLlmCallPlugin,
@@ -67,6 +73,22 @@ class SampleFileMapOutput(BaseModel):
         }
 
 
+class SamplePlanOutput(BaseModel):
+    plan: str
+
+    def to_file_map(self, context: AgentContext) -> dict[Path, str]:
+        _ = context
+        return {}
+
+
+class SampleReviewOutput(BaseModel):
+    review: str
+
+    def to_file_map(self, context: AgentContext) -> dict[Path, str]:
+        _ = context
+        return {}
+
+
 class OtherFileMapOutput(BaseModel):
     files: dict[str, str]
 
@@ -95,6 +117,19 @@ class OtherTextReplacementOutput(SampleTextReplacementOutput):
 
 class SampleLlmConfig(BaseModel):
     model: str = "test-model"
+
+
+def BasicFileAgent(
+    *,
+    cwd: Path,
+    llm_config: BaseModel,
+    plugins: list[Any] | None = None,
+) -> _BasicFileAgent:
+    """Build a test agent with the required plugin-only model configuration."""
+    return _BasicFileAgent(
+        cwd=cwd,
+        plugins=[LlmConfigPlugin(llm_config), *(plugins or [])],
+    )
 
 
 class SampleLlmOutcome(BaseModel):
@@ -188,7 +223,7 @@ def test_static_input_paths_plugin_resolves_workspace_paths(workspace_tmp_path: 
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[plugin],
+        plugins=[LlmRequestGroupPlugin(key="paths"), plugin],
     )
 
     expected = [
@@ -196,14 +231,17 @@ def test_static_input_paths_plugin_resolves_workspace_paths(workspace_tmp_path: 
         (workspace_tmp_path / "data" / "config.yaml").resolve(),
     ]
     assert agent.input_paths == expected
-    assert agent.context.input_paths == expected
+    assert agent.context.llm_request_contexts["paths"].input_paths == expected
 
 
 def test_static_output_paths_plugin_resolves_workspace_paths(workspace_tmp_path: Path) -> None:
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[StaticOutputPathsPlugin([Path("docs/output.md")])],
+        plugins=[
+            LlmRequestGroupPlugin(key="paths"),
+            StaticOutputPathsPlugin([Path("docs/output.md")]),
+        ],
     )
 
     assert list(agent.output_paths()) == [(workspace_tmp_path / "docs" / "output.md").resolve()]
@@ -216,6 +254,7 @@ def test_dynamic_output_paths_plugin_copies_registered_input_paths(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            LlmRequestGroupPlugin(key="paths"),
             StaticInputPathsPlugin([Path("docs/readme.md"), Path("data/config.yaml")]),
             DynamicOutputPathsPlugin(),
         ],
@@ -226,7 +265,8 @@ def test_dynamic_output_paths_plugin_copies_registered_input_paths(
         (workspace_tmp_path / "data" / "config.yaml").resolve(),
     ]
     assert list(agent.output_paths()) == expected
-    assert agent.context.output_paths is not agent.context.input_paths
+    request_context = agent.context.llm_request_contexts["paths"]
+    assert request_context.output_paths is not request_context.input_paths
 
 
 def test_existing_path_guard_plugin_rejects_existing_static_path(
@@ -235,17 +275,22 @@ def test_existing_path_guard_plugin_rejects_existing_static_path(
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[StaticOutputPathsPlugin([Path("blocked.txt")]), ExistingPathGuardPlugin()],
+        plugins=[
+            LlmRequestGroupPlugin(key="guard"),
+            StaticOutputPathsPlugin([Path("blocked.txt")]),
+            ExistingPathGuardPlugin(),
+        ],
     )
+    request_context = agent.context.llm_request_contexts["guard"]
 
     _write_test_file(workspace_tmp_path, Path("blocked.txt"), "keep\n")
 
-    assert agent.context.allow_overwrite_existing_paths is False
-    assert agent.context.output_paths == [
+    assert request_context.allow_overwrite_existing_paths is False
+    assert request_context.output_paths == [
         resolve_agent_file_path(workspace_tmp_path, Path("blocked.txt"))
     ]
     with pytest.raises(RuntimeError, match="refusing to overwrite existing path: blocked.txt"):
-        asyncio.run(agent.call_llm_and_apply_output(system_prompt="", user_prompt=""))
+        asyncio.run(agent.run())
 
 
 def test_file_cleanup_plugin_injects_and_removes_files(
@@ -255,7 +300,10 @@ def test_file_cleanup_plugin_injects_and_removes_files(
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[FileCleanupPlugin([Path("stale.jsonl")])],
+        plugins=[
+            FileCleanupPlugin([Path("stale.jsonl")]),
+            LlmRequestGroupPlugin(key="cleanup"),
+        ],
     )
 
     assert agent.context.clean_up_paths == [stale_path]
@@ -270,11 +318,44 @@ def test_file_cleanup_plugin_rejects_directories(workspace_tmp_path: Path) -> No
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[FileCleanupPlugin([directory])],
+        plugins=[
+            FileCleanupPlugin([directory]),
+            LlmRequestGroupPlugin(key="cleanup"),
+        ],
     )
 
     with pytest.raises(RuntimeError, match="cleanup path is a directory: cache"):
         asyncio.run(agent.run())
+
+
+def test_basic_file_agent_requires_llm_request_group(workspace_tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires at least one LlmRequestGroupPlugin"):
+        BasicFileAgent(
+            cwd=workspace_tmp_path,
+            llm_config=SampleLlmConfig(),
+        )
+
+
+def test_basic_file_agent_uses_llm_config_plugin(workspace_tmp_path: Path) -> None:
+    llm_config = SampleLlmConfig()
+    agent = _BasicFileAgent(
+        cwd=workspace_tmp_path,
+        plugins=[
+            LlmConfigPlugin(llm_config),
+            LlmRequestGroupPlugin(key="configured"),
+        ],
+    )
+
+    assert not hasattr(agent, "llm_config")
+    assert agent.context.llm_request_contexts["configured"].llm_config is llm_config
+
+
+def test_llm_request_group_requires_llm_config_plugin(workspace_tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="LLM request requires LlmConfigPlugin"):
+        _BasicFileAgent(
+            cwd=workspace_tmp_path,
+            plugins=[LlmRequestGroupPlugin(key="missing-config")],
+        )
 
 
 def test_file_tree_input_paths_plugin_resolves_ordered_tree_paths(
@@ -289,11 +370,12 @@ def test_file_tree_input_paths_plugin_resolves_ordered_tree_paths(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            LlmRequestGroupPlugin(key="tree"),
             FileTreeInputPathsPlugin(
                 Path("plan"),
                 first_paths=[Path("overview.md")],
                 patterns=["[0-9][0-9][0-9].md"],
-            )
+            ),
         ],
     )
 
@@ -304,10 +386,13 @@ def test_response_output_type_plugin_registers_context_model(workspace_tmp_path:
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[ResponseOutputTypePlugin(SampleOutput)],
+        plugins=[
+            LlmRequestGroupPlugin(key="response"),
+            ResponseOutputTypePlugin(SampleOutput),
+        ],
     )
 
-    assert agent.context.llm_response_output_type is SampleOutput
+    assert agent.context.llm_request_contexts["response"].llm_response_output_type is SampleOutput
     assert agent.response_output_type() is SampleOutput
 
 
@@ -316,16 +401,19 @@ def test_file_agent_records_parsed_response_output(workspace_tmp_path: Path) -> 
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            LlmRequestGroupPlugin(key="apply"),
             ResponseOutputTypePlugin(SampleFileMapOutput),
             LabeledFileMapWriterPlugin(),
         ],
     )
+    request_context = agent.context.llm_request_contexts["apply"]
+    agent.context = request_context
 
     agent._apply_output(
         {"raw_output": '{"summary":"done","files":{"notes/output.txt":"hello\\n"}}'}
     )
 
-    assert agent.context.llm_response_output == SampleFileMapOutput(
+    assert request_context.llm_response_output == SampleFileMapOutput(
         summary="done",
         files={"notes/output.txt": "hello\n"},
     )
@@ -348,14 +436,19 @@ def test_file_agent_records_llm_call_outcome(
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[ResponseOutputTypePlugin(SampleOutput)],
+        plugins=[
+            LlmRequestGroupPlugin(key="call"),
+            ResponseOutputTypePlugin(SampleOutput),
+        ],
     )
+    request_context = agent.context.llm_request_contexts["call"]
+    agent.context = request_context
 
     asyncio.run(agent._call_llm({"system_prompt": "system", "user_prompt": "prompt"}))
 
-    assert agent.context.llm_call_outcome == outcome
-    assert agent.context.llm_call_system_prompt == "system"
-    assert agent.context.llm_call_user_prompt == "prompt"
+    assert request_context.llm_call_outcome == outcome
+    assert request_context.llm_call_system_prompt == "system"
+    assert request_context.llm_call_user_prompt == "prompt"
 
 
 def test_llm_session_turn_plugin_appends_call(
@@ -382,8 +475,13 @@ def test_llm_session_turn_plugin_appends_call(
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[ResponseOutputTypePlugin(SampleOutput), plugin],
+        plugins=[
+            LlmRequestGroupPlugin(key="session"),
+            ResponseOutputTypePlugin(SampleOutput),
+            plugin,
+        ],
     )
+    agent.context = agent.context.llm_request_contexts["session"]
 
     asyncio.run(agent._call_llm({"system_prompt": "system", "user_prompt": "prompt"}))
 
@@ -402,13 +500,17 @@ def test_llm_output_result_plugin_registers_context_callback(workspace_tmp_path:
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[LlmOutputResultPlugin(handle_result)],
+        plugins=[
+            LlmRequestGroupPlugin(key="result"),
+            LlmOutputResultPlugin(handle_result),
+        ],
     )
+    request_context = agent.context.llm_request_contexts["result"]
     result = SyncAgentResult(summary="done", written_paths=[workspace_tmp_path / "output.txt"])
 
-    asyncio.run(agent.context.llm_output_result_hooks[0](result))
+    asyncio.run(request_context.llm_output_result_hooks[0](result))
 
-    assert received == [(agent.context, result)]
+    assert received == [(request_context, result)]
 
 
 def test_before_run_plugin_prepares_after_cleanup(
@@ -436,6 +538,7 @@ def test_before_run_plugin_prepares_after_cleanup(
             FileCleanupPlugin([input_path]),
             BeforeRunPlugin(prepare),
             AfterRunPlugin(finish),
+            LlmRequestGroupPlugin(key="run"),
         ],
     )
     expected = SyncAgentResult(summary="done", written_paths=[])
@@ -444,7 +547,7 @@ def test_before_run_plugin_prepares_after_cleanup(
         events.append("run")
         return expected
 
-    monkeypatch.setattr(agent, "call_llm_and_apply_output_with_retries", run_agent)
+    monkeypatch.setattr(agent, "_run_llm_requests", run_agent)
 
     result = asyncio.run(agent.run())
 
@@ -465,7 +568,10 @@ def test_after_run_plugin_failure_does_not_retry_agent(
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[AfterRunPlugin(fail_after_run)],
+        plugins=[
+            AfterRunPlugin(fail_after_run),
+            LlmRequestGroupPlugin(key="run"),
+        ],
     )
 
     async def run_agent() -> SyncAgentResult:
@@ -473,7 +579,7 @@ def test_after_run_plugin_failure_does_not_retry_agent(
         calls += 1
         return SyncAgentResult(summary="done", written_paths=[])
 
-    monkeypatch.setattr(agent, "call_llm_and_apply_output_with_retries", run_agent)
+    monkeypatch.setattr(agent, "_run_llm_requests", run_agent)
 
     with pytest.raises(ValueError, match="post-run failure"):
         asyncio.run(agent.run())
@@ -505,6 +611,7 @@ def test_iterative_run_plugin_uses_context_items_and_aggregates_results(
             IterativeRunPlugin(items=["first", "second"]),
             BeforeIterationPlugin(prepare),
             AfterIterationPlugin(finish),
+            LlmRequestGroupPlugin(key="iteration"),
         ],
     )
 
@@ -513,7 +620,7 @@ def test_iterative_run_plugin_uses_context_items_and_aggregates_results(
         path = workspace_tmp_path / f"{item}.txt"
         return SyncAgentResult(summary=str(item), written_paths=[path])
 
-    monkeypatch.setattr(agent, "call_llm_and_apply_output_with_retries", run_iteration)
+    monkeypatch.setattr(agent, "_run_llm_requests", run_iteration)
 
     result = asyncio.run(agent.run())
 
@@ -545,6 +652,244 @@ def test_iterative_run_plugin_rejects_multiple_iteration_sources(
             plugins=[
                 IterativeRunPlugin(items=[1]),
                 IterativeRunPlugin(items=[2]),
+                LlmRequestGroupPlugin(key="iteration"),
+            ],
+        )
+
+
+def test_serial_llm_requests_run_in_order_and_record_keyed_results(
+    workspace_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_test_file(workspace_tmp_path, Path("plan-system.jinja"), "plan system")
+    _write_test_file(
+        workspace_tmp_path,
+        Path("plan-user.jinja"),
+        "plan:{{ item }}:{{ previous_keys | join(',') }}",
+    )
+    _write_test_file(workspace_tmp_path, Path("review-system.jinja"), "review system")
+    _write_test_file(
+        workspace_tmp_path,
+        Path("review-user.jinja"),
+        "review:{{ item }}:{{ plan.plan }}",
+    )
+    calls: list[tuple[str, str, list[str]]] = []
+    events: list[tuple[str, str, object]] = []
+    iteration_outputs: list[tuple[object, dict[str, BaseModel]]] = []
+
+    async def llm_call(**kwargs: Any) -> LlmCallOutcome:
+        properties = list(kwargs["response_format"]["properties"])
+        prompt = kwargs["prompt"].strip()
+        calls.append((kwargs["system"].strip(), prompt, properties))
+        parts = prompt.split(":")
+        text = (
+            json.dumps({"plan": f"{parts[1]} draft"})
+            if "plan" in properties
+            else json.dumps({"review": f"reviewed {parts[2]}"})
+        )
+        return SampleLlmOutcome(text=text, prompt_eval_count=1, eval_count=1)
+
+    async def prepare_request(context: AgentContext, key: str) -> None:
+        assert context.llm_request_key == key
+        events.append(("before", key, context.iteration_item))
+
+    async def finish_request(
+        context: AgentContext,
+        key: str,
+        result: SyncAgentResult,
+    ) -> None:
+        assert context.llm_request_results[key] is result
+        assert context.llm_request_key == key
+        events.append(("after", key, context.iteration_item))
+
+    async def finish_iteration(
+        context: AgentContext,
+        item: object,
+        result: SyncAgentResult,
+    ) -> None:
+        _ = result
+        iteration_outputs.append((item, dict(context.llm_response_outputs)))
+
+    monkeypatch.setattr(file_agent, "stream_llm_chat_format", llm_call)
+    agent = BasicFileAgent(
+        cwd=workspace_tmp_path,
+        llm_config=SampleLlmConfig(),
+        plugins=[
+            IterativeRunPlugin(items=["first", "second"]),
+            AfterIterationPlugin(finish_iteration),
+            LlmRequestGroupPlugin(key="plan"),
+            BeforeLlmRequestPlugin(handler=prepare_request),
+            ResponseOutputTypePlugin(SamplePlanOutput),
+            TemplateSystemPromptPlugin(
+                "plan-system.jinja",
+                template_root=workspace_tmp_path,
+            ),
+            TemplateUserPromptPlugin(
+                "plan-user.jinja",
+                template_root=workspace_tmp_path,
+                template_vars=lambda context: {
+                    "item": context.iteration_item,
+                    "previous_keys": list(context.llm_response_outputs),
+                },
+            ),
+            LabeledFileMapWriterPlugin(),
+            AfterLlmRequestPlugin(handler=finish_request),
+            LlmRequestGroupPlugin(key="review"),
+            BeforeLlmRequestPlugin(handler=prepare_request),
+            ResponseOutputTypePlugin(SampleReviewOutput),
+            TemplateSystemPromptPlugin(
+                "review-system.jinja",
+                template_root=workspace_tmp_path,
+            ),
+            TemplateUserPromptPlugin(
+                "review-user.jinja",
+                template_root=workspace_tmp_path,
+                template_vars=lambda context: {
+                    "item": context.iteration_item,
+                    "plan": context.llm_response_outputs["plan"],
+                },
+            ),
+            LabeledFileMapWriterPlugin(),
+            AfterLlmRequestPlugin(handler=finish_request),
+        ],
+    )
+
+    result = asyncio.run(agent.run())
+
+    assert calls == [
+        ("plan system", "plan:first:", ["plan"]),
+        ("review system", "review:first:first draft", ["review"]),
+        ("plan system", "plan:second:", ["plan"]),
+        ("review system", "review:second:second draft", ["review"]),
+    ]
+    assert events == [
+        ("before", "plan", "first"),
+        ("after", "plan", "first"),
+        ("before", "review", "first"),
+        ("after", "review", "first"),
+        ("before", "plan", "second"),
+        ("after", "plan", "second"),
+        ("before", "review", "second"),
+        ("after", "review", "second"),
+    ]
+    assert iteration_outputs == [
+        (
+            "first",
+            {
+                "plan": SamplePlanOutput(plan="first draft"),
+                "review": SampleReviewOutput(review="reviewed first draft"),
+            },
+        ),
+        (
+            "second",
+            {
+                "plan": SamplePlanOutput(plan="second draft"),
+                "review": SampleReviewOutput(review="reviewed second draft"),
+            },
+        ),
+    ]
+    assert list(agent.context.llm_call_outcomes) == ["plan", "review"]
+    assert agent.context.llm_response_outputs == {
+        "plan": SamplePlanOutput(plan="second draft"),
+        "review": SampleReviewOutput(review="reviewed second draft"),
+    }
+    assert list(agent.context.llm_request_results) == ["plan", "review"]
+    assert result == SyncAgentResult(summary="", written_paths=[])
+
+
+def test_llm_request_group_plugin_rejects_blank_key() -> None:
+    with pytest.raises(ValueError, match="must not be blank"):
+        LlmRequestGroupPlugin(key="")
+
+
+def test_llm_request_hooks_are_optional(workspace_tmp_path: Path) -> None:
+    agent = BasicFileAgent(
+        cwd=workspace_tmp_path,
+        llm_config=SampleLlmConfig(),
+        plugins=[LlmRequestGroupPlugin(key="plan")],
+    )
+
+    assert list(agent.context.llm_request_contexts) == ["plan"]
+
+
+def test_llm_request_hooks_require_request_group(workspace_tmp_path: Path) -> None:
+    async def before_request(_context: AgentContext, _key: str) -> None:
+        pass
+
+    async def after_request(
+        _context: AgentContext,
+        _key: str,
+        _result: SyncAgentResult,
+    ) -> None:
+        pass
+
+    with pytest.raises(RuntimeError, match="requires a preceding LlmRequestGroupPlugin"):
+        BasicFileAgent(
+            cwd=workspace_tmp_path,
+            llm_config=SampleLlmConfig(),
+            plugins=[BeforeLlmRequestPlugin(handler=before_request)],
+        )
+
+    with pytest.raises(RuntimeError, match="requires a preceding LlmRequestGroupPlugin"):
+        BasicFileAgent(
+            cwd=workspace_tmp_path,
+            llm_config=SampleLlmConfig(),
+            plugins=[AfterLlmRequestPlugin(handler=after_request)],
+        )
+
+
+def test_llm_request_hooks_must_be_paired(workspace_tmp_path: Path) -> None:
+    async def before_request(_context: AgentContext, _key: str) -> None:
+        pass
+
+    async def after_request(
+        _context: AgentContext,
+        _key: str,
+        _result: SyncAgentResult,
+    ) -> None:
+        pass
+
+    with pytest.raises(ValueError, match="must be paired"):
+        BasicFileAgent(
+            cwd=workspace_tmp_path,
+            llm_config=SampleLlmConfig(),
+            plugins=[
+                LlmRequestGroupPlugin(key="plan"),
+                BeforeLlmRequestPlugin(handler=before_request),
+            ],
+        )
+
+    with pytest.raises(ValueError, match="must be paired"):
+        BasicFileAgent(
+            cwd=workspace_tmp_path,
+            llm_config=SampleLlmConfig(),
+            plugins=[
+                LlmRequestGroupPlugin(key="plan"),
+                AfterLlmRequestPlugin(handler=after_request),
+            ],
+        )
+
+
+def test_llm_request_plugins_reject_duplicate_keys(workspace_tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="duplicate LLM request key"):
+        BasicFileAgent(
+            cwd=workspace_tmp_path,
+            llm_config=SampleLlmConfig(),
+            plugins=[
+                LlmRequestGroupPlugin(key="plan"),
+                LlmRequestGroupPlugin(key="plan"),
+            ],
+        )
+
+
+def test_llm_request_plugins_reject_nested_iteration(workspace_tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must not configure nested"):
+        BasicFileAgent(
+            cwd=workspace_tmp_path,
+            llm_config=SampleLlmConfig(),
+            plugins=[
+                LlmRequestGroupPlugin(key="plan"),
+                IterativeRunPlugin(items=["nested"]),
             ],
         )
 
@@ -559,6 +904,7 @@ def test_json_field_stream_llm_call_registers_wrapped_call(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            LlmRequestGroupPlugin(key="stream"),
             JsonFieldStreamLlmCallPlugin(
                 field_name="summary",
                 raw_abort_threshold=100,
@@ -566,7 +912,7 @@ def test_json_field_stream_llm_call_registers_wrapped_call(
         ],
     )
 
-    assert agent.context.llm_call is not _unused_llm_call
+    assert agent.context.llm_request_contexts["stream"].llm_call is not _unused_llm_call
 
 
 def test_silent_llm_call_suppresses_chunks_and_preserves_call(
@@ -601,9 +947,12 @@ def test_silent_llm_call_suppresses_chunks_and_preserves_call(
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=llm_config,
-        plugins=[SilentLlmCallPlugin()],
+        plugins=[
+            LlmRequestGroupPlugin(key="silent"),
+            SilentLlmCallPlugin(),
+        ],
     )
-    registered_llm_call = agent.context.llm_call
+    registered_llm_call = agent.context.llm_request_contexts["silent"].llm_call
     assert registered_llm_call is not None
 
     outcome = asyncio.run(
@@ -645,13 +994,19 @@ def test_retry_llm_call_retries_transient_errors(
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[ResponseOutputTypePlugin(SampleOutput), AgentRetryPolicyPlugin()],
+        plugins=[
+            LlmRequestGroupPlugin(key="retry"),
+            ResponseOutputTypePlugin(SampleOutput),
+            AgentRetryPolicyPlugin(),
+        ],
     )
+    request_context = agent.context.llm_request_contexts["retry"]
+    agent.context = request_context
 
     result = asyncio.run(agent._call_llm({"system_prompt": "system", "user_prompt": "prompt"}))
 
     assert calls == 3
-    assert agent.context.max_attempts == 3
+    assert request_context.max_attempts == 3
     assert result["raw_output"] == "done"
 
 
@@ -670,8 +1025,13 @@ def test_retry_llm_call_does_not_retry_deterministic_errors(
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[ResponseOutputTypePlugin(SampleOutput), AgentRetryPolicyPlugin()],
+        plugins=[
+            LlmRequestGroupPlugin(key="retry"),
+            ResponseOutputTypePlugin(SampleOutput),
+            AgentRetryPolicyPlugin(),
+        ],
     )
+    agent.context = agent.context.llm_request_contexts["retry"]
 
     with pytest.raises(ValueError, match="invalid request"):
         asyncio.run(agent._call_llm({"system_prompt": "system", "user_prompt": "prompt"}))
@@ -695,10 +1055,12 @@ def test_retry_llm_call_stops_after_configured_attempts(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            LlmRequestGroupPlugin(key="retry"),
             ResponseOutputTypePlugin(SampleOutput),
             AgentRetryPolicyPlugin(max_attempts=2),
         ],
     )
+    agent.context = agent.context.llm_request_contexts["retry"]
 
     with pytest.raises(RuntimeError, match=r"LLM call failed after 2 attempt\(s\)"):
         asyncio.run(agent._call_llm({"system_prompt": "system", "user_prompt": "prompt"}))
@@ -732,6 +1094,7 @@ def test_agent_retry_policy_plugin_retries_invalid_structured_output(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            LlmRequestGroupPlugin(key="retry"),
             StaticOutputPathsPlugin([Path("output.txt")]),
             ResponseOutputTypePlugin(SampleFileMapOutput),
             AgentRetryPolicyPlugin(max_attempts=2),
@@ -795,12 +1158,14 @@ def test_json_field_stream_llm_call_streams_field_and_preserves_outcome(
         cwd=workspace_tmp_path,
         llm_config=llm_config,
         plugins=[
+            LlmRequestGroupPlugin(key="stream"),
             ResponseOutputTypePlugin(SampleOutput),
             plugin,
         ],
     )
+    request_context = agent.context.llm_request_contexts["stream"]
     outcome = asyncio.run(
-        agent.context.llm_call(
+        request_context.llm_call(
             llm_cfg=llm_config,
             system="system",
             prompt="prompt",
@@ -847,14 +1212,18 @@ def test_json_field_stream_llm_call_aborts_over_raw_threshold(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            LlmRequestGroupPlugin(key="stream"),
             ResponseOutputTypePlugin(SampleOutput),
             plugin,
         ],
     )
+    request_context = agent.context.llm_request_contexts["stream"]
+    llm_config = request_context.llm_config
+    assert llm_config is not None
     with pytest.raises(ValueError, match=r"5 characters \(limit 4\)"):
         asyncio.run(
-            agent.context.llm_call(
-                llm_cfg=agent.context.llm_config,
+            request_context.llm_call(
+                llm_cfg=llm_config,
                 system="system",
                 prompt="prompt",
                 response_format=SampleOutput.model_json_schema(),
@@ -871,6 +1240,7 @@ def test_labeled_file_map_writer_requires_compatible_output_type(
             cwd=workspace_tmp_path,
             llm_config=SampleLlmConfig(),
             plugins=[
+                LlmRequestGroupPlugin(key="write"),
                 ResponseOutputTypePlugin(SampleOutput),
                 LabeledFileMapWriterPlugin(),
             ],
@@ -884,6 +1254,7 @@ def test_labeled_file_map_writer_resolves_and_writes_output(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            LlmRequestGroupPlugin(key="write"),
             StaticOutputPathsPlugin([Path("notes/output.txt")]),
             ResponseOutputTypePlugin(SampleFileMapOutput),
             LabeledFileMapWriterPlugin(),
@@ -909,11 +1280,13 @@ def test_file_agent_accepts_subset_of_allowed_output_paths(workspace_tmp_path: P
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            LlmRequestGroupPlugin(key="write"),
             StaticOutputPathsPlugin([Path("notes/output.txt"), Path("notes/unchanged.txt")]),
             ResponseOutputTypePlugin(SampleFileMapOutput),
             LabeledFileMapWriterPlugin(),
         ],
     )
+    agent.context = agent.context.llm_request_contexts["write"]
 
     state = agent._apply_output({"raw_output": '{"files":{"notes/output.txt":"hello\\n"}}'})
 
@@ -933,6 +1306,7 @@ def test_text_replacement_file_writer_requires_compatible_output_type(
             cwd=workspace_tmp_path,
             llm_config=SampleLlmConfig(),
             plugins=[
+                LlmRequestGroupPlugin(key="replace"),
                 ResponseOutputTypePlugin(SampleOutput),
                 TextReplacementFileWriterPlugin(target_path=Path("draft.txt")),
             ],
@@ -948,6 +1322,7 @@ def test_text_replacement_file_writer_patches_target_and_writes_report(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            LlmRequestGroupPlugin(key="replace"),
             StaticOutputPathsPlugin([target, report]),
             ResponseOutputTypePlugin(SampleTextReplacementOutput),
             TextReplacementFileWriterPlugin(
@@ -999,6 +1374,7 @@ def test_text_replacement_file_writer_ignores_unchanged_replacement(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            LlmRequestGroupPlugin(key="replace"),
             ResponseOutputTypePlugin(SampleTextReplacementOutput),
             TextReplacementFileWriterPlugin(target_path=target),
         ],
@@ -1019,7 +1395,10 @@ def test_static_system_prompt_plugin_uses_context_vars(workspace_tmp_path: Path)
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[StaticSystemPromptPlugin(lambda context: f"SYSTEM:{context.cwd.name}")],
+        plugins=[
+            LlmRequestGroupPlugin(key="prompt"),
+            StaticSystemPromptPlugin(lambda context: f"SYSTEM:{context.cwd.name}"),
+        ],
     )
 
     assert agent.build_system_prompt("") == f"SYSTEM:{workspace_tmp_path.name}\n"
@@ -1029,6 +1408,7 @@ def test_file_agent_requires_system_prompt_hook(workspace_tmp_path: Path) -> Non
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
+        plugins=[LlmRequestGroupPlugin(key="prompt")],
     )
 
     with pytest.raises(RuntimeError, match="system prompt hook"):
@@ -1047,7 +1427,7 @@ def test_template_system_prompt_plugin_uses_context_vars(
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[plugin],
+        plugins=[LlmRequestGroupPlugin(key="prompt"), plugin],
     )
 
     assert agent.build_system_prompt("") == f"Contract for {workspace_tmp_path.name}\n"
@@ -1057,6 +1437,7 @@ def test_file_agent_requires_user_prompt_hook(workspace_tmp_path: Path) -> None:
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
+        plugins=[LlmRequestGroupPlugin(key="prompt")],
     )
 
     with pytest.raises(RuntimeError, match="user prompt hook"):
@@ -1084,6 +1465,7 @@ def test_template_user_prompt_plugin_adds_context_and_common_variables(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            LlmRequestGroupPlugin(key="prompt"),
             StaticInputPathsPlugin([Path("docs/readme.md"), Path("data/config.yaml")]),
             plugin,
         ],
@@ -1108,7 +1490,8 @@ def test_template_user_prompt_plugin_accepts_static_variables(
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
-        plugins=[plugin],
+        plugins=[LlmRequestGroupPlugin(key="prompt"), plugin],
     )
 
-    assert plugin.build_user_prompt(agent.context, "task", "current") == "hello 0\n"
+    request_context = agent.context.llm_request_contexts["prompt"]
+    assert plugin.build_user_prompt(request_context, "task", "current") == "hello 0\n"

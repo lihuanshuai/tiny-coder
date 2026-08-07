@@ -27,6 +27,8 @@ from tiny_coder.file_agent import AgentContext, BasicFileAgent
 from tiny_coder.plugins import (
     AgentRetryPolicyPlugin,
     LabeledFileMapWriterPlugin,
+    LlmConfigPlugin,
+    LlmRequestGroupPlugin,
     ResponseOutputTypePlugin,
     StaticInputPathsPlugin,
     StaticOutputPathsPlugin,
@@ -56,8 +58,9 @@ class ExampleLlmConfig(BaseModel):
 
 agent = BasicFileAgent(
     cwd=Path.cwd(),
-    llm_config=ExampleLlmConfig(),
     plugins=[
+        LlmConfigPlugin(ExampleLlmConfig()),
+        LlmRequestGroupPlugin(key="sync"),
         StaticInputPathsPlugin([Path("input.md")]),
         StaticOutputPathsPlugin([Path("output.md")]),
         ResponseOutputTypePlugin(FileOutput),
@@ -102,6 +105,69 @@ iteration_plugins = [
     AfterIterationPlugin(finish_iteration),
 ]
 ```
+
+## Serial LLM Requests
+
+`LlmRequestGroupPlugin` starts a keyed request block in the flat agent plugin list. Following
+plugins configure that request's templates, response model, paths, writer, retry policy, and
+LLM-call behavior until the next `LlmRequestGroupPlugin`. Request blocks run in declaration order
+inside each iteration. Every `BasicFileAgent` must declare at least one request block; construction
+fails when `LlmRequestGroupPlugin` is omitted. Put agent-level lifecycle plugins before the first
+request block. Configure the default model with `LlmConfigPlugin` before the first request block,
+or register it inside a request block when that request needs an override.
+
+Later requests can consume earlier parsed outputs from `context.llm_response_outputs`; call
+outcomes and final request results are available from `context.llm_call_outcomes` and
+`context.llm_request_results`. These keyed mappings are reset at the start of each iteration, so
+iteration hooks see only the current iteration's requests.
+
+```python
+from tiny_coder.plugins import (
+    LabeledFileMapWriterPlugin,
+    LlmConfigPlugin,
+    LlmRequestGroupPlugin,
+    ResponseOutputTypePlugin,
+    TemplateSystemPromptPlugin,
+    TemplateUserPromptPlugin,
+)
+
+
+template_root = Path(__file__).parent / "templates"
+
+
+request_plugins = [
+    LlmConfigPlugin(ExampleLlmConfig()),
+    LlmRequestGroupPlugin(key="plan"),
+    ResponseOutputTypePlugin(FileOutput),
+    TemplateSystemPromptPlugin(
+        "plan-system.jinja",
+        template_root=template_root,
+    ),
+    TemplateUserPromptPlugin(
+        "plan-user.jinja",
+        template_root=template_root,
+    ),
+    LabeledFileMapWriterPlugin(),
+    LlmRequestGroupPlugin(key="review"),
+    ResponseOutputTypePlugin(FileOutput),
+    TemplateSystemPromptPlugin(
+        "review-system.jinja",
+        template_root=template_root,
+    ),
+    TemplateUserPromptPlugin(
+        "review-user.jinja",
+        template_root=template_root,
+        template_vars=lambda context: {
+            "plan": context.llm_response_outputs["plan"],
+        },
+    ),
+    LabeledFileMapWriterPlugin(),
+]
+```
+
+`BeforeLlmRequestPlugin` and `AfterLlmRequestPlugin` are optional. When used in a request block,
+they must be paired and receive that request's context for dynamic per-iteration preparation and
+result handling.
 
 ## Development
 

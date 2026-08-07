@@ -200,6 +200,7 @@ async def stream_llm_chat_format(
     try:
         try:
             create_completion = cast(Callable[..., Any], client.chat.completions.create)
+            reasoning_options = {} if config.think else {"reasoning_effort": "none"}
             stream_response = await create_completion(
                 model=config.llm_model,
                 messages=[
@@ -211,10 +212,13 @@ async def stream_llm_chat_format(
                 stream=True,
                 stream_options={"include_usage": True},
                 extra_body=openai_extra_body(llm_cfg),
+                **reasoning_options,
             )
         except Exception as error:
             message = str(error).lower()
-            if "format" in message or "schema" in message or "response_format" in message:
+            if any(
+                marker in message for marker in ("format", "grammar", "schema", "response_format")
+            ):
                 raise RuntimeError(UNSUPPORTED_SCHEMA_HINT) from error
             raise
         async for packet in stream_response:
@@ -246,6 +250,13 @@ async def stream_llm_chat_format(
             "OpenAI-compatible chat stream missing usage metrics (prompt=%s eval=%s); using zeros",
             had_prompt_metric,
             had_eval_metric,
+        )
+    if not collected:
+        raise RuntimeError(
+            "OpenAI-compatible LLM stream returned no content "
+            f"(finish_reason={done_reason or 'unknown'}, "
+            f"prompt_eval_count={prompt_eval_count}, eval_count={eval_count}, "
+            f"reasoning_chars={reasoning_chars})"
         )
     completed_at = datetime.now(timezone.utc).isoformat()
     return LlmChatStreamOutcome(

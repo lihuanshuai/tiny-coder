@@ -12,9 +12,11 @@ from pydantic import BaseModel, ValidationError
 from tiny_coder.json_utils import JsonProtocolError, load_json_object
 from tiny_coder.llm_format_stream import stream_llm_chat_format
 from tiny_coder.plugins import (
+    LlmRequestGroupPlugin,
     _agent_root,
     _FileAgentPlugin,
     _require_output_model_type,
+    _validate_llm_request_registration,
 )
 from tiny_coder.plugins import (
     resolve_agent_file_path as _resolve_agent_file_path,
@@ -55,6 +57,10 @@ class SyncAgentResult:
     written_paths: list[Path]
 
 
+class RetryLlmRequestSequence(ValueError):
+    """Request a fresh execution of the current keyed LLM request sequence."""
+
+
 _BeforeRunCallback: TypeAlias = Callable[["AgentContext"], Awaitable[None]]
 _LlmOutputResultHook: TypeAlias = Callable[[SyncAgentResult], Coroutine[Any, Any, None]]
 _AfterRunHook: TypeAlias = Callable[[SyncAgentResult], Coroutine[Any, Any, None]]
@@ -62,6 +68,8 @@ _BeforeIterationHook: TypeAlias = Callable[["AgentContext", object], Awaitable[N
 _AfterIterationHook: TypeAlias = Callable[
     ["AgentContext", object, SyncAgentResult], Awaitable[None]
 ]
+_BeforeLlmRequestHook: TypeAlias = Callable[["AgentContext", str], Awaitable[None]]
+_AfterLlmRequestHook: TypeAlias = Callable[["AgentContext", str, SyncAgentResult], Awaitable[None]]
 _AfterLlmCallCallback: TypeAlias = Callable[
     ["AgentContext", "LlmCallOutcome"], Coroutine[Any, Any, None]
 ]
@@ -82,7 +90,7 @@ class AgentContext:
     """Mutable runtime data shared with plugins through ``plugin.context``."""
 
     cwd: Path
-    llm_config: BaseModel
+    llm_config: BaseModel | None = None
     llm_call: _LlmCall = field(default_factory=_default_llm_call)
     max_attempts: int = 1
     llm_call_outcome: LlmCallOutcome | None = None
@@ -106,6 +114,13 @@ class AgentContext:
     iteration_item: object | None = None
     before_iteration_hooks: list[_BeforeIterationHook] = field(default_factory=list)
     after_iteration_hooks: list[_AfterIterationHook] = field(default_factory=list)
+    llm_request_contexts: dict[str, AgentContext] = field(default_factory=dict)
+    llm_request_key: str | None = None
+    before_llm_request_hooks: list[_BeforeLlmRequestHook] = field(default_factory=list)
+    after_llm_request_hooks: list[_AfterLlmRequestHook] = field(default_factory=list)
+    llm_call_outcomes: dict[str, LlmCallOutcome] = field(default_factory=dict)
+    llm_response_outputs: dict[str, BaseModel] = field(default_factory=dict)
+    llm_request_results: dict[str, SyncAgentResult] = field(default_factory=dict)
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -205,42 +220,58 @@ class BasicFileAgent:
     """Core file-oriented LangGraph runner with plugin-only lifecycle hooks."""
 
     cwd: Path
-    llm_config: BaseModel
     plugins: InitVar[Sequence[_FileAgentPlugin] | None] = None
     context: AgentContext = field(init=False)
     graph: Any = field(init=False, repr=False)
 
     def __post_init__(self, plugins: Sequence[_FileAgentPlugin] | None) -> None:
         self.cwd = _agent_root(self.cwd)
-        self.context = AgentContext(
-            cwd=self.cwd,
-            llm_config=self.llm_config,
-        )
+        self.context = AgentContext(cwd=self.cwd)
+        registration_context = self.context
         for plugin in plugins or []:
-            plugin.on_registered(self.context)
+            if isinstance(plugin, LlmRequestGroupPlugin):
+                if registration_context is not self.context:
+                    _validate_llm_request_registration(registration_context)
+                plugin.on_registered(self.context)
+                registration_context = self.context.llm_request_contexts[plugin.key]
+            else:
+                plugin.on_registered(registration_context)
+        if registration_context is not self.context:
+            _validate_llm_request_registration(registration_context)
+        if not self.context.llm_request_contexts:
+            raise ValueError("BasicFileAgent requires at least one LlmRequestGroupPlugin")
         self.graph = self._build_graph()
 
     @property
     def input_paths(self) -> list[Path]:
         """Return the current readable input paths from shared agent context."""
-        return self.context.input_paths
+        return self._configured_request_context().input_paths
 
     def output_paths(self) -> list[Path]:
         """Return the files this sync run may write from registered plugins only."""
-        return self.context.output_paths
+        return self._configured_request_context().output_paths
 
     def response_output_type(self) -> type[BaseModel]:
         """Return the full structured output model from registered plugins only."""
-        output_type = self.context.llm_response_output_type
+        output_type = self._configured_request_context().llm_response_output_type
         if output_type is None:
             raise NotImplementedError("llm_response_output_type must be provided by a plugin")
         return _require_output_model_type(output_type)
 
     def split_and_write_output(self, output: BaseModel) -> list[Path]:
         """Persist the validated output through registered plugins only."""
-        if self.context.output_writer is None:
+        context = self._configured_request_context()
+        if context.output_writer is None:
             raise NotImplementedError("output_writer must be provided by a plugin")
-        return self.context.output_writer(self.context, output)
+        return context.output_writer(context, output)
+
+    def _configured_request_context(self) -> AgentContext:
+        request_contexts = self.context.llm_request_contexts
+        if not request_contexts:
+            return self.context
+        if len(request_contexts) == 1:
+            return next(iter(request_contexts.values()))
+        raise RuntimeError("request-specific helper requires exactly one LLM request group")
 
     def _guard_existing_output_paths(self) -> None:
         if self.context.allow_overwrite_existing_paths:
@@ -259,11 +290,12 @@ class BasicFileAgent:
 
     def build_system_prompt(self, task_prompt: str) -> str:
         """Build the system prompt from registered plugins."""
-        if not self.context.system_prompt_hooks:
+        context = self._configured_request_context()
+        if not context.system_prompt_hooks:
             raise RuntimeError("agent requires at least one system prompt hook")
         prompt = ""
-        for hook in self.context.system_prompt_hooks:
-            prompt = hook(self.context, task_prompt, prompt)
+        for hook in context.system_prompt_hooks:
+            prompt = hook(context, task_prompt, prompt)
         return prompt
 
     def build_user_prompt(
@@ -273,12 +305,13 @@ class BasicFileAgent:
         retry_errors: Sequence[str] | None = None,
     ) -> str:
         """Build the user prompt from registered plugins."""
-        if not self.context.user_prompt_hooks:
+        context = self._configured_request_context()
+        if not context.user_prompt_hooks:
             raise RuntimeError("agent requires at least one user prompt hook")
         prompt = ""
-        for hook in self.context.user_prompt_hooks:
+        for hook in context.user_prompt_hooks:
             prompt = hook(
-                self.context,
+                context,
                 task_prompt,
                 prompt,
                 retry_errors=retry_errors,
@@ -296,13 +329,16 @@ class BasicFileAgent:
 
     async def _call_llm(self, state: _SyncGraphState) -> _SyncGraphState:
         """Call LLM server with JSON Schema output; raises when the model call itself fails."""
+        llm_config = self.context.llm_config
+        if llm_config is None:
+            raise RuntimeError("active LLM request has no configured model")
         self.context.llm_call_system_prompt = state["system_prompt"]
         self.context.llm_call_user_prompt = state["user_prompt"]
         self.context.llm_call_outcome = None
         for attempt in range(1, self.context.max_attempts + 1):
             try:
                 outcome = await self.context.llm_call(
-                    llm_cfg=self.context.llm_config,
+                    llm_cfg=llm_config,
                     system=state["system_prompt"],
                     prompt=state["user_prompt"],
                     response_format=self.response_output_type().model_json_schema(),
@@ -366,10 +402,10 @@ class BasicFileAgent:
         for iteration_index, iteration_item in enumerate(iteration_items):
             self.context.iteration_index = iteration_index
             self.context.iteration_item = iteration_item
+            self._reset_llm_request_state()
             for before_iteration_hook in self.context.before_iteration_hooks:
                 await before_iteration_hook(self.context, iteration_item)
-            self._guard_existing_output_paths()
-            result = await self.call_llm_and_apply_output_with_retries()
+            result = await self._run_llm_requests()
             results.append(result)
             for after_iteration_hook in self.context.after_iteration_hooks:
                 await after_iteration_hook(self.context, iteration_item, result)
@@ -390,18 +426,107 @@ class BasicFileAgent:
             written_paths=[path for result in results for path in result.written_paths],
         )
 
-    async def call_llm_and_apply_output(
+    def _reset_llm_request_state(self) -> None:
+        self.context.llm_request_key = None
+        self.context.llm_call_outcomes.clear()
+        self.context.llm_response_outputs.clear()
+        self.context.llm_request_results.clear()
+
+    async def _run_llm_requests(self) -> SyncAgentResult:
+        root_context = self.context
+        request_contexts = root_context.llm_request_contexts
+        first_request = next(iter(request_contexts.values()))
+        retry_errors: list[str] = []
+        for attempt in range(1, first_request.max_attempts + 1):
+            self._reset_llm_request_state()
+            results: list[SyncAgentResult] = []
+            try:
+                for request_index, (request_key, request_context) in enumerate(
+                    request_contexts.items()
+                ):
+                    result = await self._run_llm_request(
+                        root_context=root_context,
+                        request_key=request_key,
+                        request_context=request_context,
+                        retry_errors=retry_errors if request_index == 0 else None,
+                    )
+                    results.append(result)
+            except RetryLlmRequestSequence as error:
+                error_text = str(error)
+                retry_errors.append(error_text)
+                print(
+                    self.format_attempt_error_message(
+                        attempt=attempt,
+                        max_attempts=first_request.max_attempts,
+                        error=error_text,
+                    )
+                )
+                if attempt >= first_request.max_attempts:
+                    raise RuntimeError(
+                        "LLM request sequence failed "
+                        f"after {first_request.max_attempts} attempt(s): {error_text}"
+                    ) from error
+                continue
+            return self._aggregate_results(results)
+        raise RuntimeError("LLM request sequence unexpectedly exhausted retries")
+
+    async def _run_llm_request(
         self,
         *,
-        system_prompt: str,
-        user_prompt: str,
+        root_context: AgentContext,
+        request_key: str,
+        request_context: AgentContext,
+        retry_errors: Sequence[str] | None,
     ) -> SyncAgentResult:
-        """Call the LLM once, then validate and apply its structured output."""
-        self._guard_existing_output_paths()
-        return await self._call_llm_and_apply_output(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-        )
+        self._prepare_llm_request_context(root_context, request_key, request_context)
+        self.context = request_context
+        try:
+            self._clean_up_files()
+            for before_run_hook in request_context.before_run_hooks:
+                await before_run_hook(request_context)
+            for before_request_hook in request_context.before_llm_request_hooks:
+                await before_request_hook(request_context, request_key)
+            self._guard_existing_output_paths()
+            result = await self._call_llm_and_apply_output_with_retries(
+                initial_retry_errors=retry_errors,
+            )
+            for after_run_hook in request_context.after_run_hooks:
+                await after_run_hook(result)
+
+            call_outcome = request_context.llm_call_outcome
+            response_output = request_context.llm_response_output
+            if call_outcome is None or response_output is None:
+                raise RuntimeError("successful keyed LLM request did not record its output")
+            root_context.llm_call_outcomes[request_key] = call_outcome
+            root_context.llm_response_outputs[request_key] = response_output
+            root_context.llm_request_results[request_key] = result
+            for after_request_hook in request_context.after_llm_request_hooks:
+                await after_request_hook(request_context, request_key, result)
+            return result
+        finally:
+            root_context.llm_request_key = request_key
+            root_context.llm_call_outcome = request_context.llm_call_outcome
+            root_context.llm_call_system_prompt = request_context.llm_call_system_prompt
+            root_context.llm_call_user_prompt = request_context.llm_call_user_prompt
+            root_context.llm_response_output = request_context.llm_response_output
+            self.context = root_context
+
+    @staticmethod
+    def _prepare_llm_request_context(
+        root_context: AgentContext,
+        request_key: str,
+        request_context: AgentContext,
+    ) -> None:
+        request_context.iteration_items = root_context.iteration_items
+        request_context.iteration_index = root_context.iteration_index
+        request_context.iteration_item = root_context.iteration_item
+        request_context.llm_request_key = request_key
+        request_context.llm_call_outcome = None
+        request_context.llm_response_output = None
+        request_context.llm_call_outcomes = root_context.llm_call_outcomes
+        request_context.llm_response_outputs = root_context.llm_response_outputs
+        request_context.llm_request_results = root_context.llm_request_results
+        request_context.extras = root_context.extras
 
     async def _call_llm_and_apply_output(
         self,
@@ -419,10 +544,14 @@ class BasicFileAgent:
         ]
         return SyncAgentResult(summary=final_state.get("summary", ""), written_paths=written)
 
-    async def call_llm_and_apply_output_with_retries(self) -> SyncAgentResult:
+    async def _call_llm_and_apply_output_with_retries(
+        self,
+        *,
+        initial_retry_errors: Sequence[str] | None = None,
+    ) -> SyncAgentResult:
         """Call the LLM and apply output, retrying with prior validation errors."""
         max_attempts = self.context.max_attempts
-        retry_errors: list[str] = []
+        retry_errors = list(initial_retry_errors or [])
         resolved_system_prompt = self.build_system_prompt("")
         for attempt in range(1, max_attempts + 1):
             user_prompt = self.build_user_prompt(
@@ -436,6 +565,8 @@ class BasicFileAgent:
                 )
                 for output_result_hook in self.context.llm_output_result_hooks:
                     await output_result_hook(result)
+            except RetryLlmRequestSequence:
+                raise
             except (ValueError, OSError) as e:
                 error_text = str(e)
                 retry_errors.append(error_text)
@@ -473,6 +604,7 @@ __all__ = [
     "BasicFileAgent",
     "AgentContext",
     "LlmCallOutcome",
+    "RetryLlmRequestSequence",
     "SyncAgentResult",
     "content_to_yaml_text",
     "read_agent_file",

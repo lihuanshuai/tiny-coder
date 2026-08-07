@@ -60,6 +60,10 @@ _BeforeIterationCallback: TypeAlias = Callable[["AgentContext", object], Awaitab
 _AfterIterationCallback: TypeAlias = Callable[
     ["AgentContext", object, "SyncAgentResult"], Awaitable[None]
 ]
+_BeforeLlmRequestCallback: TypeAlias = Callable[["AgentContext", str], Awaitable[None]]
+_AfterLlmRequestCallback: TypeAlias = Callable[
+    ["AgentContext", str, "SyncAgentResult"], Awaitable[None]
+]
 _SessionTurnT = TypeVar("_SessionTurnT", bound=Mapping[str, Any])
 
 
@@ -199,6 +203,74 @@ class AfterIterationPlugin:
     def on_registered(self, context: AgentContext) -> None:
         """Register the callback on the shared iteration lifecycle."""
         context.after_iteration_hooks.append(self.handler)
+
+
+@dataclass
+class LlmRequestGroupPlugin:
+    """Start one flat, keyed request configuration block in the agent plugin list."""
+
+    key: str
+
+    def __post_init__(self) -> None:
+        if not self.key.strip():
+            raise ValueError("LLM request key must not be blank")
+
+    def on_registered(self, context: AgentContext) -> None:
+        """Create and register this keyed request context on the agent context."""
+        # Local import avoids the file_agent/plugins module cycle during import.
+        from tiny_coder.file_agent import AgentContext
+
+        if self.key in context.llm_request_contexts:
+            raise ValueError(f"duplicate LLM request key: {self.key}")
+
+        request_context = AgentContext(cwd=context.cwd, llm_config=context.llm_config)
+        request_context.llm_request_key = self.key
+        request_context.llm_call_outcomes = context.llm_call_outcomes
+        request_context.llm_response_outputs = context.llm_response_outputs
+        request_context.llm_request_results = context.llm_request_results
+        request_context.extras = context.extras
+        context.llm_request_contexts[self.key] = request_context
+
+
+@dataclass
+class BeforeLlmRequestPlugin:
+    """Prepare the active keyed LLM request before each call."""
+
+    handler: _BeforeLlmRequestCallback
+
+    def on_registered(self, context: AgentContext) -> None:
+        """Register the callback on the active request context."""
+        if context.llm_request_key is None:
+            raise RuntimeError("BeforeLlmRequestPlugin requires a preceding LlmRequestGroupPlugin")
+        context.before_llm_request_hooks.append(self.handler)
+
+
+@dataclass
+class AfterLlmRequestPlugin:
+    """Inspect the active keyed LLM request after it succeeds."""
+
+    handler: _AfterLlmRequestCallback
+
+    def on_registered(self, context: AgentContext) -> None:
+        """Register the callback on the active request context."""
+        if context.llm_request_key is None:
+            raise RuntimeError("AfterLlmRequestPlugin requires a preceding LlmRequestGroupPlugin")
+        context.after_llm_request_hooks.append(self.handler)
+
+
+def _validate_llm_request_registration(context: AgentContext) -> None:
+    """Validate one completed keyed request configuration."""
+    if (
+        context.iteration_items is not None
+        or context.before_iteration_hooks
+        or context.after_iteration_hooks
+        or context.llm_request_contexts
+    ):
+        raise ValueError("LLM request plugins must not configure nested request or iteration runs")
+    if len(context.before_llm_request_hooks) != len(context.after_llm_request_hooks):
+        raise ValueError("BeforeLlmRequestPlugin and AfterLlmRequestPlugin must be paired")
+    if context.llm_config is None:
+        raise ValueError("LLM request requires LlmConfigPlugin")
 
 
 class DynamicOutputPathsPlugin:
@@ -416,6 +488,16 @@ class ResponseOutputTypePlugin:
         context.llm_response_output_type = self.output_type
 
 
+@dataclass
+class LlmConfigPlugin:
+    """Provide the model configuration for the active LLM request group."""
+
+    llm_config: BaseModel
+
+    def on_registered(self, context: AgentContext) -> None:
+        context.llm_config = self.llm_config
+
+
 class SilentLlmCallPlugin:
     """Suppress streamed chunks while preserving the configured LLM call."""
 
@@ -555,6 +637,17 @@ class LabeledFileMapWriterPlugin:
         return [_write_text_file(path, content) for path, content in files.items()]
 
 
+class NoopOutputWriterPlugin:
+    """Accept a validated response without writing workspace files."""
+
+    def on_registered(self, context: AgentContext) -> None:
+        context.output_writer = self.write_output
+
+    def write_output(self, context: AgentContext, output: BaseModel) -> list[Path]:
+        _ = context, output
+        return []
+
+
 @dataclass(kw_only=True)
 class TextReplacementFileWriterPlugin:
     """Apply model-provided replacements to one text file and write an optional report."""
@@ -628,8 +721,10 @@ def _write_text_file(path: Path, content: str) -> Path:
 __all__ = [
     "AgentRetryPolicyPlugin",
     "AfterIterationPlugin",
+    "AfterLlmRequestPlugin",
     "AfterRunPlugin",
     "BeforeIterationPlugin",
+    "BeforeLlmRequestPlugin",
     "BeforeRunPlugin",
     "DynamicOutputPathsPlugin",
     "ExistingPathGuardPlugin",
@@ -638,10 +733,13 @@ __all__ = [
     "IterativeRunPlugin",
     "JsonFieldStreamLlmCallPlugin",
     "LabeledFileMapWriterPlugin",
+    "LlmConfigPlugin",
     "LlmOutputResultPlugin",
+    "LlmRequestGroupPlugin",
     "ResponseOutputTypePlugin",
     "resolve_agent_file_path",
     "LlmSessionTurnPlugin",
+    "NoopOutputWriterPlugin",
     "SilentLlmCallPlugin",
     "StaticInputPathsPlugin",
     "StaticOutputPathsPlugin",
