@@ -32,6 +32,7 @@ from tiny_coder.plugins import (
     BeforeIterationPlugin,
     BeforeLlmRequestPlugin,
     BeforeRunPlugin,
+    ConditionalLlmRequestPlugin,
     DynamicOutputPathsPlugin,
     ExistingPathGuardPlugin,
     FileCleanupPlugin,
@@ -795,6 +796,96 @@ def test_serial_llm_requests_run_in_order_and_record_keyed_results(
     }
     assert list(agent.context.llm_request_results) == ["plan", "review"]
     assert result == SyncAgentResult(summary="", written_paths=[])
+
+
+def test_conditional_llm_requests_use_prior_results_and_skip_cleanly(
+    workspace_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_test_file(workspace_tmp_path, Path("system.jinja"), "system")
+    _write_test_file(workspace_tmp_path, Path("user.jinja"), "user")
+    marker_path = _write_test_file(workspace_tmp_path, Path("keep.txt"), "keep")
+    calls: list[str] = []
+    skipped_events: list[str] = []
+
+    async def llm_call(**kwargs: Any) -> LlmCallOutcome:
+        properties = list(kwargs["response_format"]["properties"])
+        key = "plan" if "plan" in properties else "review"
+        calls.append(key)
+        payload = {"plan": "draft"} if key == "plan" else {"review": "checked"}
+        return SampleLlmOutcome(
+            text=json.dumps(payload),
+            prompt_eval_count=1,
+            eval_count=1,
+        )
+
+    def request_plugins(key: str, output_type: type[BaseModel]) -> list[Any]:
+        return [
+            LlmRequestGroupPlugin(key=key),
+            ResponseOutputTypePlugin(output_type),
+            TemplateSystemPromptPlugin("system.jinja", template_root=workspace_tmp_path),
+            TemplateUserPromptPlugin("user.jinja", template_root=workspace_tmp_path),
+            LabeledFileMapWriterPlugin(),
+        ]
+
+    async def before_skipped(_context: AgentContext, _key: str) -> None:
+        skipped_events.append("before")
+
+    async def after_skipped(
+        _context: AgentContext,
+        _key: str,
+        _result: SyncAgentResult,
+    ) -> None:
+        skipped_events.append("after")
+
+    monkeypatch.setattr(file_agent, "stream_llm_chat_format", llm_call)
+    agent = BasicFileAgent(
+        cwd=workspace_tmp_path,
+        llm_config=SampleLlmConfig(),
+        plugins=[
+            *request_plugins("plan", SamplePlanOutput),
+            LlmRequestGroupPlugin(key="review"),
+            ConditionalLlmRequestPlugin(
+                should_run=lambda context, _key: (
+                    context.llm_response_outputs.get("plan") == SamplePlanOutput(plan="draft")
+                )
+            ),
+            ResponseOutputTypePlugin(SampleReviewOutput),
+            TemplateSystemPromptPlugin("system.jinja", template_root=workspace_tmp_path),
+            TemplateUserPromptPlugin("user.jinja", template_root=workspace_tmp_path),
+            LabeledFileMapWriterPlugin(),
+            LlmRequestGroupPlugin(key="skipped"),
+            ConditionalLlmRequestPlugin(should_run=lambda _context, _key: False),
+            BeforeLlmRequestPlugin(handler=before_skipped),
+            FileCleanupPlugin([marker_path]),
+            ResponseOutputTypePlugin(SampleReviewOutput),
+            TemplateSystemPromptPlugin("system.jinja", template_root=workspace_tmp_path),
+            TemplateUserPromptPlugin("user.jinja", template_root=workspace_tmp_path),
+            LabeledFileMapWriterPlugin(),
+            AfterLlmRequestPlugin(handler=after_skipped),
+        ],
+    )
+
+    result = asyncio.run(agent.run())
+
+    assert calls == ["plan", "review"]
+    assert list(agent.context.llm_response_outputs) == ["plan", "review"]
+    assert "skipped" not in agent.context.llm_call_outcomes
+    assert "skipped" not in agent.context.llm_request_results
+    assert marker_path.read_text(encoding="utf-8") == "keep"
+    assert skipped_events == []
+    assert result == SyncAgentResult(summary="", written_paths=[])
+
+
+def test_conditional_llm_request_requires_request_group(workspace_tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="requires a preceding LlmRequestGroupPlugin"):
+        BasicFileAgent(
+            cwd=workspace_tmp_path,
+            llm_config=SampleLlmConfig(),
+            plugins=[
+                ConditionalLlmRequestPlugin(should_run=lambda _context, _key: True),
+            ],
+        )
 
 
 def test_llm_request_group_plugin_rejects_blank_key() -> None:

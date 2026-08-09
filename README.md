@@ -123,6 +123,7 @@ iteration hooks see only the current iteration's requests.
 
 ```python
 from tiny_coder.plugins import (
+    ConditionalLlmRequestPlugin,
     LabeledFileMapWriterPlugin,
     LlmConfigPlugin,
     LlmRequestGroupPlugin,
@@ -149,6 +150,9 @@ request_plugins = [
     ),
     LabeledFileMapWriterPlugin(),
     LlmRequestGroupPlugin(key="review"),
+    ConditionalLlmRequestPlugin(
+        should_run=lambda context, _key: "plan" in context.llm_response_outputs,
+    ),
     ResponseOutputTypePlugin(FileOutput),
     TemplateSystemPromptPlugin(
         "review-system.jinja",
@@ -168,6 +172,12 @@ request_plugins = [
 `BeforeLlmRequestPlugin` and `AfterLlmRequestPlugin` are optional. When used in a request block,
 they must be paired and receive that request's context for dynamic per-iteration preparation and
 result handling.
+
+`ConditionalLlmRequestPlugin` evaluates its synchronous predicate immediately before its request
+block would run. A false result skips the model call, cleanup, hooks, writer, and keyed result while
+later request blocks continue normally. The predicate can inspect prior keyed results and shared
+`context.extras`, so a fixed request sequence can express bounded conditional stages without
+constructing another agent.
 
 ## Development
 

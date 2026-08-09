@@ -64,6 +64,7 @@ _BeforeLlmRequestCallback: TypeAlias = Callable[["AgentContext", str], Awaitable
 _AfterLlmRequestCallback: TypeAlias = Callable[
     ["AgentContext", str, "SyncAgentResult"], Awaitable[None]
 ]
+_LlmRequestCondition: TypeAlias = Callable[["AgentContext", str], bool]
 _SessionTurnT = TypeVar("_SessionTurnT", bound=Mapping[str, Any])
 
 
@@ -230,6 +231,23 @@ class LlmRequestGroupPlugin:
         request_context.llm_request_results = context.llm_request_results
         request_context.extras = context.extras
         context.llm_request_contexts[self.key] = request_context
+
+
+@dataclass
+class ConditionalLlmRequestPlugin:
+    """Run the active keyed request only when its runtime condition is true."""
+
+    should_run: _LlmRequestCondition
+
+    def on_registered(self, context: AgentContext) -> None:
+        """Register one condition on the active request context."""
+        if context.llm_request_key is None:
+            raise RuntimeError(
+                "ConditionalLlmRequestPlugin requires a preceding LlmRequestGroupPlugin"
+            )
+        if context.llm_request_condition is not None:
+            raise RuntimeError("LLM request condition is already configured")
+        context.llm_request_condition = self.should_run
 
 
 @dataclass
@@ -726,6 +744,7 @@ __all__ = [
     "BeforeIterationPlugin",
     "BeforeLlmRequestPlugin",
     "BeforeRunPlugin",
+    "ConditionalLlmRequestPlugin",
     "DynamicOutputPathsPlugin",
     "ExistingPathGuardPlugin",
     "FileCleanupPlugin",

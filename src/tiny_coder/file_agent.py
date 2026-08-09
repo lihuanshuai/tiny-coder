@@ -70,6 +70,7 @@ _AfterIterationHook: TypeAlias = Callable[
 ]
 _BeforeLlmRequestHook: TypeAlias = Callable[["AgentContext", str], Awaitable[None]]
 _AfterLlmRequestHook: TypeAlias = Callable[["AgentContext", str, SyncAgentResult], Awaitable[None]]
+_LlmRequestCondition: TypeAlias = Callable[["AgentContext", str], bool]
 _AfterLlmCallCallback: TypeAlias = Callable[
     ["AgentContext", "LlmCallOutcome"], Coroutine[Any, Any, None]
 ]
@@ -118,6 +119,7 @@ class AgentContext:
     llm_request_key: str | None = None
     before_llm_request_hooks: list[_BeforeLlmRequestHook] = field(default_factory=list)
     after_llm_request_hooks: list[_AfterLlmRequestHook] = field(default_factory=list)
+    llm_request_condition: _LlmRequestCondition | None = None
     llm_call_outcomes: dict[str, LlmCallOutcome] = field(default_factory=dict)
     llm_response_outputs: dict[str, BaseModel] = field(default_factory=dict)
     llm_request_results: dict[str, SyncAgentResult] = field(default_factory=dict)
@@ -444,6 +446,14 @@ class BasicFileAgent:
                 for request_index, (request_key, request_context) in enumerate(
                     request_contexts.items()
                 ):
+                    self._prepare_llm_request_context(
+                        root_context,
+                        request_key,
+                        request_context,
+                    )
+                    condition = request_context.llm_request_condition
+                    if condition is not None and not condition(request_context, request_key):
+                        continue
                     result = await self._run_llm_request(
                         root_context=root_context,
                         request_key=request_key,
