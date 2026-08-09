@@ -40,10 +40,10 @@ from tiny_coder.plugins import (
     IterativeRunPlugin,
     JsonFieldStreamLlmCallPlugin,
     LabeledFileMapWriterPlugin,
+    LlmCallJsonlRecorderPlugin,
     LlmConfigPlugin,
     LlmOutputResultPlugin,
     LlmRequestGroupPlugin,
-    LlmSessionTurnPlugin,
     ResponseOutputTypePlugin,
     SilentLlmCallPlugin,
     StaticInputPathsPlugin,
@@ -452,43 +452,59 @@ def test_file_agent_records_llm_call_outcome(
     assert request_context.llm_call_user_prompt == "prompt"
 
 
-def test_llm_session_turn_plugin_appends_call(
+def test_llm_call_jsonl_recorder_records_every_call_with_custom_extra(
     workspace_tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    outcome = SampleLlmOutcome(
-        text="原始响应",
-        prompt_eval_count=3,
-        eval_count=4,
+    outcomes = iter(
+        [
+            SampleLlmOutcome(text="第一次响应", prompt_eval_count=3, eval_count=4),
+            SampleLlmOutcome(text="第二次响应", prompt_eval_count=5, eval_count=6),
+        ]
     )
 
     async def llm_call(**_kwargs: Any) -> LlmCallOutcome:
-        return outcome
+        return next(outcomes)
 
     monkeypatch.setattr(file_agent, "stream_llm_chat_format", llm_call)
-    plugin = LlmSessionTurnPlugin[dict[str, Any]](
+    plugin = LlmCallJsonlRecorderPlugin(
         path=Path("sessions/agent.jsonl"),
-        turn_factory=lambda context, call_outcome: {
+        extra_handler=lambda context, _outcome: {
             "cwd": context.cwd.name,
-            "text": call_outcome.text,
         },
     )
     agent = BasicFileAgent(
         cwd=workspace_tmp_path,
         llm_config=SampleLlmConfig(),
         plugins=[
+            plugin,
             LlmRequestGroupPlugin(key="session"),
             ResponseOutputTypePlugin(SampleOutput),
-            plugin,
         ],
     )
     agent.context = agent.context.llm_request_contexts["session"]
 
-    asyncio.run(agent._call_llm({"system_prompt": "system", "user_prompt": "prompt"}))
+    asyncio.run(agent._call_llm({"system_prompt": "system 1", "user_prompt": "prompt 1"}))
+    asyncio.run(agent._call_llm({"system_prompt": "system 2", "user_prompt": "prompt 2"}))
 
     target = (workspace_tmp_path / "sessions" / "agent.jsonl").resolve()
     assert [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()] == [
-        {"cwd": workspace_tmp_path.name, "text": "原始响应"},
+        {
+            "request_key": "session",
+            "system": "system 1",
+            "user": "prompt 1",
+            "output": "第一次响应",
+            "stats": {"prompt_eval_count": 3, "eval_count": 4},
+            "extra": {"cwd": workspace_tmp_path.name},
+        },
+        {
+            "request_key": "session",
+            "system": "system 2",
+            "user": "prompt 2",
+            "output": "第二次响应",
+            "stats": {"prompt_eval_count": 5, "eval_count": 6},
+            "extra": {"cwd": workspace_tmp_path.name},
+        },
     ]
 
 

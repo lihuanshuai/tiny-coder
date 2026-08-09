@@ -125,6 +125,7 @@ iteration hooks see only the current iteration's requests.
 from tiny_coder.plugins import (
     ConditionalLlmRequestPlugin,
     LabeledFileMapWriterPlugin,
+    LlmCallJsonlRecorderPlugin,
     LlmConfigPlugin,
     LlmRequestGroupPlugin,
     ResponseOutputTypePlugin,
@@ -138,6 +139,12 @@ template_root = Path(__file__).parent / "templates"
 
 request_plugins = [
     LlmConfigPlugin(ExampleLlmConfig()),
+    LlmCallJsonlRecorderPlugin(
+        path=Path("logs/llm-calls.jsonl"),
+        extra_handler=lambda context, _outcome: {
+            "iteration_index": context.iteration_index,
+        },
+    ),
     LlmRequestGroupPlugin(key="plan"),
     ResponseOutputTypePlugin(FileOutput),
     TemplateSystemPromptPlugin(
@@ -178,6 +185,12 @@ block would run. A false result skips the model call, cleanup, hooks, writer, an
 later request blocks continue normally. The predicate can inspect prior keyed results and shared
 `context.extras`, so a fixed request sequence can express bounded conditional stages without
 constructing another agent.
+
+`LlmCallJsonlRecorderPlugin` records raw `request_key`, `system`, `user`, `output`, and token
+`stats` for every completed LLM call. Register it before the first request group to cover every
+keyed request in the agent, including calls whose structured output later fails validation and is
+retried. `extra_handler` may add JSON-serializable caller metadata without changing the fixed call
+record contract.
 
 ## Development
 

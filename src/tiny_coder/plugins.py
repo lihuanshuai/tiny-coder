@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
-    Generic,
     Protocol,
     TypeAlias,
+    TypedDict,
     TypeVar,
     cast,
     runtime_checkable,
@@ -65,7 +65,25 @@ _AfterLlmRequestCallback: TypeAlias = Callable[
     ["AgentContext", str, "SyncAgentResult"], Awaitable[None]
 ]
 _LlmRequestCondition: TypeAlias = Callable[["AgentContext", str], bool]
-_SessionTurnT = TypeVar("_SessionTurnT", bound=Mapping[str, Any])
+_JsonScalar: TypeAlias = str | int | float | bool | None
+_JsonValue: TypeAlias = _JsonScalar | list["_JsonValue"] | dict[str, "_JsonValue"]
+_LlmCallExtraHandler: TypeAlias = Callable[
+    ["AgentContext", "LlmCallOutcome"], Mapping[str, _JsonValue]
+]
+
+
+class _LlmCallStats(TypedDict):
+    prompt_eval_count: int
+    eval_count: int
+
+
+class _LlmCallJsonlRecord(TypedDict):
+    request_key: str | None
+    system: str
+    user: str
+    output: str
+    stats: _LlmCallStats
+    extra: dict[str, _JsonValue]
 
 
 class _FileAgentPlugin(Protocol):
@@ -109,25 +127,37 @@ class StaticOutputPathsPlugin:
 
 
 @dataclass(kw_only=True)
-class LlmSessionTurnPlugin(Generic[_SessionTurnT]):
-    """Append a caller-defined session turn after each successful LLM call."""
+class LlmCallJsonlRecorderPlugin:
+    """Append every completed LLM call's raw input and output to one JSONL file."""
 
     path: Path
-    turn_factory: Callable[[AgentContext, LlmCallOutcome], _SessionTurnT]
+    extra_handler: _LlmCallExtraHandler | None = None
     target_path: Path = field(init=False)
 
     def on_registered(self, context: AgentContext) -> None:
-        """Resolve the session path and register the turn recorder."""
+        """Resolve the log path and register the call recorder for this scope."""
         self.target_path = resolve_agent_file_path(context.cwd, self.path)
-        context.after_llm_call_hooks.append(self._record_turn)
+        context.after_llm_call_hooks.append(self._record_call)
 
-    async def _record_turn(self, context: AgentContext, outcome: LlmCallOutcome) -> None:
-        self._append(self.turn_factory(context, outcome))
+    async def _record_call(self, context: AgentContext, outcome: LlmCallOutcome) -> None:
+        extra = dict(self.extra_handler(context, outcome)) if self.extra_handler else {}
+        record = _LlmCallJsonlRecord(
+            request_key=context.llm_request_key,
+            system=context.llm_call_system_prompt,
+            user=context.llm_call_user_prompt,
+            output=outcome.text,
+            stats=_LlmCallStats(
+                prompt_eval_count=int(outcome.prompt_eval_count),
+                eval_count=int(outcome.eval_count),
+            ),
+            extra=extra,
+        )
+        self._append(record)
 
-    def _append(self, turn: _SessionTurnT) -> None:
+    def _append(self, record: _LlmCallJsonlRecord) -> None:
         self.target_path.parent.mkdir(parents=True, exist_ok=True)
         with self.target_path.open("a", encoding="utf-8", newline="\n") as f:
-            f.write(json.dumps(dict(turn), ensure_ascii=False) + "\n")
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 @dataclass
@@ -230,6 +260,7 @@ class LlmRequestGroupPlugin:
         request_context.llm_response_outputs = context.llm_response_outputs
         request_context.llm_request_results = context.llm_request_results
         request_context.extras = context.extras
+        request_context.after_llm_call_hooks = list(context.after_llm_call_hooks)
         context.llm_request_contexts[self.key] = request_context
 
 
@@ -753,11 +784,11 @@ __all__ = [
     "JsonFieldStreamLlmCallPlugin",
     "LabeledFileMapWriterPlugin",
     "LlmConfigPlugin",
+    "LlmCallJsonlRecorderPlugin",
     "LlmOutputResultPlugin",
     "LlmRequestGroupPlugin",
     "ResponseOutputTypePlugin",
     "resolve_agent_file_path",
-    "LlmSessionTurnPlugin",
     "NoopOutputWriterPlugin",
     "SilentLlmCallPlugin",
     "StaticInputPathsPlugin",
