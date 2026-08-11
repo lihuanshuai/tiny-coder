@@ -26,6 +26,7 @@ class _OpenAIChatConfig(Protocol):
     temperature: float
     repeat_penalty: float
     think: bool
+    timeout: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,11 +153,22 @@ def openai_api_key() -> str:
 
 
 def _require_openai_chat_config(llm_cfg: BaseModel) -> _OpenAIChatConfig:
-    required = ("base_url", "llm_model", "num_ctx", "temperature", "repeat_penalty", "think")
+    required = (
+        "base_url",
+        "llm_model",
+        "num_ctx",
+        "temperature",
+        "repeat_penalty",
+        "think",
+        "timeout",
+    )
     missing = [name for name in required if not hasattr(llm_cfg, name)]
     if missing:
         raise TypeError("llm_cfg is missing OpenAI-compatible fields: " + ", ".join(missing))
-    return cast(_OpenAIChatConfig, llm_cfg)
+    config = cast(_OpenAIChatConfig, llm_cfg)
+    if config.timeout <= 0:
+        raise ValueError("llm_cfg.timeout must be greater than zero")
+    return config
 
 
 def openai_extra_body(llm_cfg: BaseModel) -> dict[str, Any]:
@@ -182,7 +194,11 @@ async def stream_llm_chat_format(
     config = _require_openai_chat_config(llm_cfg)
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
-    client = AsyncOpenAI(base_url=config.base_url, api_key=openai_api_key())
+    client = AsyncOpenAI(
+        base_url=config.base_url,
+        api_key=openai_api_key(),
+        timeout=config.timeout,
+    )
     prompt_eval_count = 0
     eval_count = 0
     had_prompt_metric = False

@@ -22,6 +22,7 @@ class SampleOpenAIConfig(BaseModel):
     temperature: float = 0.5
     repeat_penalty: float = 1.1
     think: bool = False
+    timeout: float = 37.0
 
 
 class FakeStream:
@@ -59,10 +60,12 @@ class FakeCompletions:
 
 class FakeAsyncOpenAI:
     closed = False
+    timeout = 0.0
 
-    def __init__(self, *, base_url: str, api_key: str) -> None:
+    def __init__(self, *, base_url: str, api_key: str, timeout: float) -> None:
         self.base_url = base_url
         self.api_key = api_key
+        type(self).timeout = timeout
         self.chat = SimpleNamespace(completions=FakeCompletions())
 
     async def close(self) -> None:
@@ -141,7 +144,21 @@ def test_stream_llm_chat_format_forwards_schema_chunks_and_metrics(
         "think": False,
     }
     assert FakeCompletions.kwargs["reasoning_effort"] == "none"
+    assert FakeAsyncOpenAI.timeout == 37.0
     assert FakeAsyncOpenAI.closed is True
+
+
+def test_stream_llm_chat_format_rejects_nonpositive_timeout() -> None:
+    with pytest.raises(ValueError, match="timeout must be greater than zero"):
+        asyncio.run(
+            stream_llm_chat_format(
+                llm_cfg=SampleOpenAIConfig(timeout=0),
+                system="system",
+                prompt="prompt",
+                response_format={"type": "object"},
+                on_chunk=lambda _chunk: None,
+            )
+        )
 
 
 def test_stream_llm_chat_format_raises_server_stream_error(

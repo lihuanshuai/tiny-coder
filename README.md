@@ -54,6 +54,7 @@ class ExampleLlmConfig(BaseModel):
     temperature: float = 0.2
     repeat_penalty: float = 1.1
     think: bool = False
+    timeout: float = 600.0
 
 
 agent = BasicFileAgent(
