@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import Protocol
 from unicodedata import category, normalize
 
 _FUZZY_MIN_RATIO = 0.82
@@ -11,24 +10,10 @@ _FUZZY_MIN_MARGIN = 0.05
 _FUZZY_MIN_CHARS = 12
 
 
-class _TextReplacementLike(Protocol):
-    @property
-    def from_text(self) -> str: ...
-
-    @property
-    def to_text(self) -> str: ...
-
-
 @dataclass(frozen=True, slots=True)
 class TextReplacement:
-    from_text: str
     to_text: str
-
-
-@dataclass(frozen=True, slots=True)
-class TextReplacementFilePatch:
-    replacements: Sequence[TextReplacement]
-    report: str | None = None
+    from_text: str | None = None
 
 
 class TextReplacementApplyError(ValueError):
@@ -187,7 +172,7 @@ def _inherit_fuzzy_match_indentation(
 
 def apply_text_replacements(
     original: str,
-    replacements: Sequence[_TextReplacementLike],
+    replacements: Sequence[TextReplacement],
     *,
     ignore_punctuation_and_symbols: bool = False,
 ) -> str:
@@ -196,8 +181,12 @@ def apply_text_replacements(
         raise TextReplacementApplyError("replacement list must not be empty")
     updated = _normalize_newlines(original)
     for index, replacement in enumerate(replacements, start=1):
-        from_text = _normalize_newlines(replacement.from_text)
         to_text = _normalize_newlines(replacement.to_text)
+        if replacement.from_text is None:
+            updated = to_text
+            continue
+
+        from_text = _normalize_newlines(replacement.from_text)
         if not from_text:
             raise TextReplacementApplyError(f"replacement {index} from_text must not be empty")
         if from_text == to_text:
@@ -218,18 +207,18 @@ def apply_text_replacements(
             if updated[start:end].endswith("\n") and not replacement_text.endswith("\n"):
                 replacement_text += "\n"
             updated = updated[:start] + replacement_text + updated[end:]
-            continue
-        if count > 1:
+        elif count > 1:
             raise TextReplacementApplyError(
                 f"replacement {index} from_text matched {count} locations; refusing to apply"
             )
-        updated = updated.replace(from_text, to_text, 1)
-    return updated.rstrip("\n") + "\n"
+        else:
+            updated = updated.replace(from_text, to_text, 1)
+        updated = updated.rstrip("\n") + "\n" if updated else ""
+    return updated
 
 
 __all__ = [
     "TextReplacement",
     "TextReplacementApplyError",
-    "TextReplacementFilePatch",
     "apply_text_replacements",
 ]

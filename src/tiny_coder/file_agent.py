@@ -19,7 +19,6 @@ from tiny_coder.plugins import (
     resolve_agent_root,
     validate_llm_request_registration,
 )
-from tiny_coder.yaml_utils import dump_yaml_text
 
 _OutputT = TypeVar("_OutputT", bound=BaseModel)
 _SystemPromptCallback: TypeAlias = Callable[["AgentContext", str, str], str]
@@ -194,23 +193,6 @@ def parse_structured_output(raw_output: str, *, output_type: type[_OutputT]) -> 
         raise ValueError(f"invalid structured output: {e}") from e
 
 
-def content_to_yaml_text(content: Any) -> str:
-    """Serialize a validated content object to project YAML text."""
-    data = _content_to_yaml_data(content)
-    return dump_yaml_text(data, sort_keys=False).rstrip() + "\n"
-
-
-def _content_to_yaml_data(content: Any) -> Any:
-    """Convert Pydantic models nested in simple containers before YAML dumping."""
-    if isinstance(content, BaseModel):
-        return content.model_dump(mode="python", exclude_none=True)
-    if isinstance(content, list):
-        return [_content_to_yaml_data(item) for item in content]
-    if isinstance(content, dict):
-        return {key: _content_to_yaml_data(value) for key, value in content.items()}
-    return content
-
-
 def _print_llm_chunk(chunk: str) -> None:
     print(chunk, end="", flush=True)
 
@@ -229,6 +211,8 @@ class BasicFileAgent:
         self.context = AgentContext(cwd=self.cwd)
         registration_context = self.context
         for plugin in plugins or []:
+            if not isinstance(plugin, FileAgentPlugin):
+                raise TypeError("plugin must inherit FileAgentPlugin")
             if isinstance(plugin, LlmRequestGroupPlugin):
                 if registration_context is not self.context:
                     validate_llm_request_registration(registration_context)
@@ -382,7 +366,7 @@ class BasicFileAgent:
         extra = actual - allowed
         if allowed and extra:
             labels = ", ".join(_relative_label(self.cwd, path) for path in sorted(extra))
-            raise ValueError(f"sync writer returned unexpected paths: extra={labels}")
+            raise ValueError(f"output writer returned unexpected paths: extra={labels}")
         summary = getattr(output, "summary", "")
         return {
             "summary": summary if isinstance(summary, str) else "",
@@ -616,7 +600,6 @@ __all__ = [
     "RetryLlmRequestSequence",
     "SyncAgentResult",
     "agent_input_snapshots",
-    "content_to_yaml_text",
     "parse_structured_output",
     "read_agent_file",
 ]

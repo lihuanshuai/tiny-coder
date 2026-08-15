@@ -1,29 +1,27 @@
 from __future__ import annotations
 
 import json
+from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
-    Protocol,
     TypeAlias,
     TypedDict,
-    TypeVar,
-    cast,
-    runtime_checkable,
 )
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from pydantic import BaseModel
 
-from tiny_coder.json_utils import JsonStringFieldStreamer
-from tiny_coder.text_replacement import (
-    TextReplacement,
-    TextReplacementFilePatch,
-    apply_text_replacements,
+from tiny_coder.apply_patch import (
+    ApplyPatchOutput,
+    apply_patches,
+    resolve_agent_file_path,
+    resolve_agent_root,
 )
+from tiny_coder.json_utils import JsonStringFieldStreamer
 
 if TYPE_CHECKING:
     from tiny_coder.file_agent import (
@@ -32,22 +30,6 @@ if TYPE_CHECKING:
         LlmCallOutcome,
         SyncAgentResult,
     )
-
-
-def resolve_agent_root(root: Path) -> Path:
-    return Path(root).expanduser().resolve()
-
-
-def resolve_agent_file_path(root: Path, path: Path) -> Path:
-    """Resolve an agent-visible file path and keep it inside the workspace root."""
-    root_path = resolve_agent_root(root)
-    raw = path.expanduser()
-    candidate = raw.resolve() if raw.is_absolute() else (root_path / raw).resolve()
-    try:
-        candidate.relative_to(root_path)
-    except ValueError as e:
-        raise ValueError(f"path is outside agent workspace: {path}") from e
-    return candidate
 
 
 _SystemPromptProvider: TypeAlias = str | Callable[["AgentContext"], str]
@@ -86,25 +68,11 @@ class _LlmCallJsonlRecord(TypedDict):
     extra: dict[str, _JsonValue]
 
 
-@runtime_checkable
-class FileAgentPlugin(Protocol):
+class FileAgentPlugin(ABC):
     """Register one focused capability on an agent context."""
 
+    @abstractmethod
     def on_registered(self, context: AgentContext) -> None: ...
-
-
-@runtime_checkable
-class _LabeledFileMapOutput(Protocol):
-    """Structured output that maps agent-visible paths to custom file content."""
-
-    def to_file_map(self, context: AgentContext) -> Mapping[Path, str]: ...
-
-
-@runtime_checkable
-class _TextReplacementFileOutput(Protocol):
-    """Structured output that provides replacements and an optional report."""
-
-    def to_text_replacement_file_patch(self) -> TextReplacementFilePatch: ...
 
 
 @dataclass
@@ -354,34 +322,6 @@ class FileCleanupPlugin(FileAgentPlugin):
     def on_registered(self, context: AgentContext) -> None:
         """Resolve and append cleanup paths to the shared runtime context."""
         context.clean_up_paths.extend(_resolve_agent_file_paths(context, self.paths))
-
-
-_FileContentT = TypeVar("_FileContentT")
-
-
-def _resolve_labeled_file_map(
-    root: Path,
-    files: Mapping[Path, _FileContentT],
-    *,
-    allowed_paths: list[Path] | None = None,
-) -> dict[Path, _FileContentT]:
-    """Resolve an output file map to paths within the agent workspace."""
-    allowed = {resolve_agent_file_path(root, path) for path in allowed_paths or []}
-    resolved: dict[Path, _FileContentT] = {}
-    for label, value in files.items():
-        path = resolve_agent_file_path(root, label)
-        if allowed and path not in allowed:
-            allowed_labels = ", ".join(
-                _relative_label(root, allowed_path) for allowed_path in sorted(allowed)
-            )
-            raise ValueError(
-                f"output file is not allowed: {_relative_label(root, path)}; "
-                f"allowed: {allowed_labels}"
-            )
-        if path in resolved:
-            raise ValueError(f"duplicate output file: {_relative_label(root, path)}")
-        resolved[path] = value
-    return resolved
 
 
 def _relative_label(root: Path, path: Path) -> str:
@@ -656,37 +596,36 @@ class JsonFieldStreamLlmCallPlugin(FileAgentPlugin):
         return outcome
 
 
-class LabeledFileMapWriterPlugin(FileAgentPlugin):
-    """Resolve and write a structured output's labeled text file map."""
+class ApplyPatchWriterPlugin(FileAgentPlugin):
+    """Apply an output model's generic patches to workspace text files."""
 
     def on_registered(self, context: AgentContext) -> None:
-        """Bind shared context and require a compatible registered response model."""
+        """Register this writer after validating the configured response model."""
         output_type = context.llm_response_output_type
         if output_type is None:
             raise RuntimeError(
-                "LabeledFileMapWriterPlugin requires ResponseOutputTypePlugin to be registered first"
+                "ApplyPatchWriterPlugin requires ResponseOutputTypePlugin to be registered first"
             )
-        if not issubclass(output_type, _LabeledFileMapOutput):
-            raise TypeError("response output type must implement to_file_map()")
+        if not issubclass(output_type, ApplyPatchOutput):
+            raise TypeError("response output type must inherit ApplyPatchOutput")
         context.output_writer = self.write_output
 
     def write_output(self, context: AgentContext, output: BaseModel) -> list[Path]:
-        """Resolve the output-provided text map and write the files."""
+        """Convert the validated output to patches and apply them."""
         output_type = context.llm_response_output_type
         if output_type is None:
-            raise RuntimeError("LabeledFileMapWriterPlugin is not registered")
-        if not isinstance(output, output_type) or not isinstance(output, _LabeledFileMapOutput):
+            raise RuntimeError("ApplyPatchWriterPlugin is not registered")
+        if type(output) is not output_type or not isinstance(output, ApplyPatchOutput):
             raise ValueError(
                 "structured output type mismatch: "
-                f"expected {output_type.__qualname__} with to_file_map(), "
+                f"expected {output_type.__qualname__} inheriting ApplyPatchOutput, "
                 f"got {type(output).__qualname__}"
             )
-        files = _resolve_labeled_file_map(
+        return apply_patches(
             context.cwd,
-            cast(Mapping[Path, str], output.to_file_map(context)),
+            output.to_apply_patches(context),
             allowed_paths=context.output_paths,
         )
-        return [_write_text_file(path, content) for path, content in files.items()]
 
 
 class NoopOutputWriterPlugin(FileAgentPlugin):
@@ -700,81 +639,12 @@ class NoopOutputWriterPlugin(FileAgentPlugin):
         return []
 
 
-@dataclass(kw_only=True)
-class TextReplacementFileWriterPlugin(FileAgentPlugin):
-    """Apply model-provided replacements to one text file and write an optional report."""
-
-    target_path: Path
-    report_path: Path | None = None
-
-    def on_registered(self, context: AgentContext) -> None:
-        """Register this writer after validating the configured response model."""
-        output_type = context.llm_response_output_type
-        if output_type is None:
-            raise RuntimeError(
-                "TextReplacementFileWriterPlugin requires ResponseOutputTypePlugin "
-                "to be registered first"
-            )
-        if not issubclass(output_type, _TextReplacementFileOutput):
-            raise TypeError("response output type must implement to_text_replacement_file_patch()")
-        context.output_writer = self.write_output
-
-    def write_output(self, context: AgentContext, output: BaseModel) -> list[Path]:
-        """Patch the target text file and write the output-provided report."""
-        output_type = context.llm_response_output_type
-        if output_type is None:
-            raise RuntimeError("TextReplacementFileWriterPlugin is not registered")
-        if type(output) is not output_type or not isinstance(output, _TextReplacementFileOutput):
-            raise ValueError(
-                "structured output type mismatch: "
-                f"expected {output_type.__qualname__} with "
-                "to_text_replacement_file_patch(), "
-                f"got {type(output).__qualname__}"
-            )
-
-        patch = output.to_text_replacement_file_patch()
-        report_content = patch.report
-        if self.report_path is not None and report_content is None:
-            raise ValueError("text replacement output did not provide report content")
-        replacements: list[TextReplacement] = []
-        for item in patch.replacements:
-            from_text = _normalize_newlines(item.from_text)
-            to_text = _normalize_newlines(item.to_text)
-            if from_text and from_text != to_text:
-                replacements.append(TextReplacement(from_text=from_text, to_text=to_text))
-        target = resolve_agent_file_path(context.cwd, self.target_path)
-        if replacements:
-            updated = apply_text_replacements(_read_text_file(target), replacements)
-            _write_text_file(target, updated)
-
-        written = [target]
-        if self.report_path is not None:
-            report_target = resolve_agent_file_path(context.cwd, self.report_path)
-            written.append(_write_text_file(report_target, cast(str, report_content)))
-        return written
-
-
-def _normalize_newlines(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("\r", "\n")
-
-
-def _read_text_file(path: Path) -> str:
-    with path.open("r", encoding="utf-8", newline="\n") as f:
-        return f.read()
-
-
-def _write_text_file(path: Path, content: str) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as f:
-        f.write(content)
-    return path
-
-
 __all__ = [
     "AgentRetryPolicyPlugin",
     "AfterIterationPlugin",
     "AfterLlmRequestPlugin",
     "AfterRunPlugin",
+    "ApplyPatchWriterPlugin",
     "BeforeIterationPlugin",
     "BeforeLlmRequestPlugin",
     "BeforeRunPlugin",
@@ -786,7 +656,6 @@ __all__ = [
     "FileTreeInputPathsPlugin",
     "IterativeRunPlugin",
     "JsonFieldStreamLlmCallPlugin",
-    "LabeledFileMapWriterPlugin",
     "LlmConfigPlugin",
     "LlmCallJsonlRecorderPlugin",
     "LlmOutputResultPlugin",
@@ -802,7 +671,6 @@ __all__ = [
     "StaticSystemPromptPlugin",
     "TemplateSystemPromptPlugin",
     "TemplateUserPromptPlugin",
-    "TextReplacementFileWriterPlugin",
     "UserTemplateVars",
     "validate_llm_request_registration",
 ]

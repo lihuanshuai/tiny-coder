@@ -23,28 +23,33 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from tiny_coder.apply_patch import ApplyPatch, ApplyPatchOutput
 from tiny_coder.file_agent import AgentContext, BasicFileAgent
 from tiny_coder.plugins import (
     AgentRetryPolicyPlugin,
-    LabeledFileMapWriterPlugin,
+    ApplyPatchWriterPlugin,
     LlmConfigPlugin,
     LlmRequestGroupPlugin,
     ResponseOutputTypePlugin,
     StaticInputPathsPlugin,
     StaticOutputPathsPlugin,
-    resolve_agent_file_path,
 )
+from tiny_coder.text_replacement import TextReplacement
 
 
-class FileOutput(BaseModel):
+class FileOutput(BaseModel, ApplyPatchOutput):
     summary: str
     files: dict[str, str]
 
-    def to_file_map(self, context: AgentContext) -> dict[Path, str]:
-        return {
-            resolve_agent_file_path(context.cwd, Path(label)): content
+    def to_apply_patches(self, context: AgentContext) -> list[ApplyPatch]:
+        _ = context
+        return [
+            ApplyPatch(
+                path=Path(label),
+                replacements=[TextReplacement(to_text=content)],
+            )
             for label, content in self.files.items()
-        }
+        ]
 
 
 class ExampleLlmConfig(BaseModel):
@@ -66,10 +71,17 @@ agent = BasicFileAgent(
         StaticOutputPathsPlugin([Path("output.md")]),
         ResponseOutputTypePlugin(FileOutput),
         AgentRetryPolicyPlugin(3),
-        LabeledFileMapWriterPlugin(),
+        ApplyPatchWriterPlugin(),
     ],
 )
 ```
+
+`ApplyPatch` is the shared file-mutation contract. A writable response model must inherit
+`ApplyPatchOutput` and implement `to_apply_patches(context)`. Every patch contains one ordered
+`replacements` list: `TextReplacement(to_text=...)` replaces the whole file, while a non-`None`
+`from_text` replaces one matching text span.
+`ApplyPatchWriterPlugin` resolves paths, checks configured output permissions, validates every
+patch in memory, and writes only changed files.
 
 Prefer importing from `tiny_coder.file_agent`, `tiny_coder.json_utils`, or
 `tiny_coder.yaml_utils` instead of relying on package-level re-exports.
@@ -124,8 +136,8 @@ iteration hooks see only the current iteration's requests.
 
 ```python
 from tiny_coder.plugins import (
+    ApplyPatchWriterPlugin,
     ConditionalLlmRequestPlugin,
-    LabeledFileMapWriterPlugin,
     LlmCallJsonlRecorderPlugin,
     LlmConfigPlugin,
     LlmRequestGroupPlugin,
@@ -156,7 +168,7 @@ request_plugins = [
         "plan-user.jinja",
         template_root=template_root,
     ),
-    LabeledFileMapWriterPlugin(),
+    ApplyPatchWriterPlugin(),
     LlmRequestGroupPlugin(key="review"),
     ConditionalLlmRequestPlugin(
         should_run=lambda context, _key: "plan" in context.llm_response_outputs,
@@ -173,7 +185,7 @@ request_plugins = [
             "plan": context.llm_response_outputs["plan"],
         },
     ),
-    LabeledFileMapWriterPlugin(),
+    ApplyPatchWriterPlugin(),
 ]
 ```
 

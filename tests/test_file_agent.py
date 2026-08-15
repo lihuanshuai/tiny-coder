@@ -6,19 +6,19 @@ import shutil
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel
 
 from tiny_coder import file_agent
 from tiny_coder import plugins as plugins_module
+from tiny_coder.apply_patch import ApplyPatch, ApplyPatchOutput
 from tiny_coder.file_agent import (
     AgentContext,
     LlmCallOutcome,
     SyncAgentResult,
     agent_input_snapshots,
-    content_to_yaml_text,
     parse_structured_output,
     read_agent_file,
 )
@@ -27,6 +27,7 @@ from tiny_coder.plugins import (
     AfterLlmRequestPlugin,
     AfterRunPlugin,
     AgentRetryPolicyPlugin,
+    ApplyPatchWriterPlugin,
     BeforeIterationPlugin,
     BeforeLlmRequestPlugin,
     BeforeRunPlugin,
@@ -38,7 +39,6 @@ from tiny_coder.plugins import (
     FileTreeInputPathsPlugin,
     IterativeRunPlugin,
     JsonFieldStreamLlmCallPlugin,
-    LabeledFileMapWriterPlugin,
     LlmCallJsonlRecorderPlugin,
     LlmConfigPlugin,
     LlmOutputResultPlugin,
@@ -50,10 +50,9 @@ from tiny_coder.plugins import (
     StaticSystemPromptPlugin,
     TemplateSystemPromptPlugin,
     TemplateUserPromptPlugin,
-    TextReplacementFileWriterPlugin,
     resolve_agent_file_path,
 )
-from tiny_coder.text_replacement import TextReplacement, TextReplacementFilePatch
+from tiny_coder.text_replacement import TextReplacement
 
 
 class SampleOutput(BaseModel):
@@ -62,61 +61,95 @@ class SampleOutput(BaseModel):
     optional: str | None = None
 
 
-class SampleFileMapOutput(BaseModel):
+class SampleApplyPatchOutput(BaseModel, ApplyPatchOutput):
     summary: str = ""
     files: dict[str, str]
 
-    def to_file_map(self, context: AgentContext) -> dict[Path, str]:
-        return {
-            resolve_agent_file_path(context.cwd, Path(label)): content
+    def to_apply_patches(self, context: AgentContext) -> list[ApplyPatch]:
+        _ = context
+        return [
+            ApplyPatch(
+                path=Path(label),
+                replacements=[TextReplacement(to_text=content)],
+            )
             for label, content in self.files.items()
-        }
+        ]
 
 
-class SamplePlanOutput(BaseModel):
+class SamplePlanOutput(BaseModel, ApplyPatchOutput):
     plan: str
 
-    def to_file_map(self, context: AgentContext) -> dict[Path, str]:
+    def to_apply_patches(self, context: AgentContext) -> list[ApplyPatch]:
         _ = context
-        return {}
+        return []
 
 
-class SampleReviewOutput(BaseModel):
+class SampleReviewOutput(BaseModel, ApplyPatchOutput):
     review: str
 
-    def to_file_map(self, context: AgentContext) -> dict[Path, str]:
+    def to_apply_patches(self, context: AgentContext) -> list[ApplyPatch]:
         _ = context
-        return {}
+        return []
 
 
-class OtherFileMapOutput(BaseModel):
+class OtherApplyPatchOutput(BaseModel, ApplyPatchOutput):
     files: dict[str, str]
 
-    def to_file_map(self, context: AgentContext) -> dict[Path, str]:
-        return {
-            resolve_agent_file_path(context.cwd, Path(label)): content
+    def to_apply_patches(self, context: AgentContext) -> list[ApplyPatch]:
+        _ = context
+        return [
+            ApplyPatch(
+                path=Path(label),
+                replacements=[TextReplacement(to_text=content)],
+            )
             for label, content in self.files.items()
-        }
+        ]
 
 
-class SampleTextReplacementOutput(BaseModel):
+class SampleTextReplacementOutput(BaseModel, ApplyPatchOutput):
     from_text: str
     to_text: str
     report: str | None = None
+    target_path: Path = Path("draft.txt")
+    report_path: Path | None = None
 
-    def to_text_replacement_file_patch(self) -> TextReplacementFilePatch:
-        return TextReplacementFilePatch(
-            replacements=[TextReplacement(from_text=self.from_text, to_text=self.to_text)],
-            report=self.report,
-        )
+    def to_apply_patches(self, context: AgentContext) -> list[ApplyPatch]:
+        _ = context
+        patches = [
+            ApplyPatch(
+                path=self.target_path,
+                replacements=[TextReplacement(from_text=self.from_text, to_text=self.to_text)],
+            )
+        ]
+        if self.report_path is not None:
+            if self.report is None:
+                raise ValueError("text replacement output did not provide report content")
+            patches.append(
+                ApplyPatch(
+                    path=self.report_path,
+                    replacements=[TextReplacement(to_text=self.report)],
+                )
+            )
+        return patches
 
 
 class OtherTextReplacementOutput(SampleTextReplacementOutput):
     pass
 
 
+class StructuralApplyPatchOutput(BaseModel):
+    def to_apply_patches(self, context: AgentContext) -> list[ApplyPatch]:
+        _ = context
+        return []
+
+
 class SampleLlmConfig(BaseModel):
     model: str = "test-model"
+
+
+class _StructuralFileAgentPlugin:
+    def on_registered(self, context: AgentContext) -> None:
+        _ = context
 
 
 def BasicFileAgent(
@@ -178,7 +211,7 @@ def test_agent_file_helpers_stay_inside_root(workspace_tmp_path: Path) -> None:
         resolve_agent_file_path(workspace_tmp_path, Path("../outside.txt"))
 
 
-def test_builtin_plugins_implement_file_agent_protocol() -> None:
+def test_builtin_plugins_inherit_file_agent_plugin() -> None:
     plugin_types = [
         value
         for name in plugins_module.__all__
@@ -190,6 +223,14 @@ def test_builtin_plugins_implement_file_agent_protocol() -> None:
     assert all(issubclass(plugin_type, FileAgentPlugin) for plugin_type in plugin_types)
 
 
+def test_basic_file_agent_requires_file_agent_plugin_base(workspace_tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="plugin must inherit FileAgentPlugin"):
+        file_agent.BasicFileAgent(
+            cwd=workspace_tmp_path,
+            plugins=[cast(FileAgentPlugin, _StructuralFileAgentPlugin())],
+        )
+
+
 def test_parse_structured_output_validates_model() -> None:
     output = parse_structured_output(
         '{"summary": "done", "content": {"title": "Tiny"}}',
@@ -198,12 +239,6 @@ def test_parse_structured_output_validates_model() -> None:
 
     assert output.summary == "done"
     assert output.content == {"title": "Tiny"}
-
-
-def test_content_to_yaml_text_converts_pydantic_models() -> None:
-    output = SampleOutput(summary="done", content={"title": "Tiny"}, optional=None)
-
-    assert content_to_yaml_text(output) == "summary: done\ncontent:\n  title: Tiny\n"
 
 
 def test_agent_input_snapshots_include_labels_and_languages(workspace_tmp_path: Path) -> None:
@@ -414,8 +449,8 @@ def test_file_agent_records_parsed_response_output(workspace_tmp_path: Path) -> 
         llm_config=SampleLlmConfig(),
         plugins=[
             LlmRequestGroupPlugin(key="apply"),
-            ResponseOutputTypePlugin(SampleFileMapOutput),
-            LabeledFileMapWriterPlugin(),
+            ResponseOutputTypePlugin(SampleApplyPatchOutput),
+            ApplyPatchWriterPlugin(),
         ],
     )
     request_context = agent.context.llm_request_contexts["apply"]
@@ -425,7 +460,7 @@ def test_file_agent_records_parsed_response_output(workspace_tmp_path: Path) -> 
         {"raw_output": '{"summary":"done","files":{"notes/output.txt":"hello\\n"}}'}
     )
 
-    assert request_context.llm_response_output == SampleFileMapOutput(
+    assert request_context.llm_response_output == SampleApplyPatchOutput(
         summary="done",
         files={"notes/output.txt": "hello\n"},
     )
@@ -760,7 +795,7 @@ def test_serial_llm_requests_run_in_order_and_record_keyed_results(
                     "previous_keys": list(context.llm_response_outputs),
                 },
             ),
-            LabeledFileMapWriterPlugin(),
+            ApplyPatchWriterPlugin(),
             AfterLlmRequestPlugin(handler=finish_request),
             LlmRequestGroupPlugin(key="review"),
             BeforeLlmRequestPlugin(handler=prepare_request),
@@ -777,7 +812,7 @@ def test_serial_llm_requests_run_in_order_and_record_keyed_results(
                     "plan": context.llm_response_outputs["plan"],
                 },
             ),
-            LabeledFileMapWriterPlugin(),
+            ApplyPatchWriterPlugin(),
             AfterLlmRequestPlugin(handler=finish_request),
         ],
     )
@@ -852,7 +887,7 @@ def test_conditional_llm_requests_use_prior_results_and_skip_cleanly(
             ResponseOutputTypePlugin(output_type),
             TemplateSystemPromptPlugin("system.jinja", template_root=workspace_tmp_path),
             TemplateUserPromptPlugin("user.jinja", template_root=workspace_tmp_path),
-            LabeledFileMapWriterPlugin(),
+            ApplyPatchWriterPlugin(),
         ]
 
     async def before_skipped(_context: AgentContext, _key: str) -> None:
@@ -880,7 +915,7 @@ def test_conditional_llm_requests_use_prior_results_and_skip_cleanly(
             ResponseOutputTypePlugin(SampleReviewOutput),
             TemplateSystemPromptPlugin("system.jinja", template_root=workspace_tmp_path),
             TemplateUserPromptPlugin("user.jinja", template_root=workspace_tmp_path),
-            LabeledFileMapWriterPlugin(),
+            ApplyPatchWriterPlugin(),
             LlmRequestGroupPlugin(key="skipped"),
             ConditionalLlmRequestPlugin(should_run=lambda _context, _key: False),
             BeforeLlmRequestPlugin(handler=before_skipped),
@@ -888,7 +923,7 @@ def test_conditional_llm_requests_use_prior_results_and_skip_cleanly(
             ResponseOutputTypePlugin(SampleReviewOutput),
             TemplateSystemPromptPlugin("system.jinja", template_root=workspace_tmp_path),
             TemplateUserPromptPlugin("user.jinja", template_root=workspace_tmp_path),
-            LabeledFileMapWriterPlugin(),
+            ApplyPatchWriterPlugin(),
             AfterLlmRequestPlugin(handler=after_skipped),
         ],
     )
@@ -1214,14 +1249,14 @@ def test_agent_retry_policy_plugin_retries_invalid_structured_output(
         plugins=[
             LlmRequestGroupPlugin(key="retry"),
             StaticOutputPathsPlugin([Path("output.txt")]),
-            ResponseOutputTypePlugin(SampleFileMapOutput),
+            ResponseOutputTypePlugin(SampleApplyPatchOutput),
             AgentRetryPolicyPlugin(max_attempts=2),
             StaticSystemPromptPlugin("system"),
             TemplateUserPromptPlugin(
                 "user.jinja",
                 template_root=workspace_tmp_path,
             ),
-            LabeledFileMapWriterPlugin(),
+            ApplyPatchWriterPlugin(),
         ],
     )
 
@@ -1350,22 +1385,22 @@ def test_json_field_stream_llm_call_aborts_over_raw_threshold(
         )
 
 
-def test_labeled_file_map_writer_requires_compatible_output_type(
+def test_apply_patch_writer_requires_apply_patch_output_base(
     workspace_tmp_path: Path,
 ) -> None:
-    with pytest.raises(TypeError, match=r"must implement to_file_map\(\)"):
+    with pytest.raises(TypeError, match="must inherit ApplyPatchOutput"):
         BasicFileAgent(
             cwd=workspace_tmp_path,
             llm_config=SampleLlmConfig(),
             plugins=[
                 LlmRequestGroupPlugin(key="write"),
-                ResponseOutputTypePlugin(SampleOutput),
-                LabeledFileMapWriterPlugin(),
+                ResponseOutputTypePlugin(StructuralApplyPatchOutput),
+                ApplyPatchWriterPlugin(),
             ],
         )
 
 
-def test_labeled_file_map_writer_resolves_and_writes_output(
+def test_apply_patch_writer_resolves_and_writes_output(
     workspace_tmp_path: Path,
 ) -> None:
     agent = BasicFileAgent(
@@ -1374,23 +1409,25 @@ def test_labeled_file_map_writer_resolves_and_writes_output(
         plugins=[
             LlmRequestGroupPlugin(key="write"),
             StaticOutputPathsPlugin([Path("notes/output.txt")]),
-            ResponseOutputTypePlugin(SampleFileMapOutput),
-            LabeledFileMapWriterPlugin(),
+            ResponseOutputTypePlugin(SampleApplyPatchOutput),
+            ApplyPatchWriterPlugin(),
         ],
     )
 
     written = agent.split_and_write_output(
-        SampleFileMapOutput(files={"notes/output.txt": "hello\n"})
+        SampleApplyPatchOutput(files={"notes/output.txt": "hello\n"})
     )
 
     assert written == [(workspace_tmp_path / "notes" / "output.txt").resolve()]
     assert read_agent_file(workspace_tmp_path, Path("notes/output.txt")) == "hello\n"
 
     with pytest.raises(ValueError, match="output file is not allowed"):
-        agent.split_and_write_output(SampleFileMapOutput(files={"notes/other.txt": "no"}))
+        agent.split_and_write_output(SampleApplyPatchOutput(files={"notes/other.txt": "no"}))
 
-    with pytest.raises(ValueError, match="expected SampleFileMapOutput.*got OtherFileMapOutput"):
-        agent.split_and_write_output(OtherFileMapOutput(files={"notes/output.txt": "wrong"}))
+    with pytest.raises(
+        ValueError, match="expected SampleApplyPatchOutput.*got OtherApplyPatchOutput"
+    ):
+        agent.split_and_write_output(OtherApplyPatchOutput(files={"notes/output.txt": "wrong"}))
 
 
 def test_file_agent_accepts_subset_of_allowed_output_paths(workspace_tmp_path: Path) -> None:
@@ -1400,8 +1437,8 @@ def test_file_agent_accepts_subset_of_allowed_output_paths(workspace_tmp_path: P
         plugins=[
             LlmRequestGroupPlugin(key="write"),
             StaticOutputPathsPlugin([Path("notes/output.txt"), Path("notes/unchanged.txt")]),
-            ResponseOutputTypePlugin(SampleFileMapOutput),
-            LabeledFileMapWriterPlugin(),
+            ResponseOutputTypePlugin(SampleApplyPatchOutput),
+            ApplyPatchWriterPlugin(),
         ],
     )
     agent.context = agent.context.llm_request_contexts["write"]
@@ -1413,25 +1450,7 @@ def test_file_agent_accepts_subset_of_allowed_output_paths(workspace_tmp_path: P
     assert not (workspace_tmp_path / "notes" / "unchanged.txt").exists()
 
 
-def test_text_replacement_file_writer_requires_compatible_output_type(
-    workspace_tmp_path: Path,
-) -> None:
-    with pytest.raises(
-        TypeError,
-        match=r"must implement to_text_replacement_file_patch\(\)",
-    ):
-        BasicFileAgent(
-            cwd=workspace_tmp_path,
-            llm_config=SampleLlmConfig(),
-            plugins=[
-                LlmRequestGroupPlugin(key="replace"),
-                ResponseOutputTypePlugin(SampleOutput),
-                TextReplacementFileWriterPlugin(target_path=Path("draft.txt")),
-            ],
-        )
-
-
-def test_text_replacement_file_writer_patches_target_and_writes_report(
+def test_apply_patch_writer_replaces_text_and_writes_report(
     workspace_tmp_path: Path,
 ) -> None:
     target = _write_test_file(workspace_tmp_path, Path("draft.txt"), "old text\n")
@@ -1443,10 +1462,7 @@ def test_text_replacement_file_writer_patches_target_and_writes_report(
             LlmRequestGroupPlugin(key="replace"),
             StaticOutputPathsPlugin([target, report]),
             ResponseOutputTypePlugin(SampleTextReplacementOutput),
-            TextReplacementFileWriterPlugin(
-                target_path=target,
-                report_path=report,
-            ),
+            ApplyPatchWriterPlugin(),
         ],
     )
 
@@ -1455,6 +1471,8 @@ def test_text_replacement_file_writer_patches_target_and_writes_report(
             from_text="old text",
             to_text="new text",
             report='{"status":"pass"}\n',
+            target_path=target,
+            report_path=report,
         )
     )
 
@@ -1467,6 +1485,8 @@ def test_text_replacement_file_writer_patches_target_and_writes_report(
             SampleTextReplacementOutput(
                 from_text="new text",
                 to_text="partially written text",
+                target_path=target,
+                report_path=report,
             )
         )
     assert target.read_text(encoding="utf-8") == "new text\n"
@@ -1484,7 +1504,7 @@ def test_text_replacement_file_writer_patches_target_and_writes_report(
         )
 
 
-def test_text_replacement_file_writer_ignores_unchanged_replacement(
+def test_apply_patch_writer_ignores_unchanged_replacement(
     workspace_tmp_path: Path,
 ) -> None:
     target = _write_test_file(workspace_tmp_path, Path("draft.txt"), "same text\n")
@@ -1493,8 +1513,9 @@ def test_text_replacement_file_writer_ignores_unchanged_replacement(
         llm_config=SampleLlmConfig(),
         plugins=[
             LlmRequestGroupPlugin(key="replace"),
+            StaticOutputPathsPlugin([target]),
             ResponseOutputTypePlugin(SampleTextReplacementOutput),
-            TextReplacementFileWriterPlugin(target_path=target),
+            ApplyPatchWriterPlugin(),
         ],
     )
 
@@ -1502,10 +1523,11 @@ def test_text_replacement_file_writer_ignores_unchanged_replacement(
         SampleTextReplacementOutput(
             from_text="same\r\ntext",
             to_text="same\ntext",
+            target_path=target,
         )
     )
 
-    assert written == [target]
+    assert written == []
     assert target.read_text(encoding="utf-8") == "same text\n"
 
 

@@ -26,6 +26,22 @@ def test_apply_text_replacements_applies_operations_in_order() -> None:
     assert apply_text_replacements(original, replacements) == "# Plan\n- A1\n- B1\n"
 
 
+def test_apply_text_replacements_allows_ordered_whole_file_replacements() -> None:
+    replacements = [
+        TextReplacement(from_text="old", to_text="intermediate"),
+        TextReplacement(to_text="draft"),
+        TextReplacement(from_text="draft", to_text="updated"),
+        TextReplacement(to_text="final"),
+    ]
+
+    assert apply_text_replacements("old\n", replacements) == "final"
+
+
+def test_apply_text_replacements_rejects_empty_from_text() -> None:
+    with pytest.raises(TextReplacementApplyError, match="from_text must not be empty"):
+        apply_text_replacements("old\n", [TextReplacement(from_text="", to_text="new")])
+
+
 def test_apply_text_replacements_supports_insertion_by_anchor_replacement() -> None:
     original = "# Plan\n- first\n- second\n"
     replacements = [
