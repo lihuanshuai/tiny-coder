@@ -9,8 +9,8 @@ from pydantic import BaseModel
 
 from tiny_coder import llm_format_stream
 from tiny_coder.llm_format_stream import (
-    _llm_stream_chunk,
-    _nonneg_int_from_llm_field,
+    nonnegative_int_from_llm_field,
+    parse_llm_stream_chunk,
     stream_llm_chat_format,
 )
 
@@ -73,15 +73,15 @@ class FakeAsyncOpenAI:
 
 
 def test_nonneg_int_from_llm_field_accepts_only_nonnegative_integral_values() -> None:
-    assert _nonneg_int_from_llm_field(3) == 3
-    assert _nonneg_int_from_llm_field(3.0) == 3
-    assert _nonneg_int_from_llm_field(True) is None
-    assert _nonneg_int_from_llm_field(-1) is None
-    assert _nonneg_int_from_llm_field(3.5) is None
+    assert nonnegative_int_from_llm_field(3) == 3
+    assert nonnegative_int_from_llm_field(3.0) == 3
+    assert nonnegative_int_from_llm_field(True) is None
+    assert nonnegative_int_from_llm_field(-1) is None
+    assert nonnegative_int_from_llm_field(3.5) is None
 
 
 def test_llm_stream_chunk_reads_openai_and_local_fields() -> None:
-    assert _llm_stream_chunk(
+    assert parse_llm_stream_chunk(
         {
             "usage": {"prompt_tokens": 2, "completion_tokens": 5},
             "choices": [
@@ -92,7 +92,7 @@ def test_llm_stream_chunk_reads_openai_and_local_fields() -> None:
             ],
         }
     ) == (2, 5, "chunk", "thought", "stop")
-    assert _llm_stream_chunk(
+    assert parse_llm_stream_chunk(
         {
             "prompt_eval_count": 7,
             "eval_count": 9,

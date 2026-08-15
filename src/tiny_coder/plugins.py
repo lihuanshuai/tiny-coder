@@ -28,19 +28,19 @@ from tiny_coder.text_replacement import (
 if TYPE_CHECKING:
     from tiny_coder.file_agent import (
         AgentContext,
+        LlmCall,
         LlmCallOutcome,
         SyncAgentResult,
-        _LlmCall,
     )
 
 
-def _agent_root(root: Path) -> Path:
+def resolve_agent_root(root: Path) -> Path:
     return Path(root).expanduser().resolve()
 
 
 def resolve_agent_file_path(root: Path, path: Path) -> Path:
     """Resolve an agent-visible file path and keep it inside the workspace root."""
-    root_path = _agent_root(root)
+    root_path = resolve_agent_root(root)
     raw = path.expanduser()
     candidate = raw.resolve() if raw.is_absolute() else (root_path / raw).resolve()
     try:
@@ -86,7 +86,10 @@ class _LlmCallJsonlRecord(TypedDict):
     extra: dict[str, _JsonValue]
 
 
-class _FileAgentPlugin(Protocol):
+@runtime_checkable
+class FileAgentPlugin(Protocol):
+    """Register one focused capability on an agent context."""
+
     def on_registered(self, context: AgentContext) -> None: ...
 
 
@@ -105,7 +108,7 @@ class _TextReplacementFileOutput(Protocol):
 
 
 @dataclass
-class StaticInputPathsPlugin:
+class StaticInputPathsPlugin(FileAgentPlugin):
     """Provide a fixed set of readable input paths for the core agent lifecycle."""
 
     paths: list[Path]
@@ -116,7 +119,7 @@ class StaticInputPathsPlugin:
 
 
 @dataclass
-class StaticOutputPathsPlugin:
+class StaticOutputPathsPlugin(FileAgentPlugin):
     """Provide a fixed set of writable output paths for the core agent lifecycle."""
 
     paths: list[Path]
@@ -127,7 +130,7 @@ class StaticOutputPathsPlugin:
 
 
 @dataclass(kw_only=True)
-class LlmCallJsonlRecorderPlugin:
+class LlmCallJsonlRecorderPlugin(FileAgentPlugin):
     """Append every completed LLM call's raw input and output to one JSONL file."""
 
     path: Path
@@ -161,7 +164,7 @@ class LlmCallJsonlRecorderPlugin:
 
 
 @dataclass
-class BeforeRunPlugin:
+class BeforeRunPlugin(FileAgentPlugin):
     """Register an asynchronous callback that prepares one agent run."""
 
     handler: _BeforeRunCallback
@@ -172,7 +175,7 @@ class BeforeRunPlugin:
 
 
 @dataclass
-class LlmOutputResultPlugin:
+class LlmOutputResultPlugin(FileAgentPlugin):
     """Inspect one parsed and written LLM output inside the retry loop."""
 
     handler: _LlmOutputResultCallback
@@ -187,7 +190,7 @@ class LlmOutputResultPlugin:
 
 
 @dataclass
-class AfterRunPlugin:
+class AfterRunPlugin(FileAgentPlugin):
     """Run a callback after the retrying agent run succeeds."""
 
     handler: _AfterRunCallback
@@ -202,7 +205,7 @@ class AfterRunPlugin:
 
 
 @dataclass
-class IterativeRunPlugin:
+class IterativeRunPlugin(FileAgentPlugin):
     """Repeat the retrying agent run for context-owned iteration items."""
 
     items: list[object]
@@ -215,7 +218,7 @@ class IterativeRunPlugin:
 
 
 @dataclass
-class BeforeIterationPlugin:
+class BeforeIterationPlugin(FileAgentPlugin):
     """Run a callback before each context-owned iteration."""
 
     handler: _BeforeIterationCallback
@@ -226,7 +229,7 @@ class BeforeIterationPlugin:
 
 
 @dataclass
-class AfterIterationPlugin:
+class AfterIterationPlugin(FileAgentPlugin):
     """Run a callback after each context-owned iteration succeeds."""
 
     handler: _AfterIterationCallback
@@ -237,7 +240,7 @@ class AfterIterationPlugin:
 
 
 @dataclass
-class LlmRequestGroupPlugin:
+class LlmRequestGroupPlugin(FileAgentPlugin):
     """Start one flat, keyed request configuration block in the agent plugin list."""
 
     key: str
@@ -265,7 +268,7 @@ class LlmRequestGroupPlugin:
 
 
 @dataclass
-class ConditionalLlmRequestPlugin:
+class ConditionalLlmRequestPlugin(FileAgentPlugin):
     """Run the active keyed request only when its runtime condition is true."""
 
     should_run: _LlmRequestCondition
@@ -282,7 +285,7 @@ class ConditionalLlmRequestPlugin:
 
 
 @dataclass
-class BeforeLlmRequestPlugin:
+class BeforeLlmRequestPlugin(FileAgentPlugin):
     """Prepare the active keyed LLM request before each call."""
 
     handler: _BeforeLlmRequestCallback
@@ -295,7 +298,7 @@ class BeforeLlmRequestPlugin:
 
 
 @dataclass
-class AfterLlmRequestPlugin:
+class AfterLlmRequestPlugin(FileAgentPlugin):
     """Inspect the active keyed LLM request after it succeeds."""
 
     handler: _AfterLlmRequestCallback
@@ -307,7 +310,7 @@ class AfterLlmRequestPlugin:
         context.after_llm_request_hooks.append(self.handler)
 
 
-def _validate_llm_request_registration(context: AgentContext) -> None:
+def validate_llm_request_registration(context: AgentContext) -> None:
     """Validate one completed keyed request configuration."""
     if (
         context.iteration_items is not None
@@ -322,7 +325,7 @@ def _validate_llm_request_registration(context: AgentContext) -> None:
         raise ValueError("LLM request requires LlmConfigPlugin")
 
 
-class DynamicOutputPathsPlugin:
+class DynamicOutputPathsPlugin(FileAgentPlugin):
     """Use the currently registered input paths as writable output paths."""
 
     def on_registered(self, context: AgentContext) -> None:
@@ -334,7 +337,7 @@ def _resolve_agent_file_paths(context: AgentContext, paths: list[Path]) -> list[
     return [resolve_agent_file_path(context.cwd, path) for path in paths]
 
 
-class ExistingPathGuardPlugin:
+class ExistingPathGuardPlugin(FileAgentPlugin):
     """Abort a run before any configured output path is overwritten."""
 
     def on_registered(self, context: AgentContext) -> None:
@@ -343,7 +346,7 @@ class ExistingPathGuardPlugin:
 
 
 @dataclass
-class FileCleanupPlugin:
+class FileCleanupPlugin(FileAgentPlugin):
     """Register workspace files that the core runtime removes before each run."""
 
     paths: list[Path]
@@ -383,13 +386,13 @@ def _resolve_labeled_file_map(
 
 def _relative_label(root: Path, path: Path) -> str:
     try:
-        return path.relative_to(_agent_root(root)).as_posix()
+        return path.relative_to(resolve_agent_root(root)).as_posix()
     except ValueError:
         return str(path)
 
 
 @dataclass
-class StaticSystemPromptPlugin:
+class StaticSystemPromptPlugin(FileAgentPlugin):
     """Replace the system prompt with static text or context-derived text."""
 
     prompt: _SystemPromptProvider
@@ -411,7 +414,7 @@ class StaticSystemPromptPlugin:
 
 
 @dataclass
-class TemplateSystemPromptPlugin:
+class TemplateSystemPromptPlugin(FileAgentPlugin):
     """Render a template-backed system prompt using the registered agent context."""
 
     template_name: str
@@ -444,7 +447,7 @@ class TemplateSystemPromptPlugin:
 
 
 @dataclass
-class TemplateUserPromptPlugin:
+class TemplateUserPromptPlugin(FileAgentPlugin):
     """Render a template-backed user prompt using the registered agent context."""
 
     template_name: str
@@ -464,7 +467,7 @@ class TemplateUserPromptPlugin:
         retry_errors: Sequence[str] | None = None,
     ) -> str:
         """Replace the current user prompt with the rendered template."""
-        from tiny_coder.file_agent import _agent_input_snapshots
+        from tiny_coder.file_agent import agent_input_snapshots
 
         _ = task_prompt, current
         custom_vars = (
@@ -474,7 +477,7 @@ class TemplateUserPromptPlugin:
         )
         variables = {
             **custom_vars,
-            "input_files": _agent_input_snapshots(context.cwd, context.input_paths),
+            "input_files": agent_input_snapshots(context.cwd, context.input_paths),
             "retry_errors": list(retry_errors or []),
         }
         rendered = (
@@ -493,7 +496,7 @@ def _jinja_env(template_root: Path) -> Environment:
 
 
 @dataclass
-class FileTreeInputPathsPlugin:
+class FileTreeInputPathsPlugin(FileAgentPlugin):
     """Provide readable input paths from a directory tree."""
 
     root: Path
@@ -516,7 +519,7 @@ class FileTreeInputPathsPlugin:
         context.input_paths = list(dict.fromkeys(paths))
 
 
-def _require_output_model_type(output_type: Any) -> type[BaseModel]:
+def require_output_model_type(output_type: Any) -> type[BaseModel]:
     """Validate and return a BaseModel subclass."""
     if not isinstance(output_type, type) or not issubclass(output_type, BaseModel):
         raise TypeError("output_type must be a BaseModel subclass")
@@ -524,13 +527,13 @@ def _require_output_model_type(output_type: Any) -> type[BaseModel]:
 
 
 @dataclass
-class ResponseOutputTypePlugin:
+class ResponseOutputTypePlugin(FileAgentPlugin):
     """Provide the Pydantic response model used for JSON Schema and parsing."""
 
     output_type: type[BaseModel]
 
     def __post_init__(self) -> None:
-        self.output_type = _require_output_model_type(self.output_type)
+        self.output_type = require_output_model_type(self.output_type)
 
     def on_registered(self, context: AgentContext) -> None:
         """Register the response model on the shared agent context."""
@@ -538,7 +541,7 @@ class ResponseOutputTypePlugin:
 
 
 @dataclass
-class LlmConfigPlugin:
+class LlmConfigPlugin(FileAgentPlugin):
     """Provide the model configuration for the active LLM request group."""
 
     llm_config: BaseModel
@@ -547,7 +550,7 @@ class LlmConfigPlugin:
         context.llm_config = self.llm_config
 
 
-class SilentLlmCallPlugin:
+class SilentLlmCallPlugin(FileAgentPlugin):
     """Suppress streamed chunks while preserving the configured LLM call."""
 
     def on_registered(self, context: AgentContext) -> None:
@@ -574,7 +577,7 @@ class SilentLlmCallPlugin:
 
 
 @dataclass
-class AgentRetryPolicyPlugin:
+class AgentRetryPolicyPlugin(FileAgentPlugin):
     """Configure the shared attempt limit for model calls and output handling."""
 
     max_attempts: int = 3
@@ -588,7 +591,7 @@ class AgentRetryPolicyPlugin:
 
 
 @dataclass(kw_only=True)
-class JsonFieldStreamLlmCallPlugin:
+class JsonFieldStreamLlmCallPlugin(FileAgentPlugin):
     """Call the configured LLM while printing one JSON string field."""
 
     field_name: str
@@ -619,7 +622,7 @@ class JsonFieldStreamLlmCallPlugin:
 
     async def _call_and_stream_field(
         self,
-        llm_call: _LlmCall,
+        llm_call: LlmCall,
         *,
         llm_cfg: BaseModel,
         system: str,
@@ -653,7 +656,7 @@ class JsonFieldStreamLlmCallPlugin:
         return outcome
 
 
-class LabeledFileMapWriterPlugin:
+class LabeledFileMapWriterPlugin(FileAgentPlugin):
     """Resolve and write a structured output's labeled text file map."""
 
     def on_registered(self, context: AgentContext) -> None:
@@ -686,7 +689,7 @@ class LabeledFileMapWriterPlugin:
         return [_write_text_file(path, content) for path, content in files.items()]
 
 
-class NoopOutputWriterPlugin:
+class NoopOutputWriterPlugin(FileAgentPlugin):
     """Accept a validated response without writing workspace files."""
 
     def on_registered(self, context: AgentContext) -> None:
@@ -698,7 +701,7 @@ class NoopOutputWriterPlugin:
 
 
 @dataclass(kw_only=True)
-class TextReplacementFileWriterPlugin:
+class TextReplacementFileWriterPlugin(FileAgentPlugin):
     """Apply model-provided replacements to one text file and write an optional report."""
 
     target_path: Path
@@ -778,6 +781,7 @@ __all__ = [
     "ConditionalLlmRequestPlugin",
     "DynamicOutputPathsPlugin",
     "ExistingPathGuardPlugin",
+    "FileAgentPlugin",
     "FileCleanupPlugin",
     "FileTreeInputPathsPlugin",
     "IterativeRunPlugin",
@@ -788,7 +792,9 @@ __all__ = [
     "LlmOutputResultPlugin",
     "LlmRequestGroupPlugin",
     "ResponseOutputTypePlugin",
+    "require_output_model_type",
     "resolve_agent_file_path",
+    "resolve_agent_root",
     "NoopOutputWriterPlugin",
     "SilentLlmCallPlugin",
     "StaticInputPathsPlugin",
@@ -798,4 +804,5 @@ __all__ = [
     "TemplateUserPromptPlugin",
     "TextReplacementFileWriterPlugin",
     "UserTemplateVars",
+    "validate_llm_request_registration",
 ]

@@ -48,7 +48,7 @@ def _get_value(obj: object, key: str, default: object = None) -> object:
     return getattr(obj, key, default)
 
 
-def _nonneg_int_from_llm_field(value: object) -> int | None:
+def nonnegative_int_from_llm_field(value: object) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -85,17 +85,17 @@ def _chunk_delta_text(packet: object) -> tuple[str, str]:
     )
 
 
-def _llm_stream_chunk(
+def parse_llm_stream_chunk(
     packet: object,
 ) -> tuple[int | None, int | None, str, str, str | None]:
     """Read metrics, output text, reasoning, and finish reason from one stream packet."""
     usage = _get_value(packet, "usage")
-    prompt_eval_count = _nonneg_int_from_llm_field(_get_value(usage, "prompt_tokens"))
-    eval_count = _nonneg_int_from_llm_field(_get_value(usage, "completion_tokens"))
+    prompt_eval_count = nonnegative_int_from_llm_field(_get_value(usage, "prompt_tokens"))
+    eval_count = nonnegative_int_from_llm_field(_get_value(usage, "completion_tokens"))
     if prompt_eval_count is None:
-        prompt_eval_count = _nonneg_int_from_llm_field(_get_value(packet, "prompt_eval_count"))
+        prompt_eval_count = nonnegative_int_from_llm_field(_get_value(packet, "prompt_eval_count"))
     if eval_count is None:
-        eval_count = _nonneg_int_from_llm_field(_get_value(packet, "eval_count"))
+        eval_count = nonnegative_int_from_llm_field(_get_value(packet, "eval_count"))
     content, reasoning = _chunk_delta_text(packet)
     choices = _get_value(packet, "choices")
     finish_reason: str | None = None
@@ -134,7 +134,7 @@ def _llm_tail_metrics_dict(
         ("prompt_tokens", "prompt_eval_count"),
         ("completion_tokens", "eval_count"),
     ):
-        value = _nonneg_int_from_llm_field(_get_value(usage, source_key))
+        value = nonnegative_int_from_llm_field(_get_value(usage, source_key))
         if value is not None:
             metrics[target_key] = value
     model = _get_value(packet, "model")
@@ -242,8 +242,8 @@ async def stream_llm_chat_format(
             error_message = _stream_error_message(packet)
             if error_message is not None:
                 raise RuntimeError(f"OpenAI-compatible LLM stream error: {error_message}")
-            prompt_count, completion_count, content, reasoning, finish_reason = _llm_stream_chunk(
-                packet
+            prompt_count, completion_count, content, reasoning, finish_reason = (
+                parse_llm_stream_chunk(packet)
             )
             if prompt_count is not None:
                 prompt_eval_count = prompt_count
@@ -292,7 +292,9 @@ async def stream_llm_chat_format(
 
 __all__ = [
     "LlmChatStreamOutcome",
+    "nonnegative_int_from_llm_field",
     "openai_api_key",
     "openai_extra_body",
+    "parse_llm_stream_chunk",
     "stream_llm_chat_format",
 ]

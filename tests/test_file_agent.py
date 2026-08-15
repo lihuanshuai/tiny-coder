@@ -12,17 +12,15 @@ import pytest
 from pydantic import BaseModel
 
 from tiny_coder import file_agent
+from tiny_coder import plugins as plugins_module
 from tiny_coder.file_agent import (
     AgentContext,
     LlmCallOutcome,
     SyncAgentResult,
-    _agent_input_snapshots,
-    _parse_structured_sync_output,
+    agent_input_snapshots,
     content_to_yaml_text,
+    parse_structured_output,
     read_agent_file,
-)
-from tiny_coder.file_agent import (
-    BasicFileAgent as _BasicFileAgent,
 )
 from tiny_coder.plugins import (
     AfterIterationPlugin,
@@ -35,6 +33,7 @@ from tiny_coder.plugins import (
     ConditionalLlmRequestPlugin,
     DynamicOutputPathsPlugin,
     ExistingPathGuardPlugin,
+    FileAgentPlugin,
     FileCleanupPlugin,
     FileTreeInputPathsPlugin,
     IterativeRunPlugin,
@@ -125,9 +124,9 @@ def BasicFileAgent(
     cwd: Path,
     llm_config: BaseModel,
     plugins: list[Any] | None = None,
-) -> _BasicFileAgent:
+) -> file_agent.BasicFileAgent:
     """Build a test agent with the required plugin-only model configuration."""
-    return _BasicFileAgent(
+    return file_agent.BasicFileAgent(
         cwd=cwd,
         plugins=[LlmConfigPlugin(llm_config), *(plugins or [])],
     )
@@ -179,8 +178,20 @@ def test_agent_file_helpers_stay_inside_root(workspace_tmp_path: Path) -> None:
         resolve_agent_file_path(workspace_tmp_path, Path("../outside.txt"))
 
 
-def test_parse_structured_sync_output_validates_model() -> None:
-    output = _parse_structured_sync_output(
+def test_builtin_plugins_implement_file_agent_protocol() -> None:
+    plugin_types = [
+        value
+        for name in plugins_module.__all__
+        if name.endswith("Plugin") and name != "FileAgentPlugin"
+        if isinstance((value := getattr(plugins_module, name)), type)
+    ]
+
+    assert plugin_types
+    assert all(issubclass(plugin_type, FileAgentPlugin) for plugin_type in plugin_types)
+
+
+def test_parse_structured_output_validates_model() -> None:
+    output = parse_structured_output(
         '{"summary": "done", "content": {"title": "Tiny"}}',
         output_type=SampleOutput,
     )
@@ -199,7 +210,7 @@ def test_agent_input_snapshots_include_labels_and_languages(workspace_tmp_path: 
     _write_test_file(workspace_tmp_path, Path("docs/readme.md"), "# Title\n")
     _write_test_file(workspace_tmp_path, Path("data/config.yaml"), "name: tiny\n")
 
-    snapshots = _agent_input_snapshots(
+    snapshots = agent_input_snapshots(
         workspace_tmp_path,
         [
             resolve_agent_file_path(workspace_tmp_path, Path("docs/readme.md")),
@@ -339,7 +350,7 @@ def test_basic_file_agent_requires_llm_request_group(workspace_tmp_path: Path) -
 
 def test_basic_file_agent_uses_llm_config_plugin(workspace_tmp_path: Path) -> None:
     llm_config = SampleLlmConfig()
-    agent = _BasicFileAgent(
+    agent = file_agent.BasicFileAgent(
         cwd=workspace_tmp_path,
         plugins=[
             LlmConfigPlugin(llm_config),
@@ -353,7 +364,7 @@ def test_basic_file_agent_uses_llm_config_plugin(workspace_tmp_path: Path) -> No
 
 def test_llm_request_group_requires_llm_config_plugin(workspace_tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="LLM request requires LlmConfigPlugin"):
-        _BasicFileAgent(
+        file_agent.BasicFileAgent(
             cwd=workspace_tmp_path,
             plugins=[LlmRequestGroupPlugin(key="missing-config")],
         )
@@ -1219,7 +1230,7 @@ def test_agent_retry_policy_plugin_retries_invalid_structured_output(
     assert result.written_paths == [(workspace_tmp_path / "output.txt").resolve()]
     assert read_agent_file(workspace_tmp_path, Path("output.txt")) == "done\n"
     assert prompts[0] == "\n"
-    assert "invalid structured sync output" in prompts[1]
+    assert "invalid structured output" in prompts[1]
 
 
 def test_json_field_stream_llm_call_streams_field_and_preserves_outcome(

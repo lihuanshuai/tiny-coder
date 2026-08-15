@@ -12,14 +12,12 @@ from pydantic import BaseModel, ValidationError
 from tiny_coder.json_utils import JsonProtocolError, load_json_object
 from tiny_coder.llm_format_stream import stream_llm_chat_format
 from tiny_coder.plugins import (
+    FileAgentPlugin,
     LlmRequestGroupPlugin,
-    _agent_root,
-    _FileAgentPlugin,
-    _require_output_model_type,
-    _validate_llm_request_registration,
-)
-from tiny_coder.plugins import (
-    resolve_agent_file_path as _resolve_agent_file_path,
+    require_output_model_type,
+    resolve_agent_file_path,
+    resolve_agent_root,
+    validate_llm_request_registration,
 )
 from tiny_coder.yaml_utils import dump_yaml_text
 
@@ -82,7 +80,7 @@ class _AgentInputSnapshot(TypedDict):
     content: str
 
 
-def _default_llm_call() -> _LlmCall:
+def _default_llm_call() -> LlmCall:
     return stream_llm_chat_format
 
 
@@ -92,7 +90,7 @@ class AgentContext:
 
     cwd: Path
     llm_config: BaseModel | None = None
-    llm_call: _LlmCall = field(default_factory=_default_llm_call)
+    llm_call: LlmCall = field(default_factory=_default_llm_call)
     max_attempts: int = 1
     llm_call_outcome: LlmCallOutcome | None = None
     llm_call_system_prompt: str = ""
@@ -137,7 +135,7 @@ class LlmCallOutcome(Protocol):
     def eval_count(self) -> int: ...
 
 
-class _LlmCall(Protocol):
+class LlmCall(Protocol):
     def __call__(
         self,
         *,
@@ -151,14 +149,14 @@ class _LlmCall(Protocol):
 
 def _relative_label(root: Path, path: Path) -> str:
     try:
-        return path.relative_to(_agent_root(root)).as_posix()
+        return path.relative_to(resolve_agent_root(root)).as_posix()
     except ValueError:
         return str(path)
 
 
 def read_agent_file(root: Path, path: Path) -> str:
     """Read a UTF-8 text file from the agent workspace."""
-    target = _resolve_agent_file_path(root, path)
+    target = resolve_agent_file_path(root, path)
     if not target.is_file():
         raise FileNotFoundError(f"file not found: {_relative_label(root, target)}")
     with target.open("r", encoding="utf-8", newline="\n") as f:
@@ -174,7 +172,7 @@ def _code_fence_language(path: Path) -> str:
     return _CODE_FENCE_LANG_BY_SUFFIX.get(path.suffix.lower(), "text")
 
 
-def _agent_input_snapshots(root: Path, input_paths: list[Path]) -> list[_AgentInputSnapshot]:
+def agent_input_snapshots(root: Path, input_paths: list[Path]) -> list[_AgentInputSnapshot]:
     """Read agent input files and return template-ready snapshot objects."""
     return [
         {
@@ -186,14 +184,14 @@ def _agent_input_snapshots(root: Path, input_paths: list[Path]) -> list[_AgentIn
     ]
 
 
-def _parse_structured_sync_output(raw_output: str, *, output_type: type[_OutputT]) -> _OutputT:
+def parse_structured_output(raw_output: str, *, output_type: type[_OutputT]) -> _OutputT:
     """Parse the model JSON response into the plugin-selected output model."""
     try:
         payload = load_json_object(raw_output)
-        model = _require_output_model_type(output_type)
+        model = require_output_model_type(output_type)
         return cast(_OutputT, model.model_validate(payload))
     except (JsonProtocolError, ValidationError) as e:
-        raise ValueError(f"invalid structured sync output: {e}") from e
+        raise ValueError(f"invalid structured output: {e}") from e
 
 
 def content_to_yaml_text(content: Any) -> str:
@@ -222,24 +220,24 @@ class BasicFileAgent:
     """Core file-oriented LangGraph runner with plugin-only lifecycle hooks."""
 
     cwd: Path
-    plugins: InitVar[Sequence[_FileAgentPlugin] | None] = None
+    plugins: InitVar[Sequence[FileAgentPlugin] | None] = None
     context: AgentContext = field(init=False)
     graph: Any = field(init=False, repr=False)
 
-    def __post_init__(self, plugins: Sequence[_FileAgentPlugin] | None) -> None:
-        self.cwd = _agent_root(self.cwd)
+    def __post_init__(self, plugins: Sequence[FileAgentPlugin] | None) -> None:
+        self.cwd = resolve_agent_root(self.cwd)
         self.context = AgentContext(cwd=self.cwd)
         registration_context = self.context
         for plugin in plugins or []:
             if isinstance(plugin, LlmRequestGroupPlugin):
                 if registration_context is not self.context:
-                    _validate_llm_request_registration(registration_context)
+                    validate_llm_request_registration(registration_context)
                 plugin.on_registered(self.context)
                 registration_context = self.context.llm_request_contexts[plugin.key]
             else:
                 plugin.on_registered(registration_context)
         if registration_context is not self.context:
-            _validate_llm_request_registration(registration_context)
+            validate_llm_request_registration(registration_context)
         if not self.context.llm_request_contexts:
             raise ValueError("BasicFileAgent requires at least one LlmRequestGroupPlugin")
         self.graph = self._build_graph()
@@ -258,7 +256,7 @@ class BasicFileAgent:
         output_type = self._configured_request_context().llm_response_output_type
         if output_type is None:
             raise NotImplementedError("llm_response_output_type must be provided by a plugin")
-        return _require_output_model_type(output_type)
+        return require_output_model_type(output_type)
 
     def split_and_write_output(self, output: BaseModel) -> list[Path]:
         """Persist the validated output through registered plugins only."""
@@ -376,7 +374,7 @@ class BasicFileAgent:
         """Validate output and let plugins write it; raises on violations."""
         self.context.llm_response_output = None
         output_type = self.response_output_type()
-        output = _parse_structured_sync_output(state["raw_output"], output_type=output_type)
+        output = parse_structured_output(state["raw_output"], output_type=output_type)
         self.context.llm_response_output = output
         written = self.split_and_write_output(output)
         allowed = set(self.output_paths())
@@ -549,7 +547,7 @@ class BasicFileAgent:
             await self.graph.ainvoke({"system_prompt": system_prompt, "user_prompt": user_prompt}),
         )
         written = [
-            _resolve_agent_file_path(self.cwd, Path(path))
+            resolve_agent_file_path(self.cwd, Path(path))
             for path in final_state.get("written_paths", [])
         ]
         return SyncAgentResult(summary=final_state.get("summary", ""), written_paths=written)
@@ -589,7 +587,7 @@ class BasicFileAgent:
                 )
                 if attempt >= max_attempts:
                     raise RuntimeError(
-                        "LangGraph structured sync output failed "
+                        "LangGraph structured output failed "
                         f"after {max_attempts} attempt(s): {error_text}"
                     ) from e
                 continue
@@ -613,9 +611,12 @@ class BasicFileAgent:
 __all__ = [
     "BasicFileAgent",
     "AgentContext",
+    "LlmCall",
     "LlmCallOutcome",
     "RetryLlmRequestSequence",
     "SyncAgentResult",
+    "agent_input_snapshots",
     "content_to_yaml_text",
+    "parse_structured_output",
     "read_agent_file",
 ]
