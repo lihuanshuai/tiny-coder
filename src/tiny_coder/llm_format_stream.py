@@ -58,6 +58,19 @@ def nonnegative_int_from_llm_field(value: object) -> int | None:
     return None
 
 
+def _positive_float_from_llm_field(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if number > 0 else None
+
+
+def _tokens_per_second(token_count: int, duration_seconds: float | None) -> float | None:
+    if duration_seconds is None or duration_seconds <= 0:
+        return None
+    return token_count / duration_seconds
+
+
 def _schema_response_format(schema: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "json_schema",
@@ -125,6 +138,10 @@ def _llm_tail_metrics_dict(
     *,
     done_reason: str | None,
     reasoning_chars: int,
+    prompt_eval_count: int,
+    eval_count: int,
+    observed_prompt_seconds: float,
+    observed_eval_seconds: float,
 ) -> dict[str, Any]:
     if packet is None:
         return {}
@@ -144,6 +161,22 @@ def _llm_tail_metrics_dict(
         metrics["done_reason"] = done_reason
     if reasoning_chars:
         metrics["reasoning_chars"] = reasoning_chars
+    prompt_duration_ns = _positive_float_from_llm_field(_get_value(packet, "prompt_eval_duration"))
+    eval_duration_ns = _positive_float_from_llm_field(_get_value(packet, "eval_duration"))
+    prompt_speed = _tokens_per_second(
+        prompt_eval_count,
+        prompt_duration_ns / 1_000_000_000
+        if prompt_duration_ns is not None
+        else observed_prompt_seconds,
+    )
+    eval_speed = _tokens_per_second(
+        eval_count,
+        eval_duration_ns / 1_000_000_000 if eval_duration_ns is not None else observed_eval_seconds,
+    )
+    if prompt_speed is not None:
+        metrics["prompt_tokens_per_second"] = prompt_speed
+    if eval_speed is not None:
+        metrics["eval_tokens_per_second"] = eval_speed
     metrics["provider"] = "openai-compatible"
     return metrics
 
@@ -206,6 +239,7 @@ async def stream_llm_chat_format(
     last_packet: object | None = None
     done_reason: str | None = None
     reasoning_chars = 0
+    first_model_token_at: float | None = None
     collected: list[str] = []
 
     def dispatch_chunk(chunk: str) -> None:
@@ -251,6 +285,8 @@ async def stream_llm_chat_format(
             if completion_count is not None:
                 eval_count = completion_count
                 had_eval_metric = True
+            if first_model_token_at is None and (content or reasoning):
+                first_model_token_at = time.perf_counter()
             reasoning_chars += len(reasoning)
             if finish_reason is not None:
                 done_reason = finish_reason
@@ -274,18 +310,25 @@ async def stream_llm_chat_format(
             f"prompt_eval_count={prompt_eval_count}, eval_count={eval_count}, "
             f"reasoning_chars={reasoning_chars})"
         )
+    if first_model_token_at is None:
+        raise RuntimeError("OpenAI-compatible LLM stream did not record its first model token")
+    completed = time.perf_counter()
     completed_at = datetime.now(timezone.utc).isoformat()
     return LlmChatStreamOutcome(
         text="".join(collected),
         prompt_eval_count=prompt_eval_count,
         eval_count=eval_count,
-        client_wall_time_ms=(time.perf_counter() - started) * 1000.0,
+        client_wall_time_ms=(completed - started) * 1000.0,
         started_at=started_at,
         completed_at=completed_at,
         llm=_llm_tail_metrics_dict(
             last_packet,
             done_reason=done_reason,
             reasoning_chars=reasoning_chars,
+            prompt_eval_count=prompt_eval_count,
+            eval_count=eval_count,
+            observed_prompt_seconds=first_model_token_at - started,
+            observed_eval_seconds=completed - first_model_token_at,
         ),
     )
 

@@ -52,6 +52,8 @@ class FakeCompletions:
                 {
                     "model": "sample-model",
                     "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+                    "prompt_eval_duration": 1_500_000_000,
+                    "eval_duration": 2_000_000_000,
                     "choices": [],
                 },
             ]
@@ -128,6 +130,8 @@ def test_stream_llm_chat_format_forwards_schema_chunks_and_metrics(
         "model": "sample-model",
         "done_reason": "stop",
         "reasoning_chars": 6,
+        "prompt_tokens_per_second": 2.0,
+        "eval_tokens_per_second": 2.0,
         "provider": "openai-compatible",
     }
     assert FakeCompletions.kwargs["response_format"] == {
@@ -146,6 +150,21 @@ def test_stream_llm_chat_format_forwards_schema_chunks_and_metrics(
     assert FakeCompletions.kwargs["reasoning_effort"] == "none"
     assert FakeAsyncOpenAI.timeout == 37.0
     assert FakeAsyncOpenAI.closed is True
+
+
+def test_llm_tail_metrics_falls_back_to_client_observed_token_speed() -> None:
+    metrics = llm_format_stream._llm_tail_metrics_dict(
+        {"usage": {"prompt_tokens": 10, "completion_tokens": 20}},
+        done_reason="stop",
+        reasoning_chars=0,
+        prompt_eval_count=10,
+        eval_count=20,
+        observed_prompt_seconds=2.0,
+        observed_eval_seconds=4.0,
+    )
+
+    assert metrics["prompt_tokens_per_second"] == 5.0
+    assert metrics["eval_tokens_per_second"] == 5.0
 
 
 def test_stream_llm_chat_format_rejects_nonpositive_timeout() -> None:
