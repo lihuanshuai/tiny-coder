@@ -205,6 +205,53 @@ keyed request in the agent, including calls whose structured output later fails 
 retried. `extra_handler` may add JSON-serializable caller metadata without changing the fixed call
 record contract.
 
+## Generated Script Execution
+
+`ExecutableScriptPlugin` executes validated script content without writing it to a workspace file
+or invoking a shell. The LLM returns the script in `GeneratedScriptOutput.script`; the agent first
+validates the structured output and its explicit `ExecutableScriptOutput` contract, then sends the
+content to the interpreter through standard input. It defaults to `[sys.executable, "-"]`; pass a
+complete `command` to use another runtime. Standard output and error are captured, and
+`timeout_seconds` bounds execution. Results are keyed by request name in
+`context.script_execution_results` for later requests and lifecycle hooks.
+
+```python
+from tiny_coder.executable_script import GeneratedScriptOutput
+from tiny_coder.plugins import (
+    ExecutableScriptPlugin,
+    ResponseOutputTypePlugin,
+)
+
+
+script_plugins = [
+    LlmConfigPlugin(ExampleLlmConfig()),
+    LlmRequestGroupPlugin(key="script"),
+    ResponseOutputTypePlugin(GeneratedScriptOutput),
+    TemplateSystemPromptPlugin(
+        "script-system.jinja",
+        template_root=template_root,
+    ),
+    TemplateUserPromptPlugin(
+        "script-user.jinja",
+        template_root=template_root,
+    ),
+    ExecutableScriptPlugin(
+        arguments=["--dry-run"],
+        timeout_seconds=30,
+    ),
+]
+```
+
+The default response schema contains `summary` and `script`. Custom Pydantic response models may
+inherit `ExecutableScriptOutput` and implement `to_executable_script(context)`. A non-zero exit or
+timeout is reported through the existing structured-output retry path, including captured output,
+so generated code can be corrected on the next attempt. Generated scripts should therefore be
+idempotent because a failed execution or a later request-sequence retry can run them again. When a
+script must never be retried, configure `AgentRetryPolicyPlugin(1)` on both its request and the
+first request group that controls sequence retries. Treat this plugin as an explicit trusted-code
+boundary: generated code runs with the current process user's permissions and inherited
+environment.
+
 ## Development
 
 Useful local checks:

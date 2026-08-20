@@ -9,6 +9,7 @@ from langgraph.graph import END, START, StateGraph
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from pydantic import BaseModel, ValidationError
 
+from tiny_coder.executable_script import ScriptExecutionResult
 from tiny_coder.json_utils import JsonProtocolError, load_json_object
 from tiny_coder.llm_format_stream import stream_llm_chat_format
 from tiny_coder.plugins import (
@@ -120,6 +121,7 @@ class AgentContext:
     llm_call_outcomes: dict[str, LlmCallOutcome] = field(default_factory=dict)
     llm_response_outputs: dict[str, BaseModel] = field(default_factory=dict)
     llm_request_results: dict[str, SyncAgentResult] = field(default_factory=dict)
+    script_execution_results: dict[str, ScriptExecutionResult] = field(default_factory=dict)
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -415,6 +417,7 @@ class BasicFileAgent:
         self.context.llm_call_outcomes.clear()
         self.context.llm_response_outputs.clear()
         self.context.llm_request_results.clear()
+        self.context.script_execution_results.clear()
 
     async def _run_llm_requests(self) -> SyncAgentResult:
         root_context = self.context
@@ -518,6 +521,7 @@ class BasicFileAgent:
         request_context.llm_call_outcomes = root_context.llm_call_outcomes
         request_context.llm_response_outputs = root_context.llm_response_outputs
         request_context.llm_request_results = root_context.llm_request_results
+        request_context.script_execution_results = root_context.script_execution_results
         request_context.extras = root_context.extras
 
     async def _call_llm_and_apply_output(

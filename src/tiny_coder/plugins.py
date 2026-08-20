@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -21,6 +23,7 @@ from tiny_coder.apply_patch import (
     resolve_agent_file_path,
     resolve_agent_root,
 )
+from tiny_coder.executable_script import ExecutableScriptOutput, ScriptExecutionResult
 from tiny_coder.json_utils import JsonStringFieldStreamer
 
 if TYPE_CHECKING:
@@ -230,6 +233,7 @@ class LlmRequestGroupPlugin(FileAgentPlugin):
         request_context.llm_call_outcomes = context.llm_call_outcomes
         request_context.llm_response_outputs = context.llm_response_outputs
         request_context.llm_request_results = context.llm_request_results
+        request_context.script_execution_results = context.script_execution_results
         request_context.extras = context.extras
         request_context.after_llm_call_hooks = list(context.after_llm_call_hooks)
         context.llm_request_contexts[self.key] = request_context
@@ -628,6 +632,128 @@ class ApplyPatchWriterPlugin(FileAgentPlugin):
         )
 
 
+@dataclass(kw_only=True)
+class ExecutableScriptPlugin(FileAgentPlugin):
+    """Execute validated structured script content without invoking a shell."""
+
+    command: list[str] = field(default_factory=lambda: [sys.executable, "-"])
+    arguments: list[str] = field(default_factory=list)
+    timeout_seconds: float = 60.0
+    context: AgentContext = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.command or any(not part for part in self.command):
+            raise ValueError("script command must contain non-blank arguments")
+        if self.timeout_seconds <= 0:
+            raise ValueError("script timeout_seconds must be greater than zero")
+
+    def on_registered(self, context: AgentContext) -> None:
+        """Register content validation followed by script execution."""
+        if context.llm_request_key is None:
+            raise RuntimeError("ExecutableScriptPlugin requires a preceding LlmRequestGroupPlugin")
+        output_type = context.llm_response_output_type
+        if output_type is None:
+            raise RuntimeError(
+                "ExecutableScriptPlugin requires ResponseOutputTypePlugin to be registered first"
+            )
+        if not issubclass(output_type, ExecutableScriptOutput):
+            raise TypeError("response output type must inherit ExecutableScriptOutput")
+        if context.output_writer is not None:
+            raise RuntimeError("ExecutableScriptPlugin requires an unconfigured output writer")
+
+        self.context = context
+        context.output_writer = self.validate_output
+        context.llm_output_result_hooks.append(self.execute_output)
+
+    def validate_output(self, context: AgentContext, output: BaseModel) -> list[Path]:
+        """Validate the structured script output without writing a workspace file."""
+        self._validated_script(context, output)
+        return []
+
+    def _validated_script(self, context: AgentContext, output: BaseModel) -> str:
+        output_type = context.llm_response_output_type
+        if output_type is None:
+            raise RuntimeError("ExecutableScriptPlugin is not registered")
+        if type(output) is not output_type or not isinstance(output, ExecutableScriptOutput):
+            raise ValueError(
+                "structured output type mismatch: "
+                f"expected {output_type.__qualname__} inheriting ExecutableScriptOutput, "
+                f"got {type(output).__qualname__}"
+            )
+
+        script = output.to_executable_script(context)
+        if not isinstance(script, str):
+            raise ValueError("executable script output must return str content")
+        script = _normalize_newlines(script)
+        if not script.strip():
+            raise ValueError("generated script must not be blank")
+        return script if script.endswith("\n") else script + "\n"
+
+    async def execute_output(self, result: SyncAgentResult) -> None:
+        """Execute the generated script and retain its captured process result."""
+        _ = result
+        request_key = self.context.llm_request_key
+        if request_key is None:
+            raise RuntimeError("generated script execution requires an active request key")
+        output = self.context.llm_response_output
+        if output is None:
+            raise RuntimeError("generated script execution requires validated output")
+        script = self._validated_script(self.context, output)
+        command = (*self.command, *self.arguments)
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=self.context.cwd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        timed_out = False
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                process.communicate(script.encode("utf-8")),
+                timeout=self.timeout_seconds,
+            )
+        except TimeoutError:
+            timed_out = True
+            process.kill()
+            stdout_bytes, stderr_bytes = await process.communicate()
+
+        returncode = process.returncode
+        if returncode is None:
+            raise RuntimeError("generated script process did not terminate")
+        execution = ScriptExecutionResult(
+            command=command,
+            returncode=returncode,
+            stdout=stdout_bytes.decode("utf-8", errors="replace"),
+            stderr=stderr_bytes.decode("utf-8", errors="replace"),
+            timed_out=timed_out,
+        )
+        self.context.script_execution_results[request_key] = execution
+        if execution.timed_out:
+            raise ValueError(
+                f"generated script timed out after {self.timeout_seconds:g} seconds"
+                + _script_output_details(execution)
+            )
+        if execution.returncode != 0:
+            raise ValueError(
+                f"generated script failed with exit code {execution.returncode}"
+                + _script_output_details(execution)
+            )
+
+
+def _normalize_newlines(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _script_output_details(result: ScriptExecutionResult) -> str:
+    details = []
+    if result.stdout:
+        details.append(f"stdout:\n{result.stdout.rstrip()}")
+    if result.stderr:
+        details.append(f"stderr:\n{result.stderr.rstrip()}")
+    return "" if not details else "\n" + "\n".join(details)
+
+
 class NoopOutputWriterPlugin(FileAgentPlugin):
     """Accept a validated response without writing workspace files."""
 
@@ -651,6 +777,7 @@ __all__ = [
     "ConditionalLlmRequestPlugin",
     "DynamicOutputPathsPlugin",
     "ExistingPathGuardPlugin",
+    "ExecutableScriptPlugin",
     "FileAgentPlugin",
     "FileCleanupPlugin",
     "FileTreeInputPathsPlugin",
