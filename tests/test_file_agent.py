@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from tiny_coder import file_agent
 from tiny_coder import plugins as plugins_module
@@ -40,6 +40,8 @@ from tiny_coder.plugins import (
     IterativeRunPlugin,
     JsonFieldStreamLlmCallPlugin,
     LlmCallJsonlRecorderPlugin,
+    LlmCallTokenStats,
+    LlmCallTokenStatsPlugin,
     LlmConfigPlugin,
     LlmOutputResultPlugin,
     LlmRequestGroupPlugin,
@@ -169,6 +171,7 @@ class SampleLlmOutcome(BaseModel):
     text: str
     prompt_eval_count: int
     eval_count: int
+    llm: dict[str, float] = Field(default_factory=dict)
 
 
 async def _unused_llm_call(
@@ -552,6 +555,67 @@ def test_llm_call_jsonl_recorder_records_every_call_with_custom_extra(
             "extra": {"cwd": workspace_tmp_path.name},
         },
     ]
+
+
+def test_llm_call_token_stats_plugin_prints_successful_outcome(
+    workspace_tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    context = AgentContext(cwd=workspace_tmp_path)
+    LlmCallTokenStatsPlugin().on_registered(context)
+    context.llm_call_outcome = SampleLlmOutcome(
+        text="done",
+        prompt_eval_count=1200,
+        eval_count=34,
+        llm={
+            "prompt_tokens_per_second": 456.78,
+            "eval_tokens_per_second": 12.34,
+        },
+    )
+
+    asyncio.run(context.after_run_hooks[0](SyncAgentResult(summary="done", written_paths=[])))
+
+    assert (
+        capsys.readouterr().out.strip()
+        == "LLM Token｜输入 1,200（456.8 token/s）｜输出 34（12.3 token/s）"
+    )
+
+
+def test_llm_call_token_stats_plugin_uses_custom_handler(
+    workspace_tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    received: list[tuple[AgentContext, LlmCallTokenStats]] = []
+
+    async def handle_stats(context: AgentContext, stats: LlmCallTokenStats) -> None:
+        received.append((context, stats))
+
+    context = AgentContext(cwd=workspace_tmp_path)
+    LlmCallTokenStatsPlugin(handler=handle_stats).on_registered(context)
+    context.llm_call_outcome = SampleLlmOutcome(
+        text="done",
+        prompt_eval_count=12,
+        eval_count=3,
+        llm={
+            "prompt_tokens_per_second": 4.5,
+            "eval_tokens_per_second": 6.7,
+        },
+    )
+
+    asyncio.run(context.after_run_hooks[0](SyncAgentResult(summary="done", written_paths=[])))
+
+    assert received == [
+        (
+            context,
+            LlmCallTokenStats(
+                prompt_eval_count=12,
+                eval_count=3,
+                prompt_tokens_per_second=4.5,
+                eval_tokens_per_second=6.7,
+            ),
+        )
+    ]
+    assert capsys.readouterr().out == ""
 
 
 def test_llm_output_result_plugin_registers_context_callback(workspace_tmp_path: Path) -> None:

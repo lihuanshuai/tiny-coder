@@ -55,6 +55,9 @@ _JsonValue: TypeAlias = _JsonScalar | list["_JsonValue"] | dict[str, "_JsonValue
 _LlmCallExtraHandler: TypeAlias = Callable[
     ["AgentContext", "LlmCallOutcome"], Mapping[str, _JsonValue]
 ]
+_LlmCallTokenStatsHandler: TypeAlias = Callable[
+    ["AgentContext", "LlmCallTokenStats"], Awaitable[None]
+]
 
 
 class _LlmCallStats(TypedDict):
@@ -132,6 +135,65 @@ class LlmCallJsonlRecorderPlugin(FileAgentPlugin):
         self.target_path.parent.mkdir(parents=True, exist_ok=True)
         with self.target_path.open("a", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _token_speed(outcome: LlmCallOutcome, key: str) -> float | None:
+    metadata = getattr(outcome, "llm", None)
+    value = metadata.get(key) if isinstance(metadata, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return float(value)
+
+
+def _format_token_speed(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:,.1f} token/s"
+
+
+@dataclass
+class LlmCallTokenStats:
+    """Numeric token usage and speed values from one successful LLM call."""
+
+    prompt_eval_count: int
+    eval_count: int
+    prompt_tokens_per_second: float | None
+    eval_tokens_per_second: float | None
+
+
+def format_llm_call_token_stats(stats: LlmCallTokenStats) -> str:
+    """Format token statistics for compact command-line display."""
+    prompt_speed = _format_token_speed(stats.prompt_tokens_per_second)
+    eval_speed = _format_token_speed(stats.eval_tokens_per_second)
+    return (
+        f"LLM Token｜输入 {stats.prompt_eval_count:,}（{prompt_speed}）"
+        f"｜输出 {stats.eval_count:,}（{eval_speed}）"
+    )
+
+
+@dataclass
+class LlmCallTokenStatsPlugin(FileAgentPlugin):
+    """Print final token counts and speeds after a keyed LLM request succeeds."""
+
+    handler: _LlmCallTokenStatsHandler | None = None
+
+    def on_registered(self, context: AgentContext) -> None:
+        """Register a compact success-only footer for the active request."""
+
+        async def print_call_stats(_result: SyncAgentResult) -> None:
+            outcome = context.llm_call_outcome
+            if outcome is None:
+                raise RuntimeError("successful LLM request has no call outcome")
+            stats = LlmCallTokenStats(
+                prompt_eval_count=outcome.prompt_eval_count,
+                eval_count=outcome.eval_count,
+                prompt_tokens_per_second=_token_speed(outcome, "prompt_tokens_per_second"),
+                eval_tokens_per_second=_token_speed(outcome, "eval_tokens_per_second"),
+            )
+            if self.handler is None:
+                print(format_llm_call_token_stats(stats))
+            else:
+                await self.handler(context, stats)
+
+        context.after_run_hooks.append(print_call_stats)
 
 
 @dataclass
@@ -785,6 +847,8 @@ __all__ = [
     "JsonFieldStreamLlmCallPlugin",
     "LlmConfigPlugin",
     "LlmCallJsonlRecorderPlugin",
+    "LlmCallTokenStats",
+    "LlmCallTokenStatsPlugin",
     "LlmOutputResultPlugin",
     "LlmRequestGroupPlugin",
     "ResponseOutputTypePlugin",
@@ -800,4 +864,5 @@ __all__ = [
     "TemplateUserPromptPlugin",
     "UserTemplateVars",
     "validate_llm_request_registration",
+    "format_llm_call_token_stats",
 ]
