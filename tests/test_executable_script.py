@@ -9,11 +9,11 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from tiny_coder import file_agent
 from tiny_coder.executable_script import GeneratedScriptOutput
-from tiny_coder.file_agent import LlmCall, LlmCallOutcome
+from tiny_coder.file_agent import AgentContext, LlmCall, LlmCallOutcome
 from tiny_coder.plugins import (
     AgentRetryPolicyPlugin,
     ExecutableScriptPlugin,
@@ -37,6 +37,29 @@ class SampleLlmOutcome(BaseModel):
 
 class NonScriptOutput(BaseModel):
     script: str
+
+
+def test_generated_script_output_schema_describes_required_fields() -> None:
+    schema = GeneratedScriptOutput.model_json_schema()
+
+    assert schema["required"] == ["summary", "script"]
+    assert schema["properties"]["summary"]["minLength"] == 1
+    assert schema["properties"]["summary"]["description"] == (
+        "Concise plain-text summary of the generated script's behavior."
+    )
+    assert schema["properties"]["script"]["minLength"] == 1
+    assert schema["properties"]["script"]["description"] == (
+        "Complete executable script source code to validate and run."
+    )
+
+
+@pytest.mark.parametrize("field", ["summary", "script"])
+def test_generated_script_output_rejects_blank_fields(field: str) -> None:
+    values = {"summary": "generated", "script": "print('ok')"}
+    values[field] = " "
+
+    with pytest.raises(ValidationError, match=f"generated {field} must not be blank"):
+        GeneratedScriptOutput.model_validate(values)
 
 
 @pytest.fixture
@@ -98,12 +121,14 @@ def test_executable_script_plugin_validates_then_executes_content(
             )
         )
 
+    script_plugin = ExecutableScriptPlugin(arguments=["argument"])
     agent = _build_agent(
         workspace_tmp_path,
         llm_call,
-        script_plugin=ExecutableScriptPlugin(arguments=["argument"]),
+        script_plugin=script_plugin,
     )
 
+    assert not hasattr(script_plugin, "context")
     result = asyncio.run(agent.run())
 
     assert result.summary == "generated"
@@ -115,6 +140,128 @@ def test_executable_script_plugin_validates_then_executes_content(
     assert execution.stdout.splitlines() == ["hello", "argument"]
     assert execution.stderr == ""
     assert not execution.timed_out
+
+
+def test_executable_script_plugin_can_inherit_terminal_output(
+    workspace_tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    async def llm_call(**kwargs: object) -> LlmCallOutcome:
+        _ = kwargs
+        return SampleLlmOutcome(
+            text=json.dumps(
+                {
+                    "summary": "generated",
+                    "script": (
+                        "import sys\n"
+                        "print('visible stdout', flush=True)\n"
+                        "print('visible stderr', file=sys.stderr, flush=True)"
+                    ),
+                }
+            )
+        )
+
+    agent = _build_agent(
+        workspace_tmp_path,
+        llm_call,
+        script_plugin=ExecutableScriptPlugin(capture_output=False),
+    )
+
+    asyncio.run(agent.run())
+
+    captured = capfd.readouterr()
+    assert "visible stdout" in captured.out
+    assert "visible stderr" in captured.err
+    execution = agent.context.script_execution_results["script"]
+    assert execution.stdout == ""
+    assert execution.stderr == ""
+
+
+def test_executable_script_plugin_prepares_then_honors_rejected_confirmation(
+    workspace_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared_scripts: list[str] = []
+
+    async def llm_call(**kwargs: object) -> LlmCallOutcome:
+        _ = kwargs
+        return SampleLlmOutcome(
+            text=json.dumps({"summary": "generated", "script": "```python\r\nprint('ok')\r\n```"})
+        )
+
+    async def prepare_output(
+        output: GeneratedScriptOutput,
+        context: AgentContext,
+    ) -> None:
+        _ = context
+        prepared_scripts.append(output.script)
+        output.script = output.script.replace("\r\n", "\n")
+        output.script = output.script.removeprefix("```python\n").removesuffix("\n```")
+
+    async def unexpected_process(*args: object, **kwargs: object) -> None:
+        _ = args, kwargs
+        raise AssertionError("rejected confirmation must not execute the script")
+
+    async def reject_execution(context: AgentContext, output: BaseModel) -> bool:
+        assert context.llm_request_key == "script"
+        assert isinstance(output, GeneratedScriptOutput)
+        assert output.script == "print('ok')"
+        return False
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_process)
+    monkeypatch.setattr(
+        GeneratedScriptOutput,
+        "prepare_executable_script",
+        prepare_output,
+    )
+    agent = _build_agent(
+        workspace_tmp_path,
+        llm_call,
+        script_plugin=ExecutableScriptPlugin(execution_confirmation=reject_execution),
+    )
+
+    asyncio.run(agent.run())
+
+    output = agent.context.llm_response_output
+    assert isinstance(output, GeneratedScriptOutput)
+    assert output.script == "print('ok')"
+    assert prepared_scripts == ["```python\r\nprint('ok')\r\n```"]
+    assert agent.context.script_execution_results == {}
+
+
+def test_executable_script_plugin_revalidates_prepared_output(
+    workspace_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def llm_call(**kwargs: object) -> LlmCallOutcome:
+        _ = kwargs
+        return SampleLlmOutcome(text=json.dumps({"summary": "generated", "script": "print('ok')"}))
+
+    async def prepare_invalid_output(
+        output: GeneratedScriptOutput,
+        context: AgentContext,
+    ) -> None:
+        _ = context
+        output.script = " "
+
+    async def unexpected_process(*args: object, **kwargs: object) -> None:
+        _ = args, kwargs
+        raise AssertionError("invalid prepared script must not be executed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_process)
+    monkeypatch.setattr(
+        GeneratedScriptOutput,
+        "prepare_executable_script",
+        prepare_invalid_output,
+    )
+    agent = _build_agent(
+        workspace_tmp_path,
+        llm_call,
+        script_plugin=ExecutableScriptPlugin(),
+    )
+
+    with pytest.raises(RuntimeError, match="generated script must not be blank"):
+        asyncio.run(agent.run())
 
 
 def test_executable_script_failure_is_available_to_generation_retry(
@@ -130,7 +277,7 @@ def test_executable_script_failure_is_available_to_generation_retry(
             if len(prompts) == 1
             else "print('fixed')"
         )
-        return SampleLlmOutcome(text=json.dumps({"script": code}))
+        return SampleLlmOutcome(text=json.dumps({"summary": "generated", "script": code}))
 
     agent = _build_agent(
         workspace_tmp_path,
@@ -155,7 +302,9 @@ def test_executable_script_timeout_is_captured(
 ) -> None:
     async def llm_call(**kwargs: object) -> LlmCallOutcome:
         _ = kwargs
-        return SampleLlmOutcome(text=json.dumps({"script": "import time\ntime.sleep(5)"}))
+        return SampleLlmOutcome(
+            text=json.dumps({"summary": "generated", "script": "import time\ntime.sleep(5)"})
+        )
 
     agent = _build_agent(
         workspace_tmp_path,
@@ -194,7 +343,7 @@ def test_invalid_script_output_is_not_executed(
 ) -> None:
     async def llm_call(**kwargs: object) -> LlmCallOutcome:
         _ = kwargs
-        return SampleLlmOutcome(text=json.dumps({"script": "   "}))
+        return SampleLlmOutcome(text=json.dumps({"summary": "generated", "script": "   "}))
 
     async def unexpected_process(*args: object, **kwargs: object) -> None:
         _ = args, kwargs

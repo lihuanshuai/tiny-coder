@@ -214,6 +214,8 @@ content to the interpreter through standard input. It defaults to `[sys.executab
 complete `command` to use another runtime. Standard output and error are captured, and
 `timeout_seconds` bounds execution. Results are keyed by request name in
 `context.script_execution_results` for later requests and lifecycle hooks.
+Set `capture_output=False` when the child process should inherit the current terminal and display
+its output immediately; the stored execution result then has empty `stdout` and `stderr` fields.
 
 ```python
 from tiny_coder.executable_script import GeneratedScriptOutput
@@ -242,15 +244,21 @@ script_plugins = [
 ]
 ```
 
-The default response schema contains `summary` and `script`. Custom Pydantic response models may
-inherit `ExecutableScriptOutput` and implement `to_executable_script(context)`. A non-zero exit or
-timeout is reported through the existing structured-output retry path, including captured output,
-so generated code can be corrected on the next attempt. Generated scripts should therefore be
-idempotent because a failed execution or a later request-sequence retry can run them again. When a
-script must never be retried, configure `AgentRetryPolicyPlugin(1)` on both its request and the
-first request group that controls sequence retries. Treat this plugin as an explicit trusted-code
-boundary: generated code runs with the current process user's permissions and inherited
-environment.
+The default response schema requires non-blank `summary` and `script` fields and describes both for
+structured-output generation. Custom Pydantic response models may inherit `ExecutableScriptOutput`
+and implement `to_executable_script(context)`. A non-zero exit or timeout is reported through the
+existing structured-output retry path, including captured output, so generated code can be corrected
+on the next attempt. Generated scripts should therefore be idempotent because a failed execution or
+a later request-sequence retry can run them again. When a script must never be retried, configure
+`AgentRetryPolicyPlugin(1)` on both its request and the first request group that controls sequence
+retries. Treat this plugin as an explicit trusted-code boundary: generated code runs with the current
+process user's permissions and inherited environment.
+
+Custom response models can override `prepare_executable_script(context)` to normalize and validate
+their script asynchronously. The plugin reads and validates the script again after preparation,
+then always owns execution. Set `execution_confirmation` to an asynchronous callback when execution
+must first be approved; the callback controls how confirmation is presented and returns whether the
+prepared output may run. Without a callback, execution starts immediately.
 
 ## Development
 

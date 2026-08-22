@@ -6,6 +6,7 @@ import sys
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -49,6 +50,7 @@ _BeforeLlmRequestCallback: TypeAlias = Callable[["AgentContext", str], Awaitable
 _AfterLlmRequestCallback: TypeAlias = Callable[
     ["AgentContext", str, "SyncAgentResult"], Awaitable[None]
 ]
+_ExecutionConfirmation: TypeAlias = Callable[["AgentContext", BaseModel], Awaitable[bool]]
 _LlmRequestCondition: TypeAlias = Callable[["AgentContext", str], bool]
 _JsonScalar: TypeAlias = str | int | float | bool | None
 _JsonValue: TypeAlias = _JsonScalar | list["_JsonValue"] | dict[str, "_JsonValue"]
@@ -696,12 +698,14 @@ class ApplyPatchWriterPlugin(FileAgentPlugin):
 
 @dataclass(kw_only=True)
 class ExecutableScriptPlugin(FileAgentPlugin):
-    """Execute validated structured script content without invoking a shell."""
+    """Normalize, validate, confirm, and execute structured script content."""
 
     command: list[str] = field(default_factory=lambda: [sys.executable, "-"])
     arguments: list[str] = field(default_factory=list)
     timeout_seconds: float = 60.0
-    context: AgentContext = field(init=False, repr=False)
+    execution_confirmation: _ExecutionConfirmation | None = None
+    environment: Mapping[str, str] | None = field(default=None, repr=False)
+    capture_output: bool = True
 
     def __post_init__(self) -> None:
         if not self.command or any(not part for part in self.command):
@@ -723,16 +727,19 @@ class ExecutableScriptPlugin(FileAgentPlugin):
         if context.output_writer is not None:
             raise RuntimeError("ExecutableScriptPlugin requires an unconfigured output writer")
 
-        self.context = context
         context.output_writer = self.validate_output
-        context.llm_output_result_hooks.append(self.execute_output)
+        context.llm_output_result_hooks.append(partial(self.process_output, context))
 
     def validate_output(self, context: AgentContext, output: BaseModel) -> list[Path]:
         """Validate the structured script output without writing a workspace file."""
         self._validated_script(context, output)
         return []
 
-    def _validated_script(self, context: AgentContext, output: BaseModel) -> str:
+    def _validated_output(
+        self,
+        context: AgentContext,
+        output: BaseModel,
+    ) -> ExecutableScriptOutput:
         output_type = context.llm_response_output_type
         if output_type is None:
             raise RuntimeError("ExecutableScriptPlugin is not registered")
@@ -742,8 +749,11 @@ class ExecutableScriptPlugin(FileAgentPlugin):
                 f"expected {output_type.__qualname__} inheriting ExecutableScriptOutput, "
                 f"got {type(output).__qualname__}"
             )
+        return output
 
-        script = output.to_executable_script(context)
+    def _validated_script(self, context: AgentContext, output: BaseModel) -> str:
+        executable_output = self._validated_output(context, output)
+        script = executable_output.to_executable_script(context)
         if not isinstance(script, str):
             raise ValueError("executable script output must return str content")
         script = _normalize_newlines(script)
@@ -751,23 +761,35 @@ class ExecutableScriptPlugin(FileAgentPlugin):
             raise ValueError("generated script must not be blank")
         return script if script.endswith("\n") else script + "\n"
 
-    async def execute_output(self, result: SyncAgentResult) -> None:
-        """Execute the generated script and retain its captured process result."""
+    async def process_output(
+        self,
+        context: AgentContext,
+        result: SyncAgentResult,
+    ) -> None:
+        """Run asynchronous validation and optionally execute the prepared script."""
         _ = result
-        request_key = self.context.llm_request_key
+        request_key = context.llm_request_key
         if request_key is None:
-            raise RuntimeError("generated script execution requires an active request key")
-        output = self.context.llm_response_output
+            raise RuntimeError("generated script processing requires an active request key")
+        output = context.llm_response_output
         if output is None:
-            raise RuntimeError("generated script execution requires validated output")
-        script = self._validated_script(self.context, output)
+            raise RuntimeError("generated script processing requires validated output")
+        executable_output = self._validated_output(context, output)
+        await executable_output.prepare_executable_script(context)
+        script = self._validated_script(context, output)
+        if self.execution_confirmation is not None and not await self.execution_confirmation(
+            context,
+            output,
+        ):
+            return
         command = (*self.command, *self.arguments)
         process = await asyncio.create_subprocess_exec(
             *command,
-            cwd=self.context.cwd,
+            cwd=context.cwd,
+            env=self.environment,
             stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE if self.capture_output else None,
+            stderr=asyncio.subprocess.PIPE if self.capture_output else None,
         )
         timed_out = False
         try:
@@ -780,6 +802,9 @@ class ExecutableScriptPlugin(FileAgentPlugin):
             process.kill()
             stdout_bytes, stderr_bytes = await process.communicate()
 
+        stdout_bytes = stdout_bytes or b""
+        stderr_bytes = stderr_bytes or b""
+
         returncode = process.returncode
         if returncode is None:
             raise RuntimeError("generated script process did not terminate")
@@ -790,7 +815,7 @@ class ExecutableScriptPlugin(FileAgentPlugin):
             stderr=stderr_bytes.decode("utf-8", errors="replace"),
             timed_out=timed_out,
         )
-        self.context.script_execution_results[request_key] = execution
+        context.script_execution_results[request_key] = execution
         if execution.timed_out:
             raise ValueError(
                 f"generated script timed out after {self.timeout_seconds:g} seconds"
