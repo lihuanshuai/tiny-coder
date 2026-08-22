@@ -211,8 +211,9 @@ record contract.
 or invoking a shell. The LLM returns the script in `GeneratedScriptOutput.script`; the agent first
 validates the structured output and its explicit `ExecutableScriptOutput` contract, then sends the
 content to the interpreter through standard input. It defaults to `[sys.executable, "-"]`; pass a
-complete `command` to use another runtime. Standard output and error are captured, and
-`timeout_seconds` bounds execution. Results are keyed by request name in
+complete `command` to use another runtime. Script execution deliberately has no timeout. Configure
+the LLM request timeout on the model configuration passed to `LlmConfigPlugin`. Standard output and
+error are captured, and results are keyed by request name in
 `context.script_execution_results` for later requests and lifecycle hooks.
 Set `capture_output=False` when the child process should inherit the current terminal and display
 its output immediately; the stored execution result then has empty `stdout` and `stderr` fields.
@@ -237,18 +238,15 @@ script_plugins = [
         "script-user.jinja",
         template_root=template_root,
     ),
-    ExecutableScriptPlugin(
-        arguments=["--dry-run"],
-        timeout_seconds=30,
-    ),
+    ExecutableScriptPlugin(arguments=["--dry-run"]),
 ]
 ```
 
 The default response schema requires non-blank `summary` and `script` fields and describes both for
 structured-output generation. Custom Pydantic response models may inherit `ExecutableScriptOutput`
-and implement `to_executable_script(context)`. A non-zero exit or timeout is reported through the
-existing structured-output retry path, including captured output, so generated code can be corrected
-on the next attempt. Generated scripts should therefore be idempotent because a failed execution or
+and implement `to_executable_script(context)`. A non-zero exit is reported through the existing
+structured-output retry path, including captured output, so generated code can be corrected on the
+next attempt. Generated scripts should therefore be idempotent because a failed execution or
 a later request-sequence retry can run them again. When a script must never be retried, configure
 `AgentRetryPolicyPlugin(1)` on both its request and the first request group that controls sequence
 retries. Treat this plugin as an explicit trusted-code boundary: generated code runs with the current

@@ -702,7 +702,6 @@ class ExecutableScriptPlugin(FileAgentPlugin):
 
     command: list[str] = field(default_factory=lambda: [sys.executable, "-"])
     arguments: list[str] = field(default_factory=list)
-    timeout_seconds: float = 60.0
     execution_confirmation: _ExecutionConfirmation | None = None
     environment: Mapping[str, str] | None = field(default=None, repr=False)
     capture_output: bool = True
@@ -710,8 +709,6 @@ class ExecutableScriptPlugin(FileAgentPlugin):
     def __post_init__(self) -> None:
         if not self.command or any(not part for part in self.command):
             raise ValueError("script command must contain non-blank arguments")
-        if self.timeout_seconds <= 0:
-            raise ValueError("script timeout_seconds must be greater than zero")
 
     def on_registered(self, context: AgentContext) -> None:
         """Register content validation followed by script execution."""
@@ -791,16 +788,7 @@ class ExecutableScriptPlugin(FileAgentPlugin):
             stdout=asyncio.subprocess.PIPE if self.capture_output else None,
             stderr=asyncio.subprocess.PIPE if self.capture_output else None,
         )
-        timed_out = False
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(script.encode("utf-8")),
-                timeout=self.timeout_seconds,
-            )
-        except TimeoutError:
-            timed_out = True
-            process.kill()
-            stdout_bytes, stderr_bytes = await process.communicate()
+        stdout_bytes, stderr_bytes = await process.communicate(script.encode("utf-8"))
 
         stdout_bytes = stdout_bytes or b""
         stderr_bytes = stderr_bytes or b""
@@ -813,14 +801,8 @@ class ExecutableScriptPlugin(FileAgentPlugin):
             returncode=returncode,
             stdout=stdout_bytes.decode("utf-8", errors="replace"),
             stderr=stderr_bytes.decode("utf-8", errors="replace"),
-            timed_out=timed_out,
         )
         context.script_execution_results[request_key] = execution
-        if execution.timed_out:
-            raise ValueError(
-                f"generated script timed out after {self.timeout_seconds:g} seconds"
-                + _script_output_details(execution)
-            )
         if execution.returncode != 0:
             raise ValueError(
                 f"generated script failed with exit code {execution.returncode}"

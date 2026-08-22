@@ -139,7 +139,6 @@ def test_executable_script_plugin_validates_then_executes_content(
     assert execution.returncode == 0
     assert execution.stdout.splitlines() == ["hello", "argument"]
     assert execution.stderr == ""
-    assert not execution.timed_out
 
 
 def test_executable_script_plugin_can_inherit_terminal_output(
@@ -297,31 +296,6 @@ def test_executable_script_failure_is_available_to_generation_retry(
     assert execution.stdout.strip() == "fixed"
 
 
-def test_executable_script_timeout_is_captured(
-    workspace_tmp_path: Path,
-) -> None:
-    async def llm_call(**kwargs: object) -> LlmCallOutcome:
-        _ = kwargs
-        return SampleLlmOutcome(
-            text=json.dumps({"summary": "generated", "script": "import time\ntime.sleep(5)"})
-        )
-
-    agent = _build_agent(
-        workspace_tmp_path,
-        llm_call,
-        script_plugin=ExecutableScriptPlugin(
-            timeout_seconds=0.1,
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="generated script timed out after 0.1 seconds"):
-        asyncio.run(agent.run())
-
-    execution = agent.context.script_execution_results["script"]
-    assert execution.timed_out
-    assert execution.returncode != 0
-
-
 def test_executable_script_plugin_requires_explicit_output_contract(
     workspace_tmp_path: Path,
 ) -> None:
@@ -361,9 +335,5 @@ def test_invalid_script_output_is_not_executed(
 
 
 def test_executable_script_plugin_rejects_unsafe_configuration() -> None:
-
     with pytest.raises(ValueError, match="command must contain non-blank"):
         ExecutableScriptPlugin(command=[])
-
-    with pytest.raises(ValueError, match="must be greater than zero"):
-        ExecutableScriptPlugin(timeout_seconds=0)

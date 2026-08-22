@@ -55,7 +55,6 @@ class ScriptExecutionResult:
     returncode: int
     stdout: str
     stderr: str
-    timed_out: bool = False
 
 
 __all__ = [
