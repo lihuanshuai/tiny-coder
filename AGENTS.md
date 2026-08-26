@@ -3,8 +3,9 @@
 ## Project Overview
 
 `tiny-coder` is a `src`-layout Python package for local LLM coding agents. The core module is
-`src/tiny_coder/file_agent.py`, which implements a plugin-driven `BasicFileAgent` around
-LangGraph, Pydantic response validation, safe workspace file access, and structured JSON output.
+`src/tiny_coder/file_agent.py`, which runs an ordered sequence of plugin-configured conversations
+with shared context, Pydantic response validation, safe workspace file access, and structured JSON
+output.
 
 ## Coding Rules
 

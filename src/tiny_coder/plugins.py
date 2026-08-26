@@ -6,7 +6,6 @@ import sys
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -29,37 +28,42 @@ from tiny_coder.json_utils import JsonStringFieldStreamer
 
 if TYPE_CHECKING:
     from tiny_coder.file_agent import (
-        AgentContext,
+        ConversationContext,
+        ConversationResult,
         LlmCall,
         LlmCallOutcome,
-        SyncAgentResult,
     )
 
 
-_SystemPromptProvider: TypeAlias = str | Callable[["AgentContext"], str]
-_TemplateVars: TypeAlias = Mapping[str, Any] | Callable[["AgentContext", str], Mapping[str, Any]]
-UserTemplateVars: TypeAlias = Mapping[str, Any] | Callable[["AgentContext"], Mapping[str, Any]]
-_BeforeRunCallback: TypeAlias = Callable[["AgentContext"], Awaitable[None]]
-_LlmOutputResultCallback: TypeAlias = Callable[["AgentContext", "SyncAgentResult"], Awaitable[None]]
-_AfterRunCallback: TypeAlias = Callable[["AgentContext", "SyncAgentResult"], Awaitable[None]]
-_BeforeIterationCallback: TypeAlias = Callable[["AgentContext", object], Awaitable[None]]
-_AfterIterationCallback: TypeAlias = Callable[
-    ["AgentContext", object, "SyncAgentResult"], Awaitable[None]
+_SystemPromptProvider: TypeAlias = str | Callable[["ConversationContext"], str]
+_UserPromptProvider: TypeAlias = str | Callable[["ConversationContext", Sequence[str]], str]
+_TemplateVars: TypeAlias = Mapping[str, Any] | Callable[["ConversationContext"], Mapping[str, Any]]
+UserTemplateVars: TypeAlias = (
+    Mapping[str, Any] | Callable[["ConversationContext"], Mapping[str, Any]]
+)
+_BeforeConversationCallback: TypeAlias = Callable[["ConversationContext"], Awaitable[None]]
+_AfterConversationCallback: TypeAlias = Callable[
+    ["ConversationContext", "ConversationResult"], Awaitable[None]
 ]
-_BeforeLlmRequestCallback: TypeAlias = Callable[["AgentContext", str], Awaitable[None]]
-_AfterLlmRequestCallback: TypeAlias = Callable[
-    ["AgentContext", str, "SyncAgentResult"], Awaitable[None]
-]
-_ExecutionConfirmation: TypeAlias = Callable[["AgentContext", BaseModel], Awaitable[bool]]
-_LlmRequestCondition: TypeAlias = Callable[["AgentContext", str], bool]
+_ExecutionConfirmation: TypeAlias = Callable[["ConversationContext", BaseModel], Awaitable[bool]]
+_ConversationCondition: TypeAlias = Callable[["ConversationContext"], bool]
 _JsonScalar: TypeAlias = str | int | float | bool | None
 _JsonValue: TypeAlias = _JsonScalar | list["_JsonValue"] | dict[str, "_JsonValue"]
-_LlmCallExtraHandler: TypeAlias = Callable[
-    ["AgentContext", "LlmCallOutcome"], Mapping[str, _JsonValue]
-]
 _LlmCallTokenStatsHandler: TypeAlias = Callable[
-    ["AgentContext", "LlmCallTokenStats"], Awaitable[None]
+    ["ConversationContext", "LlmCallTokenStats"], Awaitable[None]
 ]
+
+
+class LlmCallJsonlRecorderExtraHandler(ABC):
+    """Provide JSON-compatible metadata for one recorded LLM call."""
+
+    @abstractmethod
+    def __call__(
+        self,
+        context: ConversationContext,
+        outcome: LlmCallOutcome,
+        /,
+    ) -> Mapping[str, _JsonValue]: ...
 
 
 class _LlmCallStats(TypedDict):
@@ -68,7 +72,7 @@ class _LlmCallStats(TypedDict):
 
 
 class _LlmCallJsonlRecord(TypedDict):
-    request_key: str | None
+    conversation_key: str
     system: str
     user: str
     output: str
@@ -76,52 +80,63 @@ class _LlmCallJsonlRecord(TypedDict):
     extra: dict[str, _JsonValue]
 
 
-class FileAgentPlugin(ABC):
-    """Register one focused capability on an agent context."""
+class ConversationPlugin(ABC):
+    """Register one focused capability on a conversation context."""
 
     @abstractmethod
-    def on_registered(self, context: AgentContext) -> None: ...
+    def on_registered(self, context: ConversationContext) -> None: ...
 
 
 @dataclass
-class StaticInputPathsPlugin(FileAgentPlugin):
-    """Provide a fixed set of readable input paths for the core agent lifecycle."""
+class StaticInputPathsPlugin(ConversationPlugin):
+    """Provide a fixed set of readable input paths for one conversation."""
 
     paths: list[Path]
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Resolve configured paths once the core agent context is available."""
         context.input_paths = _resolve_agent_file_paths(context, self.paths)
 
 
 @dataclass
-class StaticOutputPathsPlugin(FileAgentPlugin):
-    """Provide a fixed set of writable output paths for the core agent lifecycle."""
+class StaticOutputPathsPlugin(ConversationPlugin):
+    """Provide a fixed set of writable output paths for one conversation."""
 
     paths: list[Path]
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Resolve configured paths once the core agent context is available."""
         context.output_paths = _resolve_agent_file_paths(context, self.paths)
 
 
 @dataclass(kw_only=True)
-class LlmCallJsonlRecorderPlugin(FileAgentPlugin):
+class LlmCallJsonlRecorderPlugin(ConversationPlugin):
     """Append every completed LLM call's raw input and output to one JSONL file."""
 
     path: Path
-    extra_handler: _LlmCallExtraHandler | None = None
+    extra_handler: LlmCallJsonlRecorderExtraHandler | None = None
     target_path: Path = field(init=False)
 
-    def on_registered(self, context: AgentContext) -> None:
+    def __post_init__(self) -> None:
+        if self.extra_handler is not None and not isinstance(
+            self.extra_handler,
+            LlmCallJsonlRecorderExtraHandler,
+        ):
+            raise TypeError("extra_handler must inherit LlmCallJsonlRecorderExtraHandler")
+
+    def on_registered(self, context: ConversationContext) -> None:
         """Resolve the log path and register the call recorder for this scope."""
         self.target_path = resolve_agent_file_path(context.cwd, self.path)
         context.after_llm_call_hooks.append(self._record_call)
 
-    async def _record_call(self, context: AgentContext, outcome: LlmCallOutcome) -> None:
+    async def _record_call(
+        self,
+        context: ConversationContext,
+        outcome: LlmCallOutcome,
+    ) -> None:
         extra = dict(self.extra_handler(context, outcome)) if self.extra_handler else {}
         record = _LlmCallJsonlRecord(
-            request_key=context.llm_request_key,
+            conversation_key=context.key,
             system=context.llm_call_system_prompt,
             user=context.llm_call_user_prompt,
             output=outcome.text,
@@ -172,18 +187,21 @@ def format_llm_call_token_stats(stats: LlmCallTokenStats) -> str:
 
 
 @dataclass
-class LlmCallTokenStatsPlugin(FileAgentPlugin):
-    """Print final token counts and speeds after a keyed LLM request succeeds."""
+class LlmCallTokenStatsPlugin(ConversationPlugin):
+    """Print final token counts and speeds after a conversation succeeds."""
 
     handler: _LlmCallTokenStatsHandler | None = None
 
-    def on_registered(self, context: AgentContext) -> None:
-        """Register a compact success-only footer for the active request."""
+    def on_registered(self, context: ConversationContext) -> None:
+        """Register a compact success-only footer for this conversation."""
 
-        async def print_call_stats(_result: SyncAgentResult) -> None:
+        async def print_call_stats(
+            _context: ConversationContext,
+            _result: ConversationResult,
+        ) -> None:
             outcome = context.llm_call_outcome
             if outcome is None:
-                raise RuntimeError("successful LLM request has no call outcome")
+                raise RuntimeError("successful conversation has no LLM call outcome")
             stats = LlmCallTokenStats(
                 prompt_eval_count=outcome.prompt_eval_count,
                 eval_count=outcome.eval_count,
@@ -195,199 +213,71 @@ class LlmCallTokenStatsPlugin(FileAgentPlugin):
             else:
                 await self.handler(context, stats)
 
-        context.after_run_hooks.append(print_call_stats)
+        context.conversation_completed_hooks.append(print_call_stats)
 
 
 @dataclass
-class BeforeRunPlugin(FileAgentPlugin):
-    """Register an asynchronous callback that prepares one agent run."""
+class BeforeConversationPlugin(ConversationPlugin):
+    """Prepare one conversation before prompting the model."""
 
-    handler: _BeforeRunCallback
+    handler: _BeforeConversationCallback
 
-    def on_registered(self, context: AgentContext) -> None:
-        """Append the callback to the shared run-preparation hooks."""
-        context.before_run_hooks.append(self.handler)
-
-
-@dataclass
-class LlmOutputResultPlugin(FileAgentPlugin):
-    """Inspect one parsed and written LLM output inside the retry loop."""
-
-    handler: _LlmOutputResultCallback
-
-    def on_registered(self, context: AgentContext) -> None:
-        """Bind the context and register the output-result hook."""
-
-        async def handle_output_result(result: SyncAgentResult) -> None:
-            await self.handler(context, result)
-
-        context.llm_output_result_hooks.append(handle_output_result)
+    def on_registered(self, context: ConversationContext) -> None:
+        context.before_conversation_hooks.append(self.handler)
 
 
 @dataclass
-class AfterRunPlugin(FileAgentPlugin):
-    """Run a callback after the retrying agent run succeeds."""
+class AfterConversationPlugin(ConversationPlugin):
+    """Inspect one parsed and handled conversation inside its retry loop."""
 
-    handler: _AfterRunCallback
+    handler: _AfterConversationCallback
 
-    def on_registered(self, context: AgentContext) -> None:
-        """Bind the context and register the post-run hook."""
-
-        async def after_run(result: SyncAgentResult) -> None:
-            await self.handler(context, result)
-
-        context.after_run_hooks.append(after_run)
+    def on_registered(self, context: ConversationContext) -> None:
+        context.after_conversation_hooks.append(self.handler)
 
 
 @dataclass
-class IterativeRunPlugin(FileAgentPlugin):
-    """Repeat the retrying agent run for context-owned iteration items."""
+class ConditionalConversationPlugin(ConversationPlugin):
+    """Run this conversation only when its runtime condition is true."""
 
-    items: list[object]
+    should_run: _ConversationCondition
 
-    def on_registered(self, context: AgentContext) -> None:
-        """Register one iteration source on the shared agent context."""
-        if context.iteration_items is not None:
-            raise RuntimeError("only one IterativeRunPlugin can be registered")
-        context.iteration_items = list(self.items)
-
-
-@dataclass
-class BeforeIterationPlugin(FileAgentPlugin):
-    """Run a callback before each context-owned iteration."""
-
-    handler: _BeforeIterationCallback
-
-    def on_registered(self, context: AgentContext) -> None:
-        """Register the callback on the shared iteration lifecycle."""
-        context.before_iteration_hooks.append(self.handler)
+    def on_registered(self, context: ConversationContext) -> None:
+        if context.should_run is not None:
+            raise RuntimeError("conversation condition is already configured")
+        context.should_run = self.should_run
 
 
-@dataclass
-class AfterIterationPlugin(FileAgentPlugin):
-    """Run a callback after each context-owned iteration succeeds."""
-
-    handler: _AfterIterationCallback
-
-    def on_registered(self, context: AgentContext) -> None:
-        """Register the callback on the shared iteration lifecycle."""
-        context.after_iteration_hooks.append(self.handler)
-
-
-@dataclass
-class LlmRequestGroupPlugin(FileAgentPlugin):
-    """Start one flat, keyed request configuration block in the agent plugin list."""
-
-    key: str
-
-    def __post_init__(self) -> None:
-        if not self.key.strip():
-            raise ValueError("LLM request key must not be blank")
-
-    def on_registered(self, context: AgentContext) -> None:
-        """Create and register this keyed request context on the agent context."""
-        # Local import avoids the file_agent/plugins module cycle during import.
-        from tiny_coder.file_agent import AgentContext
-
-        if self.key in context.llm_request_contexts:
-            raise ValueError(f"duplicate LLM request key: {self.key}")
-
-        request_context = AgentContext(cwd=context.cwd, llm_config=context.llm_config)
-        request_context.llm_request_key = self.key
-        request_context.llm_call_outcomes = context.llm_call_outcomes
-        request_context.llm_response_outputs = context.llm_response_outputs
-        request_context.llm_request_results = context.llm_request_results
-        request_context.script_execution_results = context.script_execution_results
-        request_context.extras = context.extras
-        request_context.after_llm_call_hooks = list(context.after_llm_call_hooks)
-        context.llm_request_contexts[self.key] = request_context
-
-
-@dataclass
-class ConditionalLlmRequestPlugin(FileAgentPlugin):
-    """Run the active keyed request only when its runtime condition is true."""
-
-    should_run: _LlmRequestCondition
-
-    def on_registered(self, context: AgentContext) -> None:
-        """Register one condition on the active request context."""
-        if context.llm_request_key is None:
-            raise RuntimeError(
-                "ConditionalLlmRequestPlugin requires a preceding LlmRequestGroupPlugin"
-            )
-        if context.llm_request_condition is not None:
-            raise RuntimeError("LLM request condition is already configured")
-        context.llm_request_condition = self.should_run
-
-
-@dataclass
-class BeforeLlmRequestPlugin(FileAgentPlugin):
-    """Prepare the active keyed LLM request before each call."""
-
-    handler: _BeforeLlmRequestCallback
-
-    def on_registered(self, context: AgentContext) -> None:
-        """Register the callback on the active request context."""
-        if context.llm_request_key is None:
-            raise RuntimeError("BeforeLlmRequestPlugin requires a preceding LlmRequestGroupPlugin")
-        context.before_llm_request_hooks.append(self.handler)
-
-
-@dataclass
-class AfterLlmRequestPlugin(FileAgentPlugin):
-    """Inspect the active keyed LLM request after it succeeds."""
-
-    handler: _AfterLlmRequestCallback
-
-    def on_registered(self, context: AgentContext) -> None:
-        """Register the callback on the active request context."""
-        if context.llm_request_key is None:
-            raise RuntimeError("AfterLlmRequestPlugin requires a preceding LlmRequestGroupPlugin")
-        context.after_llm_request_hooks.append(self.handler)
-
-
-def validate_llm_request_registration(context: AgentContext) -> None:
-    """Validate one completed keyed request configuration."""
-    if (
-        context.iteration_items is not None
-        or context.before_iteration_hooks
-        or context.after_iteration_hooks
-        or context.llm_request_contexts
-    ):
-        raise ValueError("LLM request plugins must not configure nested request or iteration runs")
-    if len(context.before_llm_request_hooks) != len(context.after_llm_request_hooks):
-        raise ValueError("BeforeLlmRequestPlugin and AfterLlmRequestPlugin must be paired")
-    if context.llm_config is None:
-        raise ValueError("LLM request requires LlmConfigPlugin")
-
-
-class DynamicOutputPathsPlugin(FileAgentPlugin):
+class DynamicOutputPathsPlugin(ConversationPlugin):
     """Use the currently registered input paths as writable output paths."""
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Copy input paths once the core agent context is available."""
         context.output_paths = list(context.input_paths)
 
 
-def _resolve_agent_file_paths(context: AgentContext, paths: list[Path]) -> list[Path]:
+def _resolve_agent_file_paths(
+    context: ConversationContext,
+    paths: list[Path],
+) -> list[Path]:
     return [resolve_agent_file_path(context.cwd, path) for path in paths]
 
 
-class ExistingPathGuardPlugin(FileAgentPlugin):
+class ExistingPathGuardPlugin(ConversationPlugin):
     """Abort a run before any configured output path is overwritten."""
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Disable replacing existing output files for this agent."""
         context.allow_overwrite_existing_paths = False
 
 
 @dataclass
-class FileCleanupPlugin(FileAgentPlugin):
+class FileCleanupPlugin(ConversationPlugin):
     """Register workspace files that the core runtime removes before each run."""
 
     paths: list[Path]
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Resolve and append cleanup paths to the shared runtime context."""
         context.clean_up_paths.extend(_resolve_agent_file_paths(context, self.paths))
 
@@ -400,84 +290,92 @@ def _relative_label(root: Path, path: Path) -> str:
 
 
 @dataclass
-class StaticSystemPromptPlugin(FileAgentPlugin):
+class StaticSystemPromptPlugin(ConversationPlugin):
     """Replace the system prompt with static text or context-derived text."""
 
     prompt: _SystemPromptProvider
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Register this plugin as a system prompt hook."""
         context.system_prompt_hooks.append(self.build_system_prompt)
 
     def build_system_prompt(
         self,
-        context: AgentContext,
-        task_prompt: str,
-        current: str,
+        context: ConversationContext,
     ) -> str:
         """Return the configured system prompt for this run."""
-        _ = task_prompt, current
         prompt = self.prompt(context) if callable(self.prompt) else self.prompt
         return prompt.rstrip() + "\n"
 
 
 @dataclass
-class TemplateSystemPromptPlugin(FileAgentPlugin):
+class StaticUserPromptPlugin(ConversationPlugin):
+    """Build a user prompt from static text or the current conversation context."""
+
+    prompt: _UserPromptProvider
+
+    def on_registered(self, context: ConversationContext) -> None:
+        context.user_prompt_hooks.append(self.build_user_prompt)
+
+    def build_user_prompt(
+        self,
+        context: ConversationContext,
+        retry_errors: Sequence[str],
+    ) -> str:
+        prompt = self.prompt(context, retry_errors) if callable(self.prompt) else self.prompt
+        return prompt.rstrip() + "\n"
+
+
+@dataclass
+class TemplateSystemPromptPlugin(ConversationPlugin):
     """Render a template-backed system prompt using the registered agent context."""
 
     template_name: str
     template_root: Path = field(kw_only=True)
     template_vars: _TemplateVars | None = field(default=None, kw_only=True)
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Register this template as a system prompt hook."""
         context.system_prompt_hooks.append(self.build_system_prompt)
 
     def build_system_prompt(
         self,
-        context: AgentContext,
-        task_prompt: str,
-        current: str,
+        context: ConversationContext,
     ) -> str:
         """Replace the current system prompt with the rendered template contract."""
-        _ = current
-        variables = self._template_vars(context, task_prompt)
+        variables = self._template_vars(context)
         return (
             _jinja_env(self.template_root).get_template(self.template_name).render(**variables)
         ).rstrip() + "\n"
 
-    def _template_vars(self, context: AgentContext, task_prompt: str) -> Mapping[str, Any]:
+    def _template_vars(self, context: ConversationContext) -> Mapping[str, Any]:
         if self.template_vars is None:
             return {}
         if callable(self.template_vars):
-            return self.template_vars(context, task_prompt)
+            return self.template_vars(context)
         return self.template_vars
 
 
 @dataclass
-class TemplateUserPromptPlugin(FileAgentPlugin):
+class TemplateUserPromptPlugin(ConversationPlugin):
     """Render a template-backed user prompt using the registered agent context."""
 
     template_name: str
     template_root: Path = field(kw_only=True)
     template_vars: UserTemplateVars | None = field(default=None, kw_only=True)
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Register this template as a user prompt hook."""
         context.user_prompt_hooks.append(self.build_user_prompt)
 
     def build_user_prompt(
         self,
-        context: AgentContext,
-        task_prompt: str,
-        current: str,
-        *,
-        retry_errors: Sequence[str] | None = None,
+        context: ConversationContext,
+        retry_errors: Sequence[str],
     ) -> str:
         """Replace the current user prompt with the rendered template."""
         from tiny_coder.file_agent import agent_input_snapshots
 
-        _ = task_prompt, current
         custom_vars = (
             self.template_vars(context)
             if callable(self.template_vars)
@@ -486,7 +384,7 @@ class TemplateUserPromptPlugin(FileAgentPlugin):
         variables = {
             **custom_vars,
             "input_files": agent_input_snapshots(context.cwd, context.input_paths),
-            "retry_errors": list(retry_errors or []),
+            "retry_errors": list(retry_errors),
         }
         rendered = (
             _jinja_env(self.template_root).get_template(self.template_name).render(**variables)
@@ -504,14 +402,14 @@ def _jinja_env(template_root: Path) -> Environment:
 
 
 @dataclass
-class FileTreeInputPathsPlugin(FileAgentPlugin):
+class FileTreeInputPathsPlugin(ConversationPlugin):
     """Provide readable input paths from a directory tree."""
 
     root: Path
     first_paths: list[Path] = field(default_factory=list, kw_only=True)
     patterns: list[str] = field(default_factory=lambda: ["**/*"], kw_only=True)
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Resolve configured tree paths once the core agent context is available."""
         root = resolve_agent_file_path(context.cwd, self.root)
         paths = [
@@ -535,7 +433,7 @@ def require_output_model_type(output_type: Any) -> type[BaseModel]:
 
 
 @dataclass
-class ResponseOutputTypePlugin(FileAgentPlugin):
+class ResponseOutputTypePlugin(ConversationPlugin):
     """Provide the Pydantic response model used for JSON Schema and parsing."""
 
     output_type: type[BaseModel]
@@ -543,25 +441,25 @@ class ResponseOutputTypePlugin(FileAgentPlugin):
     def __post_init__(self) -> None:
         self.output_type = require_output_model_type(self.output_type)
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Register the response model on the shared agent context."""
         context.llm_response_output_type = self.output_type
 
 
 @dataclass
-class LlmConfigPlugin(FileAgentPlugin):
-    """Provide the model configuration for the active LLM request group."""
+class LlmConfigPlugin(ConversationPlugin):
+    """Provide the model configuration for one conversation."""
 
     llm_config: BaseModel
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         context.llm_config = self.llm_config
 
 
-class SilentLlmCallPlugin(FileAgentPlugin):
+class SilentLlmCallPlugin(ConversationPlugin):
     """Suppress streamed chunks while preserving the configured LLM call."""
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         base_llm_call = context.llm_call
 
         async def silent_llm_call(
@@ -585,8 +483,8 @@ class SilentLlmCallPlugin(FileAgentPlugin):
 
 
 @dataclass
-class AgentRetryPolicyPlugin(FileAgentPlugin):
-    """Configure the shared attempt limit for model calls and output handling."""
+class ConversationRetryPlugin(ConversationPlugin):
+    """Configure the attempt limit for one conversation."""
 
     max_attempts: int = 3
 
@@ -594,18 +492,18 @@ class AgentRetryPolicyPlugin(FileAgentPlugin):
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         context.max_attempts = self.max_attempts
 
 
 @dataclass(kw_only=True)
-class JsonFieldStreamLlmCallPlugin(FileAgentPlugin):
+class JsonFieldStreamLlmCallPlugin(ConversationPlugin):
     """Call the configured LLM while printing one JSON string field."""
 
     field_name: str
     raw_abort_threshold: int
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Wrap the shared LLM call to stream only the configured JSON field."""
         base_llm_call = context.llm_call
 
@@ -664,10 +562,10 @@ class JsonFieldStreamLlmCallPlugin(FileAgentPlugin):
         return outcome
 
 
-class ApplyPatchWriterPlugin(FileAgentPlugin):
+class ApplyPatchWriterPlugin(ConversationPlugin):
     """Apply an output model's generic patches to workspace text files."""
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Register this writer after validating the configured response model."""
         output_type = context.llm_response_output_type
         if output_type is None:
@@ -678,7 +576,11 @@ class ApplyPatchWriterPlugin(FileAgentPlugin):
             raise TypeError("response output type must inherit ApplyPatchOutput")
         context.output_writer = self.write_output
 
-    def write_output(self, context: AgentContext, output: BaseModel) -> list[Path]:
+    def write_output(
+        self,
+        context: ConversationContext,
+        output: BaseModel,
+    ) -> list[Path]:
         """Convert the validated output to patches and apply them."""
         output_type = context.llm_response_output_type
         if output_type is None:
@@ -697,7 +599,7 @@ class ApplyPatchWriterPlugin(FileAgentPlugin):
 
 
 @dataclass(kw_only=True)
-class ExecutableScriptPlugin(FileAgentPlugin):
+class ExecutableScriptPlugin(ConversationPlugin):
     """Normalize, validate, confirm, and execute structured script content."""
 
     command: list[str] = field(default_factory=lambda: [sys.executable, "-"])
@@ -710,10 +612,8 @@ class ExecutableScriptPlugin(FileAgentPlugin):
         if not self.command or any(not part for part in self.command):
             raise ValueError("script command must contain non-blank arguments")
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         """Register content validation followed by script execution."""
-        if context.llm_request_key is None:
-            raise RuntimeError("ExecutableScriptPlugin requires a preceding LlmRequestGroupPlugin")
         output_type = context.llm_response_output_type
         if output_type is None:
             raise RuntimeError(
@@ -725,16 +625,20 @@ class ExecutableScriptPlugin(FileAgentPlugin):
             raise RuntimeError("ExecutableScriptPlugin requires an unconfigured output writer")
 
         context.output_writer = self.validate_output
-        context.llm_output_result_hooks.append(partial(self.process_output, context))
+        context.after_conversation_hooks.append(self.process_output)
 
-    def validate_output(self, context: AgentContext, output: BaseModel) -> list[Path]:
+    def validate_output(
+        self,
+        context: ConversationContext,
+        output: BaseModel,
+    ) -> list[Path]:
         """Validate the structured script output without writing a workspace file."""
         self._validated_script(context, output)
         return []
 
     def _validated_output(
         self,
-        context: AgentContext,
+        context: ConversationContext,
         output: BaseModel,
     ) -> ExecutableScriptOutput:
         output_type = context.llm_response_output_type
@@ -748,7 +652,7 @@ class ExecutableScriptPlugin(FileAgentPlugin):
             )
         return output
 
-    def _validated_script(self, context: AgentContext, output: BaseModel) -> str:
+    def _validated_script(self, context: ConversationContext, output: BaseModel) -> str:
         executable_output = self._validated_output(context, output)
         script = executable_output.to_executable_script(context)
         if not isinstance(script, str):
@@ -760,14 +664,11 @@ class ExecutableScriptPlugin(FileAgentPlugin):
 
     async def process_output(
         self,
-        context: AgentContext,
-        result: SyncAgentResult,
+        context: ConversationContext,
+        result: ConversationResult,
     ) -> None:
         """Run asynchronous validation and optionally execute the prepared script."""
         _ = result
-        request_key = context.llm_request_key
-        if request_key is None:
-            raise RuntimeError("generated script processing requires an active request key")
         output = context.llm_response_output
         if output is None:
             raise RuntimeError("generated script processing requires validated output")
@@ -802,7 +703,8 @@ class ExecutableScriptPlugin(FileAgentPlugin):
             stdout=stdout_bytes.decode("utf-8", errors="replace"),
             stderr=stderr_bytes.decode("utf-8", errors="replace"),
         )
-        context.script_execution_results[request_key] = execution
+        context.script_execution_result = execution
+        result.script_execution = execution
         if execution.returncode != 0:
             raise ValueError(
                 f"generated script failed with exit code {execution.returncode}"
@@ -823,53 +725,51 @@ def _script_output_details(result: ScriptExecutionResult) -> str:
     return "" if not details else "\n" + "\n".join(details)
 
 
-class NoopOutputWriterPlugin(FileAgentPlugin):
+class NoopOutputWriterPlugin(ConversationPlugin):
     """Accept a validated response without writing workspace files."""
 
-    def on_registered(self, context: AgentContext) -> None:
+    def on_registered(self, context: ConversationContext) -> None:
         context.output_writer = self.write_output
 
-    def write_output(self, context: AgentContext, output: BaseModel) -> list[Path]:
+    def write_output(
+        self,
+        context: ConversationContext,
+        output: BaseModel,
+    ) -> list[Path]:
         _ = context, output
         return []
 
 
 __all__ = [
-    "AgentRetryPolicyPlugin",
-    "AfterIterationPlugin",
-    "AfterLlmRequestPlugin",
-    "AfterRunPlugin",
+    "AfterConversationPlugin",
     "ApplyPatchWriterPlugin",
-    "BeforeIterationPlugin",
-    "BeforeLlmRequestPlugin",
-    "BeforeRunPlugin",
-    "ConditionalLlmRequestPlugin",
+    "BeforeConversationPlugin",
+    "ConditionalConversationPlugin",
+    "ConversationPlugin",
+    "ConversationRetryPlugin",
     "DynamicOutputPathsPlugin",
     "ExistingPathGuardPlugin",
     "ExecutableScriptPlugin",
-    "FileAgentPlugin",
     "FileCleanupPlugin",
     "FileTreeInputPathsPlugin",
-    "IterativeRunPlugin",
     "JsonFieldStreamLlmCallPlugin",
     "LlmConfigPlugin",
+    "LlmCallJsonlRecorderExtraHandler",
     "LlmCallJsonlRecorderPlugin",
     "LlmCallTokenStats",
     "LlmCallTokenStatsPlugin",
-    "LlmOutputResultPlugin",
-    "LlmRequestGroupPlugin",
-    "ResponseOutputTypePlugin",
-    "require_output_model_type",
-    "resolve_agent_file_path",
-    "resolve_agent_root",
     "NoopOutputWriterPlugin",
+    "ResponseOutputTypePlugin",
     "SilentLlmCallPlugin",
     "StaticInputPathsPlugin",
     "StaticOutputPathsPlugin",
     "StaticSystemPromptPlugin",
+    "StaticUserPromptPlugin",
     "TemplateSystemPromptPlugin",
     "TemplateUserPromptPlugin",
     "UserTemplateVars",
-    "validate_llm_request_registration",
     "format_llm_call_token_stats",
+    "require_output_model_type",
+    "resolve_agent_file_path",
+    "resolve_agent_root",
 ]

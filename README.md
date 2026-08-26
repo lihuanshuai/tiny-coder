@@ -1,22 +1,27 @@
 # tiny-coder
 
-`tiny-coder` is a small Python runtime for local LLM coding workflows. It provides a
-file-oriented agent core that reads workspace files, asks an LLM for structured JSON, validates
-the response with Pydantic, and lets plugins write the resulting files.
+`tiny-coder` is a small runtime for file-oriented LLM conversations. An agent run is an ordered
+list of `Conversation` objects. Each conversation owns its plugins, runs once, and publishes one
+validated `ConversationResult` for later conversations to consume.
 
-## Installation
-
-```powershell
-uv sync
-uv run pre-commit install
+```text
+Conversation("draft") -> ConversationResult
+                             |
+                             v
+Conversation("review") -> ConversationResult
+                             |
+                             v
+                      AgentResult
 ```
 
-The package requires Python 3.10 or newer.
+There is one composition mechanism:
 
-## Basic Usage
+- `BasicFileAgent` runs conversations in declaration order.
+- `Conversation` is one complete model interaction and output-handling contract.
+- `ConversationPlugin` configures only the conversation that contains it.
+- `AgentContext.conversation_results` integrates completed conversation context.
 
-`BasicFileAgent` uses the bundled OpenAI-compatible streaming client. Plugins configure prompts,
-paths, output handling, and optional stream display behavior.
+## One Conversation
 
 ```python
 from pathlib import Path
@@ -24,245 +29,155 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from tiny_coder.apply_patch import ApplyPatch, ApplyPatchOutput
-from tiny_coder.file_agent import AgentContext, BasicFileAgent
+from tiny_coder.file_agent import BasicFileAgent, Conversation, ConversationContext
 from tiny_coder.plugins import (
-    AgentRetryPolicyPlugin,
     ApplyPatchWriterPlugin,
+    ConversationRetryPlugin,
     LlmConfigPlugin,
-    LlmRequestGroupPlugin,
     ResponseOutputTypePlugin,
     StaticInputPathsPlugin,
     StaticOutputPathsPlugin,
+    StaticSystemPromptPlugin,
+    StaticUserPromptPlugin,
 )
 from tiny_coder.text_replacement import TextReplacement
 
 
+class LocalLlmConfig(BaseModel):
+    base_url: str = "http://localhost:11434/v1"
+    llm_model: str = "local-model"
+
+
 class FileOutput(BaseModel, ApplyPatchOutput):
     summary: str
-    files: dict[str, str]
+    path: str
+    content: str
 
-    def to_apply_patches(self, context: AgentContext) -> list[ApplyPatch]:
+    def to_apply_patches(self, context: ConversationContext) -> list[ApplyPatch]:
         _ = context
         return [
             ApplyPatch(
-                path=Path(label),
-                replacements=[TextReplacement(to_text=content)],
+                path=Path(self.path),
+                replacements=[TextReplacement(to_text=self.content)],
             )
-            for label, content in self.files.items()
         ]
-
-
-class ExampleLlmConfig(BaseModel):
-    base_url: str = "http://localhost:11434/v1"
-    llm_model: str = "local-model"
-    num_ctx: int = 8192
-    temperature: float = 0.2
-    repeat_penalty: float = 1.1
-    think: bool = False
-    timeout: float = 600.0
 
 
 agent = BasicFileAgent(
     cwd=Path.cwd(),
-    plugins=[
-        LlmConfigPlugin(ExampleLlmConfig()),
-        LlmRequestGroupPlugin(key="sync"),
-        StaticInputPathsPlugin([Path("input.md")]),
-        StaticOutputPathsPlugin([Path("output.md")]),
-        ResponseOutputTypePlugin(FileOutput),
-        AgentRetryPolicyPlugin(3),
-        ApplyPatchWriterPlugin(),
+    conversations=[
+        Conversation(
+            key="sync",
+            plugins=[
+                LlmConfigPlugin(LocalLlmConfig()),
+                ConversationRetryPlugin(3),
+                StaticInputPathsPlugin([Path("input.md")]),
+                StaticOutputPathsPlugin([Path("output.md")]),
+                StaticSystemPromptPlugin("Synchronize the output file."),
+                StaticUserPromptPlugin("Read the input and return the complete output."),
+                ResponseOutputTypePlugin(FileOutput),
+                ApplyPatchWriterPlugin(),
+            ],
+        )
     ],
 )
+
+result = await agent.run()
+print(result.conversations["sync"].summary)
 ```
 
-`ApplyPatch` is the shared file-mutation contract. A writable response model must inherit
-`ApplyPatchOutput` and implement `to_apply_patches(context)`. Every patch contains one ordered
-`replacements` list: `TextReplacement(to_text=...)` replaces the whole file, while a non-`None`
-`from_text` replaces one matching text span.
-`ApplyPatchWriterPlugin` resolves paths, checks configured output permissions, validates every
-patch in memory, and writes only changed files.
+Every conversation explicitly declares its model, prompts, response model, and output handler.
+Construction fails early when one of those required parts is missing.
 
-Prefer importing from `tiny_coder.file_agent`, `tiny_coder.json_utils`, or
-`tiny_coder.yaml_utils` instead of relying on package-level re-exports.
+## Multiple Conversations
 
-## Iterative Runs
-
-`IterativeRunPlugin` stores the iteration list on `AgentContext`. Register preparation and
-completion callbacks separately so each plugin has one lifecycle responsibility.
+Later conversations read earlier validated outputs through `context.previous`. Failed or skipped
+conversations never appear there.
 
 ```python
-from tiny_coder.file_agent import AgentContext, SyncAgentResult
-from tiny_coder.plugins import (
-    AfterIterationPlugin,
-    BeforeIterationPlugin,
-    IterativeRunPlugin,
-)
+from collections.abc import Sequence
+from typing import cast
+
+from tiny_coder.file_agent import ConversationContext
+from tiny_coder.plugins import NoopOutputWriterPlugin
 
 
-async def prepare_iteration(context: AgentContext, item: object) -> None:
-    context.extras["current_item"] = item
+class PlanOutput(BaseModel):
+    summary: str
+    plan: list[str]
 
 
-async def finish_iteration(
-    context: AgentContext,
-    item: object,
-    result: SyncAgentResult,
-) -> None:
-    print(context.iteration_index, item, result.written_paths)
+class ReviewOutput(BaseModel):
+    summary: str
+    approved: bool
 
 
-iteration_plugins = [
-    IterativeRunPlugin(items=["first", "second"]),
-    BeforeIterationPlugin(prepare_iteration),
-    AfterIterationPlugin(finish_iteration),
+def review_prompt(context: ConversationContext, retry_errors: Sequence[str]) -> str:
+    plan = cast(PlanOutput, context.previous["plan"].output)
+    retry_note = "\n".join(retry_errors)
+    return f"Review this plan: {plan.plan}\nPrevious errors: {retry_note}"
+
+
+conversations = [
+    Conversation(
+        key="plan",
+        plugins=[
+            LlmConfigPlugin(LocalLlmConfig()),
+            StaticSystemPromptPlugin("Create a concise implementation plan."),
+            StaticUserPromptPlugin("Plan the requested change."),
+            ResponseOutputTypePlugin(PlanOutput),
+            NoopOutputWriterPlugin(),
+        ],
+    ),
+    Conversation(
+        key="review",
+        plugins=[
+            LlmConfigPlugin(LocalLlmConfig()),
+            StaticSystemPromptPlugin("Review the proposed plan."),
+            StaticUserPromptPlugin(review_prompt),
+            ResponseOutputTypePlugin(ReviewOutput),
+            NoopOutputWriterPlugin(),
+        ],
+    ),
 ]
 ```
 
-## Serial LLM Requests
+Use `ConditionalConversationPlugin` for a bounded optional turn. Its predicate receives the same
+`ConversationContext` and can inspect `context.previous` and `context.extras`.
 
-`LlmRequestGroupPlugin` starts a keyed request block in the flat agent plugin list. Following
-plugins configure that request's templates, response model, paths, writer, retry policy, and
-LLM-call behavior until the next `LlmRequestGroupPlugin`. Request blocks run in declaration order
-inside each iteration. Every `BasicFileAgent` must declare at least one request block; construction
-fails when `LlmRequestGroupPlugin` is omitted. Put agent-level lifecycle plugins before the first
-request block. Configure the default model with `LlmConfigPlugin` before the first request block,
-or register it inside a request block when that request needs an override.
+For repeated work, build repeated conversations directly. A chapter-writing flow, for example, can
+create `chapter-001`, `chapter-002`, and `chapter-003` conversations. This keeps repetition, retry,
+and cross-turn context on the same visible mechanism.
 
-Later requests can consume earlier parsed outputs from `context.llm_response_outputs`; call
-outcomes and final request results are available from `context.llm_call_outcomes` and
-`context.llm_request_results`. These keyed mappings are reset at the start of each iteration, so
-iteration hooks see only the current iteration's requests.
+## Conversation Plugins
 
-```python
-from tiny_coder.plugins import (
-    ApplyPatchWriterPlugin,
-    ConditionalLlmRequestPlugin,
-    LlmCallJsonlRecorderPlugin,
-    LlmConfigPlugin,
-    LlmRequestGroupPlugin,
-    ResponseOutputTypePlugin,
-    TemplateSystemPromptPlugin,
-    TemplateUserPromptPlugin,
-)
+Common plugins include:
 
+- model and retry: `LlmConfigPlugin`, `ConversationRetryPlugin`;
+- prompts: `StaticSystemPromptPlugin`, `StaticUserPromptPlugin`, and Jinja template variants;
+- files: static/tree input paths, static/dynamic output paths, cleanup, and overwrite protection;
+- output: `ApplyPatchWriterPlugin`, `NoopOutputWriterPlugin`, and `ExecutableScriptPlugin`;
+- lifecycle: `BeforeConversationPlugin` and `AfterConversationPlugin`;
+- presentation and audit: token statistics, JSONL call recording, silent calls, and JSON-field
+  streaming.
 
-template_root = Path(__file__).parent / "templates"
+`BeforeConversationPlugin` runs once before the conversation's retry loop.
+`AfterConversationPlugin` runs after parsed output handling and participates in retries when it
+raises `ValueError` or `OSError`. A retry replays only the current conversation.
 
+## Generated Scripts
 
-request_plugins = [
-    LlmConfigPlugin(ExampleLlmConfig()),
-    LlmCallJsonlRecorderPlugin(
-        path=Path("logs/llm-calls.jsonl"),
-        extra_handler=lambda context, _outcome: {
-            "iteration_index": context.iteration_index,
-        },
-    ),
-    LlmRequestGroupPlugin(key="plan"),
-    ResponseOutputTypePlugin(FileOutput),
-    TemplateSystemPromptPlugin(
-        "plan-system.jinja",
-        template_root=template_root,
-    ),
-    TemplateUserPromptPlugin(
-        "plan-user.jinja",
-        template_root=template_root,
-    ),
-    ApplyPatchWriterPlugin(),
-    LlmRequestGroupPlugin(key="review"),
-    ConditionalLlmRequestPlugin(
-        should_run=lambda context, _key: "plan" in context.llm_response_outputs,
-    ),
-    ResponseOutputTypePlugin(FileOutput),
-    TemplateSystemPromptPlugin(
-        "review-system.jinja",
-        template_root=template_root,
-    ),
-    TemplateUserPromptPlugin(
-        "review-user.jinja",
-        template_root=template_root,
-        template_vars=lambda context: {
-            "plan": context.llm_response_outputs["plan"],
-        },
-    ),
-    ApplyPatchWriterPlugin(),
-]
-```
+`ExecutableScriptPlugin` validates structured script content, optionally asks for confirmation, and
+passes the script to an interpreter through standard input without creating a script file. The
+execution result is available as `result.conversations[key].script_execution`.
 
-`BeforeLlmRequestPlugin` and `AfterLlmRequestPlugin` are optional. When used in a request block,
-they must be paired and receive that request's context for dynamic per-iteration preparation and
-result handling.
-
-`ConditionalLlmRequestPlugin` evaluates its synchronous predicate immediately before its request
-block would run. A false result skips the model call, cleanup, hooks, writer, and keyed result while
-later request blocks continue normally. The predicate can inspect prior keyed results and shared
-`context.extras`, so a fixed request sequence can express bounded conditional stages without
-constructing another agent.
-
-`LlmCallJsonlRecorderPlugin` records raw `request_key`, `system`, `user`, `output`, and token
-`stats` for every completed LLM call. Register it before the first request group to cover every
-keyed request in the agent, including calls whose structured output later fails validation and is
-retried. `extra_handler` may add JSON-serializable caller metadata without changing the fixed call
-record contract.
-
-## Generated Script Execution
-
-`ExecutableScriptPlugin` executes validated script content without writing it to a workspace file
-or invoking a shell. The LLM returns the script in `GeneratedScriptOutput.script`; the agent first
-validates the structured output and its explicit `ExecutableScriptOutput` contract, then sends the
-content to the interpreter through standard input. It defaults to `[sys.executable, "-"]`; pass a
-complete `command` to use another runtime. Script execution deliberately has no timeout. Configure
-the LLM request timeout on the model configuration passed to `LlmConfigPlugin`. Standard output and
-error are captured, and results are keyed by request name in
-`context.script_execution_results` for later requests and lifecycle hooks.
-Set `capture_output=False` when the child process should inherit the current terminal and display
-its output immediately; the stored execution result then has empty `stdout` and `stderr` fields.
-
-```python
-from tiny_coder.executable_script import GeneratedScriptOutput
-from tiny_coder.plugins import (
-    ExecutableScriptPlugin,
-    ResponseOutputTypePlugin,
-)
-
-
-script_plugins = [
-    LlmConfigPlugin(ExampleLlmConfig()),
-    LlmRequestGroupPlugin(key="script"),
-    ResponseOutputTypePlugin(GeneratedScriptOutput),
-    TemplateSystemPromptPlugin(
-        "script-system.jinja",
-        template_root=template_root,
-    ),
-    TemplateUserPromptPlugin(
-        "script-user.jinja",
-        template_root=template_root,
-    ),
-    ExecutableScriptPlugin(arguments=["--dry-run"]),
-]
-```
-
-The default response schema requires non-blank `summary` and `script` fields and describes both for
-structured-output generation. Custom Pydantic response models may inherit `ExecutableScriptOutput`
-and implement `to_executable_script(context)`. A non-zero exit is reported through the existing
-structured-output retry path, including captured output, so generated code can be corrected on the
-next attempt. Generated scripts should therefore be idempotent because a failed execution or
-a later request-sequence retry can run them again. When a script must never be retried, configure
-`AgentRetryPolicyPlugin(1)` on both its request and the first request group that controls sequence
-retries. Treat this plugin as an explicit trusted-code boundary: generated code runs with the current
-process user's permissions and inherited environment.
-
-Custom response models can override `prepare_executable_script(context)` to normalize and validate
-their script asynchronously. The plugin reads and validates the script again after preparation,
-then always owns execution. Set `execution_confirmation` to an asynchronous callback when execution
-must first be approved; the callback controls how confirmation is presented and returns whether the
-prepared output may run. Without a callback, execution starts immediately.
+Generated code runs with the current process user's permissions and inherited environment. Treat
+this plugin as an explicit trusted-code boundary and make retryable scripts idempotent.
 
 ## Development
 
-Useful local checks:
-
 ```powershell
+uv sync
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
@@ -270,5 +185,5 @@ uv run mypy src/tiny_coder tests
 uv run pre-commit run --all-files
 ```
 
-When adding file I/O, use `pathlib.Path` and explicitly pass `encoding="utf-8"` and
-`newline="\n"` for text reads and writes.
+Use `pathlib.Path` for filesystem APIs. Text reads and writes must explicitly use
+`encoding="utf-8"` and `newline="\n"`.

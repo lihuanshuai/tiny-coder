@@ -35,3 +35,4 @@ repos:
     language: system
     files: ^(src|tests)/.*\.py$
     always_run: true
+    pass_filenames: false

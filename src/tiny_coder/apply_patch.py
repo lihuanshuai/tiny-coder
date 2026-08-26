@@ -12,7 +12,7 @@ from tiny_coder.text_replacement import (
 )
 
 if TYPE_CHECKING:
-    from tiny_coder.file_agent import AgentContext
+    from tiny_coder.file_agent import ConversationContext
 
 
 @dataclass
@@ -64,7 +64,7 @@ class ApplyPatchOutput(ABC):
     """Structured output that converts itself to generic workspace patches."""
 
     @abstractmethod
-    def to_apply_patches(self, context: AgentContext) -> list[ApplyPatch]: ...
+    def to_apply_patches(self, context: ConversationContext) -> list[ApplyPatch]: ...
 
 
 def resolve_agent_root(root: Path) -> Path:

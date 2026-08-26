@@ -7,18 +7,18 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 if TYPE_CHECKING:
-    from tiny_coder.file_agent import AgentContext
+    from tiny_coder.file_agent import ConversationContext
 
 
 class ExecutableScriptOutput(ABC):
     """Structured output that provides source code for an executable script."""
 
-    async def prepare_executable_script(self, context: AgentContext) -> None:
+    async def prepare_executable_script(self, context: ConversationContext) -> None:
         """Normalize and validate the script before optional execution."""
         _ = context
 
     @abstractmethod
-    def to_executable_script(self, context: AgentContext) -> str: ...
+    def to_executable_script(self, context: ConversationContext) -> str: ...
 
 
 class GeneratedScriptOutput(BaseModel, ExecutableScriptOutput):
@@ -42,7 +42,7 @@ class GeneratedScriptOutput(BaseModel, ExecutableScriptOutput):
             raise ValueError(f"generated {info.field_name} must not be blank")
         return value
 
-    def to_executable_script(self, context: AgentContext) -> str:
+    def to_executable_script(self, context: ConversationContext) -> str:
         _ = context
         return self.script
 

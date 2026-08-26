@@ -4,14 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tiny-coder"
-version = "0.1.12"
-description = "Reusable tiny file-agent runtime for local LLM coding workflows"
+version = "0.2.0"
+description = "Reusable multi-conversation runtime for local LLM file workflows"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
     "jinja2>=3.1",
-    "langgraph>=1.1.6",
     "openai>=1.0",
     "pydantic>=2.0",
     "pyyaml>=6.0",
@@ -41,7 +40,7 @@ quote-style = "preserve"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = ["-p", "no:cacheprovider"]
+addopts = ["--basetemp=.tmp/pytest", "-p", "no:cacheprovider"]
 
 [tool.mypy]
 python_version = "3.10"
