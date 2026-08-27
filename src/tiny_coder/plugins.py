@@ -37,10 +37,6 @@ if TYPE_CHECKING:
 
 _SystemPromptProvider: TypeAlias = str | Callable[["ConversationContext"], str]
 _UserPromptProvider: TypeAlias = str | Callable[["ConversationContext", Sequence[str]], str]
-_TemplateVars: TypeAlias = Mapping[str, Any] | Callable[["ConversationContext"], Mapping[str, Any]]
-UserTemplateVars: TypeAlias = (
-    Mapping[str, Any] | Callable[["ConversationContext"], Mapping[str, Any]]
-)
 _BeforeConversationCallback: TypeAlias = Callable[["ConversationContext"], Awaitable[None]]
 _AfterConversationCallback: TypeAlias = Callable[
     ["ConversationContext", "ConversationResult"], Awaitable[None]
@@ -54,7 +50,39 @@ _LlmCallTokenStatsHandler: TypeAlias = Callable[
 ]
 
 
-class LlmCallJsonlRecorderExtraHandler(ABC):
+class TemplateVarsProvider(ABC):
+    """Provide variables for rendering one conversation template."""
+
+    @abstractmethod
+    def __call__(
+        self,
+        context: ConversationContext,
+        /,
+    ) -> Mapping[str, Any]: ...
+
+
+def _validate_template_vars(
+    template_vars: Mapping[str, Any] | TemplateVarsProvider | None,
+) -> None:
+    if template_vars is not None and not isinstance(
+        template_vars,
+        (Mapping, TemplateVarsProvider),
+    ):
+        raise TypeError("template_vars must be a mapping or inherit TemplateVarsProvider")
+
+
+def _resolve_template_vars(
+    template_vars: Mapping[str, Any] | TemplateVarsProvider | None,
+    context: ConversationContext,
+) -> Mapping[str, Any]:
+    if template_vars is None:
+        return {}
+    if isinstance(template_vars, TemplateVarsProvider):
+        return template_vars(context)
+    return template_vars
+
+
+class LlmCallJsonlRecorderExtraProvider(ABC):
     """Provide JSON-compatible metadata for one recorded LLM call."""
 
     @abstractmethod
@@ -114,15 +142,15 @@ class LlmCallJsonlRecorderPlugin(ConversationPlugin):
     """Append every completed LLM call's raw input and output to one JSONL file."""
 
     path: Path
-    extra_handler: LlmCallJsonlRecorderExtraHandler | None = None
+    extra_provider: LlmCallJsonlRecorderExtraProvider | None = None
     target_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
-        if self.extra_handler is not None and not isinstance(
-            self.extra_handler,
-            LlmCallJsonlRecorderExtraHandler,
+        if self.extra_provider is not None and not isinstance(
+            self.extra_provider,
+            LlmCallJsonlRecorderExtraProvider,
         ):
-            raise TypeError("extra_handler must inherit LlmCallJsonlRecorderExtraHandler")
+            raise TypeError("extra_provider must inherit LlmCallJsonlRecorderExtraProvider")
 
     def on_registered(self, context: ConversationContext) -> None:
         """Resolve the log path and register the call recorder for this scope."""
@@ -134,7 +162,7 @@ class LlmCallJsonlRecorderPlugin(ConversationPlugin):
         context: ConversationContext,
         outcome: LlmCallOutcome,
     ) -> None:
-        extra = dict(self.extra_handler(context, outcome)) if self.extra_handler else {}
+        extra = dict(self.extra_provider(context, outcome)) if self.extra_provider else {}
         record = _LlmCallJsonlRecord(
             conversation_key=context.key,
             system=context.llm_call_system_prompt,
@@ -332,7 +360,13 @@ class TemplateSystemPromptPlugin(ConversationPlugin):
 
     template_name: str
     template_root: Path = field(kw_only=True)
-    template_vars: _TemplateVars | None = field(default=None, kw_only=True)
+    template_vars: Mapping[str, Any] | TemplateVarsProvider | None = field(
+        default=None,
+        kw_only=True,
+    )
+
+    def __post_init__(self) -> None:
+        _validate_template_vars(self.template_vars)
 
     def on_registered(self, context: ConversationContext) -> None:
         """Register this template as a system prompt hook."""
@@ -343,17 +377,10 @@ class TemplateSystemPromptPlugin(ConversationPlugin):
         context: ConversationContext,
     ) -> str:
         """Replace the current system prompt with the rendered template contract."""
-        variables = self._template_vars(context)
+        variables = _resolve_template_vars(self.template_vars, context)
         return (
             _jinja_env(self.template_root).get_template(self.template_name).render(**variables)
         ).rstrip() + "\n"
-
-    def _template_vars(self, context: ConversationContext) -> Mapping[str, Any]:
-        if self.template_vars is None:
-            return {}
-        if callable(self.template_vars):
-            return self.template_vars(context)
-        return self.template_vars
 
 
 @dataclass
@@ -362,7 +389,13 @@ class TemplateUserPromptPlugin(ConversationPlugin):
 
     template_name: str
     template_root: Path = field(kw_only=True)
-    template_vars: UserTemplateVars | None = field(default=None, kw_only=True)
+    template_vars: Mapping[str, Any] | TemplateVarsProvider | None = field(
+        default=None,
+        kw_only=True,
+    )
+
+    def __post_init__(self) -> None:
+        _validate_template_vars(self.template_vars)
 
     def on_registered(self, context: ConversationContext) -> None:
         """Register this template as a user prompt hook."""
@@ -376,11 +409,7 @@ class TemplateUserPromptPlugin(ConversationPlugin):
         """Replace the current user prompt with the rendered template."""
         from tiny_coder.file_agent import agent_input_snapshots
 
-        custom_vars = (
-            self.template_vars(context)
-            if callable(self.template_vars)
-            else dict(self.template_vars or {})
-        )
+        custom_vars = _resolve_template_vars(self.template_vars, context)
         variables = {
             **custom_vars,
             "input_files": agent_input_snapshots(context.cwd, context.input_paths),
@@ -754,7 +783,7 @@ __all__ = [
     "FileTreeInputPathsPlugin",
     "JsonFieldStreamLlmCallPlugin",
     "LlmConfigPlugin",
-    "LlmCallJsonlRecorderExtraHandler",
+    "LlmCallJsonlRecorderExtraProvider",
     "LlmCallJsonlRecorderPlugin",
     "LlmCallTokenStats",
     "LlmCallTokenStatsPlugin",
@@ -767,7 +796,7 @@ __all__ = [
     "StaticUserPromptPlugin",
     "TemplateSystemPromptPlugin",
     "TemplateUserPromptPlugin",
-    "UserTemplateVars",
+    "TemplateVarsProvider",
     "format_llm_call_token_stats",
     "require_output_model_type",
     "resolve_agent_file_path",

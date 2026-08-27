@@ -33,7 +33,7 @@ from tiny_coder.plugins import (
     ExistingPathGuardPlugin,
     FileCleanupPlugin,
     FileTreeInputPathsPlugin,
-    LlmCallJsonlRecorderExtraHandler,
+    LlmCallJsonlRecorderExtraProvider,
     LlmCallJsonlRecorderPlugin,
     LlmCallTokenStats,
     LlmCallTokenStatsPlugin,
@@ -47,6 +47,7 @@ from tiny_coder.plugins import (
     StaticUserPromptPlugin,
     TemplateSystemPromptPlugin,
     TemplateUserPromptPlugin,
+    TemplateVarsProvider,
 )
 from tiny_coder.text_replacement import TextReplacement
 
@@ -59,7 +60,7 @@ class _SummaryOutput(BaseModel):
     summary: str
 
 
-class _PriorExtraHandler(LlmCallJsonlRecorderExtraHandler):
+class _PriorExtraProvider(LlmCallJsonlRecorderExtraProvider):
     def __call__(
         self,
         context: ConversationContext,
@@ -67,6 +68,25 @@ class _PriorExtraHandler(LlmCallJsonlRecorderExtraHandler):
         /,
     ) -> dict[str, int]:
         return {"prior": len(context.previous)}
+
+
+class _SystemTemplateVarsProvider(TemplateVarsProvider):
+    def __call__(
+        self,
+        context: ConversationContext,
+        /,
+    ) -> dict[str, str]:
+        _ = context
+        return {"role": "reviewer"}
+
+
+class _UserTemplateVarsProvider(TemplateVarsProvider):
+    def __call__(
+        self,
+        context: ConversationContext,
+        /,
+    ) -> dict[str, str]:
+        return {"prior": context.previous["draft"].summary}
 
 
 class _PatchOutput(BaseModel, ApplyPatchOutput):
@@ -479,7 +499,19 @@ def test_existing_path_guard_rejects_without_calling_model(tmp_path: Path) -> No
     assert llm.calls == []
 
 
-def test_template_plugins_render_files_and_previous_conversation(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "system_template_vars",
+    [{"role": "reviewer"}, _SystemTemplateVarsProvider()],
+)
+@pytest.mark.parametrize(
+    "user_template_vars",
+    [{"prior": "done"}, _UserTemplateVarsProvider()],
+)
+def test_template_plugins_render_files_and_previous_conversation(
+    tmp_path: Path,
+    system_template_vars: dict[str, str] | TemplateVarsProvider,
+    user_template_vars: dict[str, str] | TemplateVarsProvider,
+) -> None:
     template_root = tmp_path / "templates"
     template_root.mkdir()
     (template_root / "system.jinja").write_text(
@@ -504,14 +536,12 @@ def test_template_plugins_render_files_and_previous_conversation(tmp_path: Path)
             TemplateSystemPromptPlugin(
                 "system.jinja",
                 template_root=template_root,
-                template_vars={"role": "reviewer"},
+                template_vars=system_template_vars,
             ),
             TemplateUserPromptPlugin(
                 "user.jinja",
                 template_root=template_root,
-                template_vars=lambda context: {
-                    "prior": context.previous["draft"].summary,
-                },
+                template_vars=user_template_vars,
             ),
             ResponseOutputTypePlugin(_SummaryOutput),
             NoopOutputWriterPlugin(),
@@ -523,6 +553,25 @@ def test_template_plugins_render_files_and_previous_conversation(tmp_path: Path)
     assert review_llm.calls == [("role=reviewer\n", "done|content|0\n")]
 
 
+@pytest.mark.parametrize(
+    "plugin_type",
+    [TemplateSystemPromptPlugin, TemplateUserPromptPlugin],
+)
+def test_template_prompt_requires_template_vars_provider(
+    tmp_path: Path,
+    plugin_type: type[TemplateSystemPromptPlugin] | type[TemplateUserPromptPlugin],
+) -> None:
+    with pytest.raises(
+        TypeError,
+        match="template_vars must be a mapping or inherit TemplateVarsProvider",
+    ):
+        plugin_type(
+            "system.jinja",
+            template_root=tmp_path,
+            template_vars=cast(Any, lambda _context: {}),
+        )
+
+
 def test_llm_call_recorder_uses_conversation_vocabulary(tmp_path: Path) -> None:
     log_path = tmp_path / "calls.jsonl"
     conversation = _conversation(
@@ -530,7 +579,7 @@ def test_llm_call_recorder_uses_conversation_vocabulary(tmp_path: Path) -> None:
         plugins=[
             LlmCallJsonlRecorderPlugin(
                 path=Path("calls.jsonl"),
-                extra_handler=_PriorExtraHandler(),
+                extra_provider=_PriorExtraProvider(),
             )
         ],
     )
@@ -544,14 +593,14 @@ def test_llm_call_recorder_uses_conversation_vocabulary(tmp_path: Path) -> None:
     assert record["extra"] == {"prior": 0}
 
 
-def test_llm_call_recorder_requires_extra_handler_subclass() -> None:
+def test_llm_call_recorder_requires_extra_provider_subclass() -> None:
     with pytest.raises(
         TypeError,
-        match="must inherit LlmCallJsonlRecorderExtraHandler",
+        match="extra_provider must inherit LlmCallJsonlRecorderExtraProvider",
     ):
         LlmCallJsonlRecorderPlugin(
             path=Path("calls.jsonl"),
-            extra_handler=cast(Any, lambda _context, _outcome: {}),
+            extra_provider=cast(Any, lambda _context, _outcome: {}),
         )
 
 
