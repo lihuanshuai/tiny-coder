@@ -4,7 +4,7 @@ import asyncio
 import json
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -35,19 +35,54 @@ if TYPE_CHECKING:
     )
 
 
-_SystemPromptProvider: TypeAlias = str | Callable[["ConversationContext"], str]
-_UserPromptProvider: TypeAlias = str | Callable[["ConversationContext", Sequence[str]], str]
-_BeforeConversationCallback: TypeAlias = Callable[["ConversationContext"], Awaitable[None]]
-_AfterConversationCallback: TypeAlias = Callable[
-    ["ConversationContext", "ConversationResult"], Awaitable[None]
-]
-_ExecutionConfirmation: TypeAlias = Callable[["ConversationContext", BaseModel], Awaitable[bool]]
-_ConversationCondition: TypeAlias = Callable[["ConversationContext"], bool]
 _JsonScalar: TypeAlias = str | int | float | bool | None
 _JsonValue: TypeAlias = _JsonScalar | list["_JsonValue"] | dict[str, "_JsonValue"]
-_LlmCallTokenStatsHandler: TypeAlias = Callable[
-    ["ConversationContext", "LlmCallTokenStats"], Awaitable[None]
-]
+
+
+class SystemPromptProvider(ABC):
+    """Provide a system prompt from the current conversation context."""
+
+    @abstractmethod
+    def __call__(
+        self,
+        context: ConversationContext,
+        /,
+    ) -> str: ...
+
+
+class UserPromptProvider(ABC):
+    """Provide a user prompt from the current conversation context."""
+
+    @abstractmethod
+    def __call__(
+        self,
+        context: ConversationContext,
+        retry_errors: Sequence[str],
+        /,
+    ) -> str: ...
+
+
+class ConversationConditionHandler(ABC):
+    """Decide whether one configured conversation should run."""
+
+    @abstractmethod
+    def __call__(
+        self,
+        context: ConversationContext,
+        /,
+    ) -> bool: ...
+
+
+class ExecutionConfirmationHandler(ABC):
+    """Confirm whether one prepared executable script should run."""
+
+    @abstractmethod
+    async def __call__(
+        self,
+        context: ConversationContext,
+        output: BaseModel,
+        /,
+    ) -> bool: ...
 
 
 class TemplateVarsProvider(ABC):
@@ -59,6 +94,29 @@ class TemplateVarsProvider(ABC):
         context: ConversationContext,
         /,
     ) -> Mapping[str, Any]: ...
+
+
+class BeforeConversationHandler(ABC):
+    """Prepare one conversation before its retry loop starts."""
+
+    @abstractmethod
+    async def __call__(
+        self,
+        context: ConversationContext,
+        /,
+    ) -> None: ...
+
+
+class AfterConversationHandler(ABC):
+    """Validate or process one conversation result inside its retry loop."""
+
+    @abstractmethod
+    async def __call__(
+        self,
+        context: ConversationContext,
+        result: ConversationResult,
+        /,
+    ) -> None: ...
 
 
 def _validate_template_vars(
@@ -204,6 +262,18 @@ class LlmCallTokenStats:
     eval_tokens_per_second: float | None
 
 
+class LlmCallTokenStatsHandler(ABC):
+    """Handle token statistics after one conversation succeeds."""
+
+    @abstractmethod
+    async def __call__(
+        self,
+        context: ConversationContext,
+        stats: LlmCallTokenStats,
+        /,
+    ) -> None: ...
+
+
 def format_llm_call_token_stats(stats: LlmCallTokenStats) -> str:
     """Format token statistics for compact command-line display."""
     prompt_speed = _format_token_speed(stats.prompt_tokens_per_second)
@@ -218,7 +288,11 @@ def format_llm_call_token_stats(stats: LlmCallTokenStats) -> str:
 class LlmCallTokenStatsPlugin(ConversationPlugin):
     """Print final token counts and speeds after a conversation succeeds."""
 
-    handler: _LlmCallTokenStatsHandler | None = None
+    handler: LlmCallTokenStatsHandler | None = None
+
+    def __post_init__(self) -> None:
+        if self.handler is not None and not isinstance(self.handler, LlmCallTokenStatsHandler):
+            raise TypeError("handler must inherit LlmCallTokenStatsHandler")
 
     def on_registered(self, context: ConversationContext) -> None:
         """Register a compact success-only footer for this conversation."""
@@ -248,7 +322,11 @@ class LlmCallTokenStatsPlugin(ConversationPlugin):
 class BeforeConversationPlugin(ConversationPlugin):
     """Prepare one conversation before prompting the model."""
 
-    handler: _BeforeConversationCallback
+    handler: BeforeConversationHandler
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.handler, BeforeConversationHandler):
+            raise TypeError("handler must inherit BeforeConversationHandler")
 
     def on_registered(self, context: ConversationContext) -> None:
         context.before_conversation_hooks.append(self.handler)
@@ -258,7 +336,11 @@ class BeforeConversationPlugin(ConversationPlugin):
 class AfterConversationPlugin(ConversationPlugin):
     """Inspect one parsed and handled conversation inside its retry loop."""
 
-    handler: _AfterConversationCallback
+    handler: AfterConversationHandler
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.handler, AfterConversationHandler):
+            raise TypeError("handler must inherit AfterConversationHandler")
 
     def on_registered(self, context: ConversationContext) -> None:
         context.after_conversation_hooks.append(self.handler)
@@ -268,12 +350,16 @@ class AfterConversationPlugin(ConversationPlugin):
 class ConditionalConversationPlugin(ConversationPlugin):
     """Run this conversation only when its runtime condition is true."""
 
-    should_run: _ConversationCondition
+    handler: ConversationConditionHandler
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.handler, ConversationConditionHandler):
+            raise TypeError("handler must inherit ConversationConditionHandler")
 
     def on_registered(self, context: ConversationContext) -> None:
         if context.should_run is not None:
             raise RuntimeError("conversation condition is already configured")
-        context.should_run = self.should_run
+        context.should_run = self.handler
 
 
 class DynamicOutputPathsPlugin(ConversationPlugin):
@@ -321,7 +407,11 @@ def _relative_label(root: Path, path: Path) -> str:
 class StaticSystemPromptPlugin(ConversationPlugin):
     """Replace the system prompt with static text or context-derived text."""
 
-    prompt: _SystemPromptProvider
+    prompt: str | SystemPromptProvider
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prompt, (str, SystemPromptProvider)):
+            raise TypeError("prompt must be a string or inherit SystemPromptProvider")
 
     def on_registered(self, context: ConversationContext) -> None:
         """Register this plugin as a system prompt hook."""
@@ -332,7 +422,9 @@ class StaticSystemPromptPlugin(ConversationPlugin):
         context: ConversationContext,
     ) -> str:
         """Return the configured system prompt for this run."""
-        prompt = self.prompt(context) if callable(self.prompt) else self.prompt
+        prompt = (
+            self.prompt(context) if isinstance(self.prompt, SystemPromptProvider) else self.prompt
+        )
         return prompt.rstrip() + "\n"
 
 
@@ -340,7 +432,11 @@ class StaticSystemPromptPlugin(ConversationPlugin):
 class StaticUserPromptPlugin(ConversationPlugin):
     """Build a user prompt from static text or the current conversation context."""
 
-    prompt: _UserPromptProvider
+    prompt: str | UserPromptProvider
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prompt, (str, UserPromptProvider)):
+            raise TypeError("prompt must be a string or inherit UserPromptProvider")
 
     def on_registered(self, context: ConversationContext) -> None:
         context.user_prompt_hooks.append(self.build_user_prompt)
@@ -350,7 +446,11 @@ class StaticUserPromptPlugin(ConversationPlugin):
         context: ConversationContext,
         retry_errors: Sequence[str],
     ) -> str:
-        prompt = self.prompt(context, retry_errors) if callable(self.prompt) else self.prompt
+        prompt = (
+            self.prompt(context, retry_errors)
+            if isinstance(self.prompt, UserPromptProvider)
+            else self.prompt
+        )
         return prompt.rstrip() + "\n"
 
 
@@ -628,18 +728,23 @@ class ApplyPatchWriterPlugin(ConversationPlugin):
 
 
 @dataclass(kw_only=True)
-class ExecutableScriptPlugin(ConversationPlugin):
+class ExecutableScriptPlugin(ConversationPlugin, AfterConversationHandler):
     """Normalize, validate, confirm, and execute structured script content."""
 
     command: list[str] = field(default_factory=lambda: [sys.executable, "-"])
     arguments: list[str] = field(default_factory=list)
-    execution_confirmation: _ExecutionConfirmation | None = None
+    execution_confirmation: ExecutionConfirmationHandler | None = None
     environment: Mapping[str, str] | None = field(default=None, repr=False)
     capture_output: bool = True
 
     def __post_init__(self) -> None:
         if not self.command or any(not part for part in self.command):
             raise ValueError("script command must contain non-blank arguments")
+        if self.execution_confirmation is not None and not isinstance(
+            self.execution_confirmation,
+            ExecutionConfirmationHandler,
+        ):
+            raise TypeError("execution_confirmation must inherit ExecutionConfirmationHandler")
 
     def on_registered(self, context: ConversationContext) -> None:
         """Register content validation followed by script execution."""
@@ -654,7 +759,7 @@ class ExecutableScriptPlugin(ConversationPlugin):
             raise RuntimeError("ExecutableScriptPlugin requires an unconfigured output writer")
 
         context.output_writer = self.validate_output
-        context.after_conversation_hooks.append(self.process_output)
+        context.after_conversation_hooks.append(self)
 
     def validate_output(
         self,
@@ -691,10 +796,11 @@ class ExecutableScriptPlugin(ConversationPlugin):
             raise ValueError("generated script must not be blank")
         return script if script.endswith("\n") else script + "\n"
 
-    async def process_output(
+    async def __call__(
         self,
         context: ConversationContext,
         result: ConversationResult,
+        /,
     ) -> None:
         """Run asynchronous validation and optionally execute the prepared script."""
         _ = result
@@ -770,14 +876,18 @@ class NoopOutputWriterPlugin(ConversationPlugin):
 
 
 __all__ = [
+    "AfterConversationHandler",
     "AfterConversationPlugin",
     "ApplyPatchWriterPlugin",
+    "BeforeConversationHandler",
     "BeforeConversationPlugin",
     "ConditionalConversationPlugin",
+    "ConversationConditionHandler",
     "ConversationPlugin",
     "ConversationRetryPlugin",
     "DynamicOutputPathsPlugin",
     "ExistingPathGuardPlugin",
+    "ExecutionConfirmationHandler",
     "ExecutableScriptPlugin",
     "FileCleanupPlugin",
     "FileTreeInputPathsPlugin",
@@ -786,6 +896,7 @@ __all__ = [
     "LlmCallJsonlRecorderExtraProvider",
     "LlmCallJsonlRecorderPlugin",
     "LlmCallTokenStats",
+    "LlmCallTokenStatsHandler",
     "LlmCallTokenStatsPlugin",
     "NoopOutputWriterPlugin",
     "ResponseOutputTypePlugin",
@@ -794,9 +905,11 @@ __all__ = [
     "StaticOutputPathsPlugin",
     "StaticSystemPromptPlugin",
     "StaticUserPromptPlugin",
+    "SystemPromptProvider",
     "TemplateSystemPromptPlugin",
     "TemplateUserPromptPlugin",
     "TemplateVarsProvider",
+    "UserPromptProvider",
     "format_llm_call_token_stats",
     "require_output_model_type",
     "resolve_agent_file_path",

@@ -23,10 +23,13 @@ from tiny_coder.file_agent import (
     read_agent_file,
 )
 from tiny_coder.plugins import (
+    AfterConversationHandler,
     AfterConversationPlugin,
     ApplyPatchWriterPlugin,
+    BeforeConversationHandler,
     BeforeConversationPlugin,
     ConditionalConversationPlugin,
+    ConversationConditionHandler,
     ConversationPlugin,
     ConversationRetryPlugin,
     DynamicOutputPathsPlugin,
@@ -36,6 +39,7 @@ from tiny_coder.plugins import (
     LlmCallJsonlRecorderExtraProvider,
     LlmCallJsonlRecorderPlugin,
     LlmCallTokenStats,
+    LlmCallTokenStatsHandler,
     LlmCallTokenStatsPlugin,
     LlmConfigPlugin,
     NoopOutputWriterPlugin,
@@ -45,9 +49,11 @@ from tiny_coder.plugins import (
     StaticOutputPathsPlugin,
     StaticSystemPromptPlugin,
     StaticUserPromptPlugin,
+    SystemPromptProvider,
     TemplateSystemPromptPlugin,
     TemplateUserPromptPlugin,
     TemplateVarsProvider,
+    UserPromptProvider,
 )
 from tiny_coder.text_replacement import TextReplacement
 
@@ -68,6 +74,16 @@ class _PriorExtraProvider(LlmCallJsonlRecorderExtraProvider):
         /,
     ) -> dict[str, int]:
         return {"prior": len(context.previous)}
+
+
+class _ConversationKeySystemPromptProvider(SystemPromptProvider):
+    def __call__(self, context: ConversationContext, /) -> str:
+        return f"system:{context.key}"
+
+
+class _MissingPreviousConversationConditionHandler(ConversationConditionHandler):
+    def __call__(self, context: ConversationContext, /) -> bool:
+        return "missing" in context.previous
 
 
 class _SystemTemplateVarsProvider(TemplateVarsProvider):
@@ -146,14 +162,15 @@ def _conversation(
     llm: _QueuedLlmPlugin | None = None,
     plugins: Sequence[ConversationPlugin] = (),
     output_type: type[BaseModel] = _SummaryOutput,
-    user_prompt: str | Callable[[ConversationContext, Sequence[str]], str] = "user",
+    system_prompt: str | SystemPromptProvider = "system",
+    user_prompt: str | UserPromptProvider = "user",
 ) -> Conversation:
     return Conversation(
         key=key,
         plugins=[
             LlmConfigPlugin(_Config()),
             llm or _QueuedLlmPlugin(['{"summary":"done"}']),
-            StaticSystemPromptPlugin("system"),
+            StaticSystemPromptPlugin(system_prompt),
             StaticUserPromptPlugin(user_prompt),
             ResponseOutputTypePlugin(output_type),
             NoopOutputWriterPlugin(),
@@ -268,22 +285,35 @@ def test_conversation_registration_requires_complete_contract(
 def test_single_conversation_returns_validated_result(tmp_path: Path) -> None:
     llm = _QueuedLlmPlugin(['{"summary":"finished"}'])
 
-    result = _run(tmp_path, _conversation(key="sync", llm=llm))
+    result = _run(
+        tmp_path,
+        _conversation(
+            key="sync",
+            llm=llm,
+            system_prompt=_ConversationKeySystemPromptProvider(),
+        ),
+    )
 
     assert list(result.conversations) == ["sync"]
     assert result.conversations["sync"].summary == "finished"
     assert result.conversations["sync"].output == _SummaryOutput(summary="finished")
     assert result.written_paths == []
-    assert llm.calls == [("system\n", "user\n")]
+    assert llm.calls == [("system:sync\n", "user\n")]
 
 
 def test_multiple_conversations_share_only_completed_results(tmp_path: Path) -> None:
     seen_previous: list[list[str]] = []
 
-    def review_prompt(context: ConversationContext, _errors: Sequence[str]) -> str:
-        seen_previous.append(list(context.previous))
-        plan = cast(_SummaryOutput, context.previous["plan"].output)
-        return f"review: {plan.summary}"
+    class _ReviewPromptProvider(UserPromptProvider):
+        def __call__(
+            self,
+            context: ConversationContext,
+            _errors: Sequence[str],
+            /,
+        ) -> str:
+            seen_previous.append(list(context.previous))
+            plan = cast(_SummaryOutput, context.previous["plan"].output)
+            return f"review: {plan.summary}"
 
     plan = _conversation(
         key="plan",
@@ -296,7 +326,7 @@ def test_multiple_conversations_share_only_completed_results(tmp_path: Path) -> 
             LlmConfigPlugin(_Config()),
             review_llm,
             StaticSystemPromptPlugin("review system"),
-            StaticUserPromptPlugin(review_prompt),
+            StaticUserPromptPlugin(_ReviewPromptProvider()),
             ResponseOutputTypePlugin(_SummaryOutput),
             NoopOutputWriterPlugin(),
         ],
@@ -314,7 +344,7 @@ def test_conditional_conversation_skips_without_side_effects(tmp_path: Path) -> 
     skipped = _conversation(
         key="skip",
         llm=skipped_llm,
-        plugins=[ConditionalConversationPlugin(lambda context: "missing" in context.previous)],
+        plugins=[ConditionalConversationPlugin(_MissingPreviousConversationConditionHandler())],
     )
 
     result = _run(tmp_path, _conversation(key="first"), skipped)
@@ -326,15 +356,25 @@ def test_conditional_conversation_skips_without_side_effects(tmp_path: Path) -> 
 def test_conversation_callbacks_wrap_one_conversation_not_the_flow(tmp_path: Path) -> None:
     events: list[str] = []
 
-    async def prepare(context: ConversationContext) -> None:
-        events.append(f"before:{context.key}:{list(context.previous)}")
+    class _PrepareHandler(BeforeConversationHandler):
+        async def __call__(self, context: ConversationContext, /) -> None:
+            events.append(f"before:{context.key}:{list(context.previous)}")
 
-    async def validate(context: ConversationContext, result: ConversationResult) -> None:
-        events.append(f"after:{context.key}:{result.summary}")
+    class _ValidateHandler(AfterConversationHandler):
+        async def __call__(
+            self,
+            context: ConversationContext,
+            result: ConversationResult,
+            /,
+        ) -> None:
+            events.append(f"after:{context.key}:{result.summary}")
 
     conversation = _conversation(
         key="turn",
-        plugins=[BeforeConversationPlugin(prepare), AfterConversationPlugin(validate)],
+        plugins=[
+            BeforeConversationPlugin(_PrepareHandler()),
+            AfterConversationPlugin(_ValidateHandler()),
+        ],
     )
 
     _run(tmp_path, conversation)
@@ -342,15 +382,41 @@ def test_conversation_callbacks_wrap_one_conversation_not_the_flow(tmp_path: Pat
     assert events == ["before:turn:[]", "after:turn:done"]
 
 
+def test_conversation_plugins_require_handler_subclasses() -> None:
+    with pytest.raises(TypeError, match="handler must inherit BeforeConversationHandler"):
+        BeforeConversationPlugin(cast(Any, lambda _context: None))
+    with pytest.raises(TypeError, match="handler must inherit AfterConversationHandler"):
+        AfterConversationPlugin(cast(Any, lambda _context, _result: None))
+
+
+def test_prompt_plugins_require_provider_subclasses_for_dynamic_prompts() -> None:
+    with pytest.raises(TypeError, match="prompt must be a string or inherit SystemPromptProvider"):
+        StaticSystemPromptPlugin(cast(Any, lambda _context: "system"))
+    with pytest.raises(TypeError, match="prompt must be a string or inherit UserPromptProvider"):
+        StaticUserPromptPlugin(cast(Any, lambda _context, _errors: "user"))
+
+
+def test_conditional_conversation_plugin_requires_condition_subclass() -> None:
+    with pytest.raises(TypeError, match="handler must inherit ConversationConditionHandler"):
+        ConditionalConversationPlugin(cast(Any, lambda _context: True))
+
+
 def test_conversation_retries_with_validation_errors_in_next_prompt(tmp_path: Path) -> None:
     llm = _QueuedLlmPlugin(["not json", '{"summary":"fixed"}'])
     before_calls: list[str] = []
 
-    async def prepare(context: ConversationContext) -> None:
-        before_calls.append(context.key)
+    class _PrepareHandler(BeforeConversationHandler):
+        async def __call__(self, context: ConversationContext, /) -> None:
+            before_calls.append(context.key)
 
-    def user_prompt(_context: ConversationContext, errors: Sequence[str]) -> str:
-        return "retry: " + " | ".join(errors) if errors else "first attempt"
+    class _RetryPromptProvider(UserPromptProvider):
+        def __call__(
+            self,
+            _context: ConversationContext,
+            errors: Sequence[str],
+            /,
+        ) -> str:
+            return "retry: " + " | ".join(errors) if errors else "first attempt"
 
     conversation = Conversation(
         key="retry",
@@ -358,9 +424,9 @@ def test_conversation_retries_with_validation_errors_in_next_prompt(tmp_path: Pa
             LlmConfigPlugin(_Config()),
             llm,
             ConversationRetryPlugin(2),
-            BeforeConversationPlugin(prepare),
+            BeforeConversationPlugin(_PrepareHandler()),
             StaticSystemPromptPlugin("system"),
-            StaticUserPromptPlugin(user_prompt),
+            StaticUserPromptPlugin(_RetryPromptProvider()),
             ResponseOutputTypePlugin(_SummaryOutput),
             NoopOutputWriterPlugin(),
         ],
@@ -378,24 +444,36 @@ def test_after_conversation_validation_participates_in_retry(tmp_path: Path) -> 
     llm = _QueuedLlmPlugin(['{"summary":"first"}', '{"summary":"second"}'])
     calls = 0
 
-    async def reject_once(
-        _context: ConversationContext,
-        _result: ConversationResult,
-    ) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise ValueError("domain validation failed")
+    class _RejectOnceHandler(AfterConversationHandler):
+        async def __call__(
+            self,
+            _context: ConversationContext,
+            _result: ConversationResult,
+            /,
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ValueError("domain validation failed")
+
+    class _ValidationPromptProvider(UserPromptProvider):
+        def __call__(
+            self,
+            _context: ConversationContext,
+            errors: Sequence[str],
+            /,
+        ) -> str:
+            return " | ".join(errors) if errors else "user"
 
     result = _run(
         tmp_path,
         _conversation(
             key="validate",
             llm=llm,
-            user_prompt=lambda _context, errors: " | ".join(errors) if errors else "user",
+            user_prompt=_ValidationPromptProvider(),
             plugins=[
                 ConversationRetryPlugin(2),
-                AfterConversationPlugin(reject_once),
+                AfterConversationPlugin(_RejectOnceHandler()),
             ],
         ),
     )
@@ -465,15 +543,16 @@ def test_cleanup_runs_before_prepare_and_existing_path_guard(tmp_path: Path) -> 
     stale.write_text("old", encoding="utf-8", newline="\n")
     observed: list[bool] = []
 
-    async def prepare(_context: ConversationContext) -> None:
-        observed.append(stale.exists())
+    class _PrepareHandler(BeforeConversationHandler):
+        async def __call__(self, _context: ConversationContext, /) -> None:
+            observed.append(stale.exists())
 
     conversation = _conversation(
         plugins=[
             StaticOutputPathsPlugin([Path("stale.txt")]),
             FileCleanupPlugin([Path("stale.txt")]),
             ExistingPathGuardPlugin(),
-            BeforeConversationPlugin(prepare),
+            BeforeConversationPlugin(_PrepareHandler()),
         ]
     )
 
@@ -607,12 +686,18 @@ def test_llm_call_recorder_requires_extra_provider_subclass() -> None:
 def test_token_stats_handler_receives_conversation_context(tmp_path: Path) -> None:
     received: list[tuple[str, LlmCallTokenStats]] = []
 
-    async def handle(context: ConversationContext, stats: LlmCallTokenStats) -> None:
-        received.append((context.key, stats))
+    class _RecordTokenStatsHandler(LlmCallTokenStatsHandler):
+        async def __call__(
+            self,
+            context: ConversationContext,
+            stats: LlmCallTokenStats,
+            /,
+        ) -> None:
+            received.append((context.key, stats))
 
     conversation = _conversation(
         key="stats",
-        plugins=[LlmCallTokenStatsPlugin(handler=handle)],
+        plugins=[LlmCallTokenStatsPlugin(handler=_RecordTokenStatsHandler())],
     )
 
     _run(tmp_path, conversation)
@@ -635,34 +720,45 @@ def test_token_stats_wait_until_conversation_validation_succeeds(tmp_path: Path)
     validated = 0
     stats_calls: list[str] = []
 
-    async def validate(
-        _context: ConversationContext,
-        _result: ConversationResult,
-    ) -> None:
-        nonlocal validated
-        validated += 1
-        if validated == 1:
-            raise ValueError("try again")
+    class _ValidateHandler(AfterConversationHandler):
+        async def __call__(
+            self,
+            _context: ConversationContext,
+            _result: ConversationResult,
+            /,
+        ) -> None:
+            nonlocal validated
+            validated += 1
+            if validated == 1:
+                raise ValueError("try again")
 
-    async def handle_stats(
-        context: ConversationContext,
-        _stats: LlmCallTokenStats,
-    ) -> None:
-        stats_calls.append(context.key)
+    class _RecordTokenStatsHandler(LlmCallTokenStatsHandler):
+        async def __call__(
+            self,
+            context: ConversationContext,
+            _stats: LlmCallTokenStats,
+            /,
+        ) -> None:
+            stats_calls.append(context.key)
 
     conversation = _conversation(
         key="stats",
         llm=llm,
         plugins=[
             ConversationRetryPlugin(2),
-            LlmCallTokenStatsPlugin(handler=handle_stats),
-            AfterConversationPlugin(validate),
+            LlmCallTokenStatsPlugin(handler=_RecordTokenStatsHandler()),
+            AfterConversationPlugin(_ValidateHandler()),
         ],
     )
 
     _run(tmp_path, conversation)
 
     assert stats_calls == ["stats"]
+
+
+def test_token_stats_plugin_requires_handler_subclass() -> None:
+    with pytest.raises(TypeError, match="handler must inherit LlmCallTokenStatsHandler"):
+        LlmCallTokenStatsPlugin(handler=cast(Any, lambda _context, _stats: None))
 
 
 def test_silent_llm_call_suppresses_chunks(

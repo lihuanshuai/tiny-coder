@@ -12,6 +12,9 @@ from tiny_coder.executable_script import ScriptExecutionResult
 from tiny_coder.json_utils import JsonProtocolError, load_json_object
 from tiny_coder.llm_format_stream import stream_llm_chat_format
 from tiny_coder.plugins import (
+    AfterConversationHandler,
+    BeforeConversationHandler,
+    ConversationConditionHandler,
     ConversationPlugin,
     require_output_model_type,
     resolve_agent_file_path,
@@ -22,14 +25,9 @@ _OutputT = TypeVar("_OutputT", bound=BaseModel)
 _SystemPromptCallback: TypeAlias = Callable[["ConversationContext"], str]
 _UserPromptCallback: TypeAlias = Callable[["ConversationContext", Sequence[str]], str]
 _OutputWriterCallback: TypeAlias = Callable[["ConversationContext", BaseModel], list[Path]]
-_BeforeConversationCallback: TypeAlias = Callable[["ConversationContext"], Awaitable[None]]
-_AfterConversationCallback: TypeAlias = Callable[
-    ["ConversationContext", "ConversationResult"], Awaitable[None]
-]
 _ConversationCompletedCallback: TypeAlias = Callable[
     ["ConversationContext", "ConversationResult"], Awaitable[None]
 ]
-_ConversationCondition: TypeAlias = Callable[["ConversationContext"], bool]
 _AfterLlmCallCallback: TypeAlias = Callable[
     ["ConversationContext", "LlmCallOutcome"], Coroutine[Any, Any, None]
 ]
@@ -128,8 +126,8 @@ class ConversationContext:
     llm_call_user_prompt: str = ""
     input_paths: list[Path] = field(default_factory=list)
     output_paths: list[Path] = field(default_factory=list)
-    before_conversation_hooks: list[_BeforeConversationCallback] = field(default_factory=list)
-    after_conversation_hooks: list[_AfterConversationCallback] = field(default_factory=list)
+    before_conversation_hooks: list[BeforeConversationHandler] = field(default_factory=list)
+    after_conversation_hooks: list[AfterConversationHandler] = field(default_factory=list)
     conversation_completed_hooks: list[_ConversationCompletedCallback] = field(default_factory=list)
     system_prompt_hooks: list[_SystemPromptCallback] = field(default_factory=list)
     user_prompt_hooks: list[_UserPromptCallback] = field(default_factory=list)
@@ -139,7 +137,7 @@ class ConversationContext:
     output_writer: _OutputWriterCallback | None = None
     allow_overwrite_existing_paths: bool = True
     clean_up_paths: list[Path] = field(default_factory=list)
-    should_run: _ConversationCondition | None = None
+    should_run: ConversationConditionHandler | None = None
     script_execution_result: ScriptExecutionResult | None = None
 
     @property

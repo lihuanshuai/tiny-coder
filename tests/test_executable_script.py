@@ -7,6 +7,7 @@ import sys
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -17,6 +18,7 @@ from tiny_coder.file_agent import Conversation, ConversationContext, LlmCall, Ll
 from tiny_coder.plugins import (
     ConversationRetryPlugin,
     ExecutableScriptPlugin,
+    ExecutionConfirmationHandler,
     LlmConfigPlugin,
     ResponseOutputTypePlugin,
     StaticSystemPromptPlugin,
@@ -206,11 +208,17 @@ def test_executable_script_plugin_prepares_then_honors_rejected_confirmation(
         _ = args, kwargs
         raise AssertionError("rejected confirmation must not execute the script")
 
-    async def reject_execution(context: ConversationContext, output: BaseModel) -> bool:
-        assert context.key == "script"
-        assert isinstance(output, GeneratedScriptOutput)
-        assert output.script == "print('ok')"
-        return False
+    class _RejectExecutionHandler(ExecutionConfirmationHandler):
+        async def __call__(
+            self,
+            context: ConversationContext,
+            output: BaseModel,
+            /,
+        ) -> bool:
+            assert context.key == "script"
+            assert isinstance(output, GeneratedScriptOutput)
+            assert output.script == "print('ok')"
+            return False
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_process)
     monkeypatch.setattr(
@@ -221,7 +229,9 @@ def test_executable_script_plugin_prepares_then_honors_rejected_confirmation(
     agent = _build_agent(
         workspace_tmp_path,
         llm_call,
-        script_plugin=ExecutableScriptPlugin(execution_confirmation=reject_execution),
+        script_plugin=ExecutableScriptPlugin(
+            execution_confirmation=_RejectExecutionHandler(),
+        ),
     )
 
     asyncio.run(agent.run())
@@ -231,6 +241,19 @@ def test_executable_script_plugin_prepares_then_honors_rejected_confirmation(
     assert output.script == "print('ok')"
     assert prepared_scripts == ["```python\r\nprint('ok')\r\n```"]
     assert agent.conversations[0].context.script_execution_result is None
+
+
+def test_executable_script_plugin_requires_confirmation_handler_subclass() -> None:
+    async def confirm_execution(_context: ConversationContext, _output: BaseModel) -> bool:
+        return True
+
+    with pytest.raises(
+        TypeError,
+        match="execution_confirmation must inherit ExecutionConfirmationHandler",
+    ):
+        ExecutableScriptPlugin(
+            execution_confirmation=cast(ExecutionConfirmationHandler, confirm_execution),
+        )
 
 
 def test_executable_script_plugin_revalidates_prepared_output(

@@ -99,7 +99,7 @@ from collections.abc import Sequence
 from typing import cast
 
 from tiny_coder.file_agent import ConversationContext
-from tiny_coder.plugins import NoopOutputWriterPlugin
+from tiny_coder.plugins import NoopOutputWriterPlugin, UserPromptProvider
 
 
 class PlanOutput(BaseModel):
@@ -112,10 +112,16 @@ class ReviewOutput(BaseModel):
     approved: bool
 
 
-def review_prompt(context: ConversationContext, retry_errors: Sequence[str]) -> str:
-    plan = cast(PlanOutput, context.previous["plan"].output)
-    retry_note = "\n".join(retry_errors)
-    return f"Review this plan: {plan.plan}\nPrevious errors: {retry_note}"
+class ReviewPromptProvider(UserPromptProvider):
+    def __call__(
+        self,
+        context: ConversationContext,
+        retry_errors: Sequence[str],
+        /,
+    ) -> str:
+        plan = cast(PlanOutput, context.previous["plan"].output)
+        retry_note = "\n".join(retry_errors)
+        return f"Review this plan: {plan.plan}\nPrevious errors: {retry_note}"
 
 
 conversations = [
@@ -134,7 +140,7 @@ conversations = [
         plugins=[
             LlmConfigPlugin(LocalLlmConfig()),
             StaticSystemPromptPlugin("Review the proposed plan."),
-            StaticUserPromptPlugin(review_prompt),
+            StaticUserPromptPlugin(ReviewPromptProvider()),
             ResponseOutputTypePlugin(ReviewOutput),
             NoopOutputWriterPlugin(),
         ],
@@ -142,8 +148,9 @@ conversations = [
 ]
 ```
 
-Use `ConditionalConversationPlugin` for a bounded optional turn. Its predicate receives the same
-`ConversationContext` and can inspect `context.previous` and `context.extras`.
+Use `ConditionalConversationPlugin` for a bounded optional turn. Its `ConversationConditionHandler`
+subclass receives the same `ConversationContext` and can inspect `context.previous` and
+`context.extras`.
 
 For repeated work, build repeated conversations directly. A chapter-writing flow, for example, can
 create `chapter-001`, `chapter-002`, and `chapter-003` conversations. This keeps repetition, retry,
