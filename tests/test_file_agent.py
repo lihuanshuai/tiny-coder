@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -212,17 +212,112 @@ def test_agent_input_snapshots_include_labels_and_languages(tmp_path: Path) -> N
 
 def test_agent_requires_explicit_conversations(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="at least one Conversation"):
-        BasicFileAgent(cwd=tmp_path, conversations=[])
+        asyncio.run(BasicFileAgent(cwd=tmp_path, conversations=[]).run())
     with pytest.raises(ValueError, match="must not be blank"):
         Conversation(key=" ", plugins=[])
 
 
 def test_agent_rejects_duplicate_conversation_keys(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="duplicate conversation key"):
-        BasicFileAgent(
-            cwd=tmp_path,
-            conversations=[_conversation(key="same"), _conversation(key="same")],
+        asyncio.run(
+            BasicFileAgent(
+                cwd=tmp_path,
+                conversations=[_conversation(key="same"), _conversation(key="same")],
+            ).run()
         )
+
+
+def test_agent_lazily_consumes_generated_conversations(tmp_path: Path) -> None:
+    generation_events: list[str] = []
+    first_llm = _QueuedLlmPlugin(['{"summary":"first"}'])
+    second_llm = _QueuedLlmPlugin(['{"summary":"second"}'])
+
+    def conversations() -> Iterator[Conversation]:
+        generation_events.append("yield:first")
+        yield _conversation(key="first", llm=first_llm)
+        generation_events.append(f"first-calls:{len(first_llm.calls)}")
+        yield _conversation(key="second", llm=second_llm)
+
+    agent = BasicFileAgent(cwd=tmp_path, conversations=conversations())
+
+    assert generation_events == []
+    result = asyncio.run(agent.run())
+
+    assert generation_events == ["yield:first", "first-calls:1"]
+    assert list(result.conversations) == ["first", "second"]
+
+
+def test_agent_lazily_consumes_async_generated_conversations(tmp_path: Path) -> None:
+    generation_events: list[str] = []
+    first_llm = _QueuedLlmPlugin(['{"summary":"first"}'])
+    second_llm = _QueuedLlmPlugin(['{"summary":"second"}'])
+
+    async def conversations() -> AsyncIterator[Conversation]:
+        generation_events.append("yield:first")
+        yield _conversation(key="first", llm=first_llm)
+        generation_events.append(f"first-calls:{len(first_llm.calls)}")
+        yield _conversation(key="second", llm=second_llm)
+
+    agent = BasicFileAgent(cwd=tmp_path, conversations=conversations())
+
+    assert generation_events == []
+    result = asyncio.run(agent.run())
+
+    assert generation_events == ["yield:first", "first-calls:1"]
+    assert list(result.conversations) == ["first", "second"]
+
+
+def test_agent_runs_large_generated_conversation_sequence(tmp_path: Path) -> None:
+    conversation_count = 1_000
+
+    def conversations() -> Iterator[Conversation]:
+        for index in range(conversation_count):
+            yield _conversation(key=f"turn-{index}")
+
+    result = asyncio.run(BasicFileAgent(cwd=tmp_path, conversations=conversations()).run())
+
+    assert len(result.conversations) == conversation_count
+    assert next(iter(result.conversations)) == "turn-0"
+    assert next(reversed(result.conversations)) == "turn-999"
+
+
+def test_agent_validates_generated_conversations_during_consumption(tmp_path: Path) -> None:
+    empty_agent = BasicFileAgent(cwd=tmp_path, conversations=iter(()))
+    with pytest.raises(ValueError, match="at least one Conversation"):
+        asyncio.run(empty_agent.run())
+
+    def duplicate_conversations() -> Iterator[Conversation]:
+        yield _conversation(key="same")
+        yield _conversation(key="same")
+
+    duplicate_agent = BasicFileAgent(cwd=tmp_path, conversations=duplicate_conversations())
+    with pytest.raises(ValueError, match="duplicate conversation key"):
+        asyncio.run(duplicate_agent.run())
+
+
+def test_agent_validates_async_generated_conversations_during_consumption(
+    tmp_path: Path,
+) -> None:
+    async def empty_conversations() -> AsyncIterator[Conversation]:
+        if False:
+            yield _conversation(key="unreachable")
+
+    with pytest.raises(ValueError, match="at least one Conversation"):
+        asyncio.run(BasicFileAgent(cwd=tmp_path, conversations=empty_conversations()).run())
+
+    async def duplicate_conversations() -> AsyncIterator[Conversation]:
+        yield _conversation(key="same")
+        yield _conversation(key="same")
+
+    with pytest.raises(ValueError, match="duplicate conversation key"):
+        asyncio.run(BasicFileAgent(cwd=tmp_path, conversations=duplicate_conversations()).run())
+
+    async def invalid_conversations() -> AsyncIterator[Conversation]:
+        yield cast(Conversation, object())
+
+    invalid_agent = BasicFileAgent(cwd=tmp_path, conversations=invalid_conversations())
+    with pytest.raises(TypeError, match="must yield Conversation"):
+        asyncio.run(invalid_agent.run())
 
 
 def test_conversation_requires_conversation_plugins(tmp_path: Path) -> None:
@@ -231,14 +326,16 @@ def test_conversation_requires_conversation_plugins(tmp_path: Path) -> None:
             _ = context
 
     with pytest.raises(TypeError, match="ConversationPlugin"):
-        BasicFileAgent(
-            cwd=tmp_path,
-            conversations=[
-                Conversation(
-                    key="invalid",
-                    plugins=[cast(ConversationPlugin, _StructuralPlugin())],
-                )
-            ],
+        asyncio.run(
+            BasicFileAgent(
+                cwd=tmp_path,
+                conversations=[
+                    Conversation(
+                        key="invalid",
+                        plugins=[cast(ConversationPlugin, _StructuralPlugin())],
+                    )
+                ],
+            ).run()
         )
 
 
@@ -276,9 +373,11 @@ def test_conversation_registration_requires_complete_contract(
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        BasicFileAgent(
-            cwd=tmp_path,
-            conversations=[Conversation(key="incomplete", plugins=plugins)],
+        asyncio.run(
+            BasicFileAgent(
+                cwd=tmp_path,
+                conversations=[Conversation(key="incomplete", plugins=plugins)],
+            ).run()
         )
 
 
@@ -511,6 +610,9 @@ def test_path_plugins_are_scoped_to_their_conversation(tmp_path: Path) -> None:
     )
     agent = BasicFileAgent(cwd=tmp_path, conversations=[conversation])
 
+    assert not hasattr(conversation, "context")
+    asyncio.run(agent.run())
+
     assert conversation.context.input_paths == [source]
     assert conversation.context.output_paths == [source]
     assert agent.context.cwd == tmp_path.resolve()
@@ -533,7 +635,7 @@ def test_file_tree_input_paths_preserve_first_path_and_deduplicate(tmp_path: Pat
         ]
     )
 
-    BasicFileAgent(cwd=tmp_path, conversations=[conversation])
+    asyncio.run(BasicFileAgent(cwd=tmp_path, conversations=[conversation]).run())
 
     assert conversation.context.input_paths == [first, second]
 

@@ -5,7 +5,8 @@ import json
 import shutil
 import sys
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -16,6 +17,7 @@ from tiny_coder import file_agent
 from tiny_coder.executable_script import GeneratedScriptOutput
 from tiny_coder.file_agent import Conversation, ConversationContext, LlmCall, LlmCallOutcome
 from tiny_coder.plugins import (
+    ConversationPlugin,
     ConversationRetryPlugin,
     ExecutableScriptPlugin,
     ExecutionConfirmationHandler,
@@ -38,6 +40,14 @@ class SampleLlmOutcome(BaseModel):
 
 class NonScriptOutput(BaseModel):
     script: str
+
+
+@dataclass
+class _LlmCallPlugin(ConversationPlugin):
+    llm_call: LlmCall
+
+    def on_registered(self, context: ConversationContext) -> None:
+        context.llm_call = self.llm_call
 
 
 def test_generated_script_output_schema_describes_required_fields() -> None:
@@ -89,13 +99,14 @@ def _build_agent(
     max_attempts: int = 1,
 ) -> file_agent.BasicFileAgent:
     _write_test_file(root, Path("script-user.jinja"), "{{ retry_errors | join(' | ') }}")
-    agent = file_agent.BasicFileAgent(
+    return file_agent.BasicFileAgent(
         cwd=root,
         conversations=[
             Conversation(
                 key="script",
                 plugins=[
                     LlmConfigPlugin(SampleLlmConfig()),
+                    _LlmCallPlugin(llm_call),
                     ConversationRetryPlugin(max_attempts),
                     ResponseOutputTypePlugin(GeneratedScriptOutput),
                     StaticSystemPromptPlugin("Generate one executable Python script."),
@@ -108,8 +119,11 @@ def _build_agent(
             )
         ],
     )
-    agent.conversations[0].context.llm_call = llm_call
-    return agent
+
+
+def _conversation_context(agent: file_agent.BasicFileAgent) -> ConversationContext:
+    assert isinstance(agent.conversations, Iterable)
+    return next(iter(agent.conversations)).context
 
 
 def test_executable_script_plugin_validates_then_executes_content(
@@ -177,7 +191,7 @@ def test_executable_script_plugin_can_inherit_terminal_output(
     captured = capfd.readouterr()
     assert "visible stdout" in captured.out
     assert "visible stderr" in captured.err
-    execution = agent.conversations[0].context.script_execution_result
+    execution = _conversation_context(agent).script_execution_result
     assert execution is not None
     assert execution.stdout == ""
     assert execution.stderr == ""
@@ -236,11 +250,11 @@ def test_executable_script_plugin_prepares_then_honors_rejected_confirmation(
 
     asyncio.run(agent.run())
 
-    output = agent.conversations[0].context.llm_response_output
+    output = _conversation_context(agent).llm_response_output
     assert isinstance(output, GeneratedScriptOutput)
     assert output.script == "print('ok')"
     assert prepared_scripts == ["```python\r\nprint('ok')\r\n```"]
-    assert agent.conversations[0].context.script_execution_result is None
+    assert _conversation_context(agent).script_execution_result is None
 
 
 def test_executable_script_plugin_requires_confirmation_handler_subclass() -> None:
@@ -319,7 +333,7 @@ def test_executable_script_failure_is_available_to_generation_retry(
     assert "generated script failed with exit code 7" in prompts[1]
     assert "stderr:" in prompts[1]
     assert "broken" in prompts[1]
-    execution = agent.conversations[0].context.script_execution_result
+    execution = _conversation_context(agent).script_execution_result
     assert execution is not None
     assert execution.returncode == 0
     assert execution.stdout.strip() == "fixed"
@@ -329,18 +343,20 @@ def test_executable_script_plugin_requires_explicit_output_contract(
     workspace_tmp_path: Path,
 ) -> None:
     with pytest.raises(TypeError, match="must inherit ExecutableScriptOutput"):
-        file_agent.BasicFileAgent(
-            cwd=workspace_tmp_path,
-            conversations=[
-                Conversation(
-                    key="script",
-                    plugins=[
-                        LlmConfigPlugin(SampleLlmConfig()),
-                        ResponseOutputTypePlugin(NonScriptOutput),
-                        ExecutableScriptPlugin(),
-                    ],
-                )
-            ],
+        asyncio.run(
+            file_agent.BasicFileAgent(
+                cwd=workspace_tmp_path,
+                conversations=[
+                    Conversation(
+                        key="script",
+                        plugins=[
+                            LlmConfigPlugin(SampleLlmConfig()),
+                            ResponseOutputTypePlugin(NonScriptOutput),
+                            ExecutableScriptPlugin(),
+                        ],
+                    )
+                ],
+            ).run()
         )
 
 

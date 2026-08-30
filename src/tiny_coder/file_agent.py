@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from collections.abc import (
+    AsyncIterable,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, TypedDict, TypeVar, cast
@@ -249,35 +258,51 @@ _RETRYABLE_LLM_ERRORS = (
 
 @dataclass(kw_only=True)
 class BasicFileAgent:
-    """Run a declared sequence of conversations and integrate their context."""
+    """Lazily run ordered conversations and integrate their context."""
 
     cwd: Path
-    conversations: list[Conversation]
+    conversations: Iterable[Conversation] | AsyncIterable[Conversation]
     context: AgentContext = field(init=False)
 
     def __post_init__(self) -> None:
         self.cwd = resolve_agent_root(self.cwd)
-        if not self.conversations:
-            raise ValueError("BasicFileAgent requires at least one Conversation")
-        keys = [conversation.key for conversation in self.conversations]
-        duplicate_keys = sorted({key for key in keys if keys.count(key) > 1})
-        if duplicate_keys:
-            raise ValueError(f"duplicate conversation key: {duplicate_keys[0]}")
         self.context = AgentContext(cwd=self.cwd)
-        for conversation in self.conversations:
-            conversation.register(self.context)
+
+    @staticmethod
+    def _validate_conversation(
+        conversation: Conversation,
+        seen_keys: set[str],
+    ) -> None:
+        if not isinstance(conversation, Conversation):
+            raise TypeError("conversations must yield Conversation instances")
+        if conversation.key in seen_keys:
+            raise ValueError(f"duplicate conversation key: {conversation.key}")
+        seen_keys.add(conversation.key)
 
     async def run(self) -> AgentResult:
-        """Run configured conversations in order and return their integrated results."""
+        """Consume and run synchronous or asynchronous conversations in order."""
         self.context.conversation_results.clear()
-        for conversation in self.conversations:
+        seen_keys: set[str] = set()
+        async for conversation in self._iter_conversations():
+            self._validate_conversation(conversation, seen_keys)
+            conversation.register(self.context)
             context = conversation.context
             self._reset_conversation(context)
             if context.should_run is not None and not context.should_run(context):
                 continue
             result = await self._run_conversation(context)
             self.context.conversation_results[conversation.key] = result
+        if not seen_keys:
+            raise ValueError("BasicFileAgent requires at least one Conversation")
         return AgentResult(conversations=dict(self.context.conversation_results))
+
+    async def _iter_conversations(self) -> AsyncIterator[Conversation]:
+        if isinstance(self.conversations, AsyncIterable):
+            async for conversation in self.conversations:
+                yield conversation
+            return
+        for conversation in self.conversations:
+            yield conversation
 
     @staticmethod
     def _reset_conversation(context: ConversationContext) -> None:

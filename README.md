@@ -152,9 +152,33 @@ Use `ConditionalConversationPlugin` for a bounded optional turn. Its `Conversati
 subclass receives the same `ConversationContext` and can inspect `context.previous` and
 `context.extras`.
 
-For repeated work, build repeated conversations directly. A chapter-writing flow, for example, can
-create `chapter-001`, `chapter-002`, and `chapter-003` conversations. This keeps repetition, retry,
-and cross-turn context on the same visible mechanism.
+For repeated or open-ended work, pass an `Iterable[Conversation]` or
+`AsyncIterable[Conversation]`. `BasicFileAgent` requests the next conversation only after the
+current one completes, so even a very large sequence is not materialized up front. Async sources
+can also prepare the next conversation from files or results produced by the preceding one:
+
+```python
+from collections.abc import Iterator
+from itertools import count
+
+
+def generated_conversations() -> Iterator[Conversation]:
+    for turn in count(1):
+        conversation = build_conversation(key=f"turn-{turn}")
+        yield conversation
+        if should_stop(conversation.context):
+            return
+
+
+agent = BasicFileAgent(cwd=Path.cwd(), conversations=generated_conversations())
+result = await agent.run()
+```
+
+An unbounded synchronous or asynchronous generator keeps the agent running until it returns,
+raises, or the task is cancelled. One-shot iterators support one `run()`; use a re-iterable source
+when the same agent must run again. Every conversation is registered only when it is consumed.
+Completed results remain available through `context.previous`, so generation, retries, and
+cross-turn context stay on the same conversation mechanism.
 
 ## Conversation Plugins
 
