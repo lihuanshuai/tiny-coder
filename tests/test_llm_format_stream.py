@@ -5,17 +5,18 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from tiny_coder import llm_format_stream
 from tiny_coder.llm_format_stream import (
+    LlmConfig,
     nonnegative_int_from_llm_field,
     parse_llm_stream_chunk,
     stream_llm_chat_format,
 )
 
 
-class SampleOpenAIConfig(BaseModel):
+class SampleOpenAIConfig(LlmConfig):
     base_url: str = "http://localhost:11434/v1"
     llm_model: str = "sample-model"
     num_ctx: int = 4096
@@ -23,6 +24,11 @@ class SampleOpenAIConfig(BaseModel):
     repeat_penalty: float = 1.1
     think: bool = False
     timeout: float = 37.0
+    max_output_tokens: int | None = 8192
+
+
+class PlainPydanticConfig(BaseModel):
+    base_url: str = "http://localhost:11434/v1"
 
 
 class FakeStream:
@@ -72,6 +78,19 @@ class FakeAsyncOpenAI:
 
     async def close(self) -> None:
         type(self).closed = True
+
+
+def test_llm_config_declares_required_stream_fields() -> None:
+    assert set(LlmConfig.model_fields) == {
+        "base_url",
+        "llm_model",
+        "num_ctx",
+        "temperature",
+        "repeat_penalty",
+        "think",
+        "timeout",
+        "max_output_tokens",
+    }
 
 
 def test_nonneg_int_from_llm_field_accepts_only_nonnegative_integral_values() -> None:
@@ -148,6 +167,7 @@ def test_stream_llm_chat_format_forwards_schema_chunks_and_metrics(
         "think": False,
     }
     assert FakeCompletions.kwargs["reasoning_effort"] == "none"
+    assert FakeCompletions.kwargs["max_tokens"] == 8192
     assert FakeAsyncOpenAI.timeout == 37.0
     assert FakeAsyncOpenAI.closed is True
 
@@ -167,17 +187,75 @@ def test_llm_tail_metrics_falls_back_to_client_observed_token_speed() -> None:
     assert metrics["eval_tokens_per_second"] == 5.0
 
 
-def test_stream_llm_chat_format_rejects_nonpositive_timeout() -> None:
-    with pytest.raises(ValueError, match="timeout must be greater than zero"):
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("base_url", ""),
+        ("llm_model", ""),
+        ("num_ctx", 0),
+        ("temperature", -0.1),
+        ("repeat_penalty", -0.1),
+        ("timeout", 0),
+        ("max_output_tokens", 0),
+    ],
+)
+def test_llm_config_rejects_invalid_fields(field: str, value: object) -> None:
+    values = SampleOpenAIConfig().model_dump()
+    values[field] = value
+
+    with pytest.raises(ValidationError):
+        SampleOpenAIConfig.model_validate(values)
+
+
+def test_llm_config_rejects_undeclared_fields() -> None:
+    values = SampleOpenAIConfig().model_dump()
+    values["undeclared"] = True
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        SampleOpenAIConfig.model_validate(values)
+
+
+def test_llm_config_validates_inherited_defaults_and_assignment() -> None:
+    class InvalidDefaultConfig(SampleOpenAIConfig):
+        timeout: float = 0
+
+    with pytest.raises(ValidationError, match="timeout must be greater than zero"):
+        InvalidDefaultConfig()
+
+    config = SampleOpenAIConfig()
+    with pytest.raises(ValidationError, match="max_output_tokens must be greater than zero"):
+        config.max_output_tokens = 0
+
+
+def test_stream_llm_chat_format_requires_llm_config_subclass() -> None:
+    with pytest.raises(TypeError, match="llm_cfg must inherit LlmConfig"):
         asyncio.run(
             stream_llm_chat_format(
-                llm_cfg=SampleOpenAIConfig(timeout=0),
+                llm_cfg=PlainPydanticConfig(),  # type: ignore[arg-type]
                 system="system",
                 prompt="prompt",
                 response_format={"type": "object"},
                 on_chunk=lambda _chunk: None,
             )
         )
+
+
+def test_stream_llm_chat_format_omits_unset_max_output_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llm_format_stream, "AsyncOpenAI", FakeAsyncOpenAI)
+
+    asyncio.run(
+        stream_llm_chat_format(
+            llm_cfg=SampleOpenAIConfig(max_output_tokens=None),
+            system="system",
+            prompt="prompt",
+            response_format={"type": "object"},
+            on_chunk=lambda _chunk: None,
+        )
+    )
+
+    assert "max_tokens" not in FakeCompletions.kwargs
 
 
 def test_stream_llm_chat_format_raises_server_stream_error(

@@ -25,6 +25,7 @@ from tiny_coder.apply_patch import (
 )
 from tiny_coder.executable_script import ExecutableScriptOutput, ScriptExecutionResult
 from tiny_coder.json_utils import JsonStringFieldStreamer
+from tiny_coder.llm_format_stream import LlmConfig
 
 if TYPE_CHECKING:
     from tiny_coder.file_agent import (
@@ -579,7 +580,11 @@ class ResponseOutputTypePlugin(ConversationPlugin):
 class LlmConfigPlugin(ConversationPlugin):
     """Provide the model configuration for one conversation."""
 
-    llm_config: BaseModel
+    llm_config: LlmConfig
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.llm_config, LlmConfig):
+            raise TypeError("llm_config must inherit LlmConfig")
 
     def on_registered(self, context: ConversationContext) -> None:
         context.llm_config = self.llm_config
@@ -593,7 +598,7 @@ class SilentLlmCallPlugin(ConversationPlugin):
 
         async def silent_llm_call(
             *,
-            llm_cfg: BaseModel,
+            llm_cfg: LlmConfig,
             system: str,
             prompt: str,
             response_format: dict[str, Any],
@@ -638,7 +643,7 @@ class JsonFieldStreamLlmCallPlugin(ConversationPlugin):
 
         async def stream_field_llm_call(
             *,
-            llm_cfg: BaseModel,
+            llm_cfg: LlmConfig,
             system: str,
             prompt: str,
             response_format: dict[str, Any],
@@ -659,7 +664,7 @@ class JsonFieldStreamLlmCallPlugin(ConversationPlugin):
         self,
         llm_call: LlmCall,
         *,
-        llm_cfg: BaseModel,
+        llm_cfg: LlmConfig,
         system: str,
         prompt: str,
         response_format: dict[str, Any],

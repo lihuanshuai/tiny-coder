@@ -19,7 +19,7 @@ from pydantic import BaseModel, ValidationError
 
 from tiny_coder.executable_script import ScriptExecutionResult
 from tiny_coder.json_utils import JsonProtocolError, load_json_object
-from tiny_coder.llm_format_stream import stream_llm_chat_format
+from tiny_coder.llm_format_stream import LlmConfig, stream_llm_chat_format
 from tiny_coder.plugins import (
     AfterConversationHandler,
     BeforeConversationHandler,
@@ -73,7 +73,7 @@ class LlmCall(Protocol):
     def __call__(
         self,
         *,
-        llm_cfg: BaseModel,
+        llm_cfg: LlmConfig,
         system: str,
         prompt: str,
         response_format: dict[str, Any],
@@ -127,7 +127,7 @@ class ConversationContext:
 
     agent: AgentContext
     key: str
-    llm_config: BaseModel | None = None
+    llm_config: LlmConfig | None = None
     llm_call: LlmCall = field(default_factory=_default_llm_call)
     max_attempts: int = 1
     llm_call_outcome: LlmCallOutcome | None = None

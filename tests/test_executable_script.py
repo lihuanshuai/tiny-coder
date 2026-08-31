@@ -16,6 +16,7 @@ from pydantic import BaseModel, ValidationError
 from tiny_coder import file_agent
 from tiny_coder.executable_script import GeneratedScriptOutput
 from tiny_coder.file_agent import Conversation, ConversationContext, LlmCall, LlmCallOutcome
+from tiny_coder.llm_format_stream import LlmConfig
 from tiny_coder.plugins import (
     ConversationPlugin,
     ConversationRetryPlugin,
@@ -28,8 +29,14 @@ from tiny_coder.plugins import (
 )
 
 
-class SampleLlmConfig(BaseModel):
-    model: str = "test-model"
+class SampleLlmConfig(LlmConfig):
+    base_url: str = "http://localhost:11434/v1"
+    llm_model: str = "test-model"
+    num_ctx: int = 4096
+    temperature: float = 0.0
+    repeat_penalty: float = 1.0
+    think: bool = False
+    timeout: float = 30.0
 
 
 class SampleLlmOutcome(BaseModel):

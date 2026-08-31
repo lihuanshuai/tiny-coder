@@ -6,10 +6,10 @@ import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -19,14 +19,51 @@ UNSUPPORTED_SCHEMA_HINT = (
 )
 
 
-class _OpenAIChatConfig(Protocol):
-    base_url: str
-    llm_model: str
-    num_ctx: int
-    temperature: float
-    repeat_penalty: float
+class LlmConfig(BaseModel):
+    """Configuration required by the OpenAI-compatible chat stream."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        validate_default=True,
+    )
+
+    base_url: str = Field(min_length=1)
+    llm_model: str = Field(min_length=1)
+    num_ctx: int = Field(gt=0)
+    temperature: float = Field(ge=0.0)
+    repeat_penalty: float = Field(ge=0.0)
     think: bool
-    timeout: float
+    timeout: float = Field(gt=0.0)
+    max_output_tokens: int | None = Field(default=None, gt=0)
+
+    @field_validator("base_url", "llm_model")
+    @classmethod
+    def validate_non_blank(cls, value: str, info: ValidationInfo) -> str:
+        if not value.strip():
+            raise ValueError(f"{info.field_name} must not be blank")
+        return value
+
+    @field_validator("num_ctx", "timeout")
+    @classmethod
+    def validate_positive(cls, value: int | float, info: ValidationInfo) -> int | float:
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be greater than zero")
+        return value
+
+    @field_validator("temperature", "repeat_penalty")
+    @classmethod
+    def validate_nonnegative(cls, value: float, info: ValidationInfo) -> float:
+        if value < 0:
+            raise ValueError(f"{info.field_name} must not be negative")
+        return value
+
+    @field_validator("max_output_tokens")
+    @classmethod
+    def validate_max_output_tokens(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("max_output_tokens must be greater than zero or None")
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,27 +222,14 @@ def openai_api_key() -> str:
     return os.environ.get("OPENAI_API_KEY") or "not-needed"
 
 
-def _require_openai_chat_config(llm_cfg: BaseModel) -> _OpenAIChatConfig:
-    required = (
-        "base_url",
-        "llm_model",
-        "num_ctx",
-        "temperature",
-        "repeat_penalty",
-        "think",
-        "timeout",
-    )
-    missing = [name for name in required if not hasattr(llm_cfg, name)]
-    if missing:
-        raise TypeError("llm_cfg is missing OpenAI-compatible fields: " + ", ".join(missing))
-    config = cast(_OpenAIChatConfig, llm_cfg)
-    if config.timeout <= 0:
-        raise ValueError("llm_cfg.timeout must be greater than zero")
-    return config
+def _require_llm_config(llm_cfg: object) -> LlmConfig:
+    if not isinstance(llm_cfg, LlmConfig):
+        raise TypeError("llm_cfg must inherit LlmConfig")
+    return llm_cfg
 
 
-def openai_extra_body(llm_cfg: BaseModel) -> dict[str, Any]:
-    config = _require_openai_chat_config(llm_cfg)
+def openai_extra_body(llm_cfg: LlmConfig) -> dict[str, Any]:
+    config = _require_llm_config(llm_cfg)
     return {
         "num_ctx": config.num_ctx,
         "repeat_penalty": config.repeat_penalty,
@@ -215,7 +239,7 @@ def openai_extra_body(llm_cfg: BaseModel) -> dict[str, Any]:
 
 async def stream_llm_chat_format(
     *,
-    llm_cfg: BaseModel,
+    llm_cfg: LlmConfig,
     system: str,
     prompt: str,
     response_format: dict[str, Any],
@@ -224,7 +248,8 @@ async def stream_llm_chat_format(
     """Stream an OpenAI-compatible chat completion with JSON Schema output."""
     if not isinstance(response_format, dict) or not response_format:
         raise RuntimeError("response_format must be a non-empty JSON Schema object.")
-    config = _require_openai_chat_config(llm_cfg)
+    config = _require_llm_config(llm_cfg)
+    max_output_tokens = config.max_output_tokens
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
     client = AsyncOpenAI(
@@ -251,6 +276,9 @@ async def stream_llm_chat_format(
         try:
             create_completion = cast(Callable[..., Any], client.chat.completions.create)
             reasoning_options = {} if config.think else {"reasoning_effort": "none"}
+            output_limit_options = (
+                {"max_tokens": max_output_tokens} if max_output_tokens is not None else {}
+            )
             stream_response = await create_completion(
                 model=config.llm_model,
                 messages=[
@@ -263,6 +291,7 @@ async def stream_llm_chat_format(
                 stream_options={"include_usage": True},
                 extra_body=openai_extra_body(llm_cfg),
                 **reasoning_options,
+                **output_limit_options,
             )
         except Exception as error:
             message = str(error).lower()
@@ -334,6 +363,7 @@ async def stream_llm_chat_format(
 
 
 __all__ = [
+    "LlmConfig",
     "LlmChatStreamOutcome",
     "nonnegative_int_from_llm_field",
     "openai_api_key",

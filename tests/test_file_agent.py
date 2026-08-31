@@ -22,6 +22,7 @@ from tiny_coder.file_agent import (
     parse_structured_output,
     read_agent_file,
 )
+from tiny_coder.llm_format_stream import LlmConfig
 from tiny_coder.plugins import (
     AfterConversationHandler,
     AfterConversationPlugin,
@@ -58,8 +59,14 @@ from tiny_coder.plugins import (
 from tiny_coder.text_replacement import TextReplacement
 
 
-class _Config(BaseModel):
-    model: str = "test"
+class _Config(LlmConfig):
+    base_url: str = "http://localhost:11434/v1"
+    llm_model: str = "test"
+    num_ctx: int = 4096
+    temperature: float = 0.0
+    repeat_penalty: float = 1.0
+    think: bool = False
+    timeout: float = 30.0
 
 
 class _SummaryOutput(BaseModel):
@@ -140,7 +147,7 @@ class _QueuedLlmPlugin(ConversationPlugin):
     async def call(
         self,
         *,
-        llm_cfg: BaseModel,
+        llm_cfg: LlmConfig,
         system: str,
         prompt: str,
         response_format: dict[str, Any],
@@ -337,6 +344,11 @@ def test_conversation_requires_conversation_plugins(tmp_path: Path) -> None:
                 ],
             ).run()
         )
+
+
+def test_llm_config_plugin_requires_llm_config_subclass() -> None:
+    with pytest.raises(TypeError, match="llm_config must inherit LlmConfig"):
+        LlmConfigPlugin(cast(Any, _SummaryOutput(summary="not a config")))
 
 
 @pytest.mark.parametrize(

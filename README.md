@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 from tiny_coder.apply_patch import ApplyPatch, ApplyPatchOutput
 from tiny_coder.file_agent import BasicFileAgent, Conversation, ConversationContext
+from tiny_coder.llm_format_stream import LlmConfig
 from tiny_coder.plugins import (
     ApplyPatchWriterPlugin,
     ConversationRetryPlugin,
@@ -43,9 +44,15 @@ from tiny_coder.plugins import (
 from tiny_coder.text_replacement import TextReplacement
 
 
-class LocalLlmConfig(BaseModel):
+class LocalLlmConfig(LlmConfig):
     base_url: str = "http://localhost:11434/v1"
     llm_model: str = "local-model"
+    num_ctx: int = 8192
+    temperature: float = 0.1
+    repeat_penalty: float = 1.1
+    think: bool = False
+    timeout: float = 600.0
+    max_output_tokens: int | None = 8192
 
 
 class FileOutput(BaseModel, ApplyPatchOutput):
