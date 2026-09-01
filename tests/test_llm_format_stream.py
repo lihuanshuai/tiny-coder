@@ -9,6 +9,7 @@ from pydantic import BaseModel, ValidationError
 
 from tiny_coder import llm_format_stream
 from tiny_coder.llm_format_stream import (
+    LlmChatStreamOutcome,
     LlmConfig,
     nonnegative_int_from_llm_field,
     parse_llm_stream_chunk,
@@ -29,6 +30,10 @@ class SampleOpenAIConfig(LlmConfig):
 
 class PlainPydanticConfig(BaseModel):
     base_url: str = "http://localhost:11434/v1"
+
+
+class _SummaryOutput(BaseModel):
+    summary: str
 
 
 class FakeStream:
@@ -99,6 +104,64 @@ def test_nonneg_int_from_llm_field_accepts_only_nonnegative_integral_values() ->
     assert nonnegative_int_from_llm_field(True) is None
     assert nonnegative_int_from_llm_field(-1) is None
     assert nonnegative_int_from_llm_field(3.5) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('{"summary": "ok"}', {"summary": "ok"}),
+        ("```json\n{\"summary\": \"ok\"}\n```", {"summary": "ok"}),
+        ("not json", None),
+    ],
+)
+def test_llm_chat_stream_outcome_json(
+    text: str,
+    expected: dict[str, object] | None,
+) -> None:
+    outcome = LlmChatStreamOutcome(
+        text=text,
+        prompt_eval_count=1,
+        eval_count=1,
+        client_wall_time_ms=1.0,
+        started_at="2026-01-01T00:00:00+00:00",
+        completed_at="2026-01-01T00:00:01+00:00",
+        llm={},
+    )
+
+    assert outcome.json() == expected
+
+
+def test_llm_chat_stream_outcome_model_returns_requested_type() -> None:
+    outcome = LlmChatStreamOutcome(
+        text='{"summary":"ok"}',
+        prompt_eval_count=1,
+        eval_count=1,
+        client_wall_time_ms=1.0,
+        started_at="2026-01-01T00:00:00+00:00",
+        completed_at="2026-01-01T00:00:01+00:00",
+        llm={},
+    )
+
+    model: _SummaryOutput | None = outcome.model(_SummaryOutput)
+
+    assert model == _SummaryOutput(summary="ok")
+
+
+def test_llm_chat_stream_outcome_model_preserves_parse_and_validation_failures() -> None:
+    def outcome(text: str) -> LlmChatStreamOutcome:
+        return LlmChatStreamOutcome(
+            text=text,
+            prompt_eval_count=1,
+            eval_count=1,
+            client_wall_time_ms=1.0,
+            started_at="2026-01-01T00:00:00+00:00",
+            completed_at="2026-01-01T00:00:01+00:00",
+            llm={},
+        )
+
+    assert outcome("not json").model(_SummaryOutput) is None
+    with pytest.raises(ValidationError, match="summary"):
+        outcome('{"missing":true}').model(_SummaryOutput)
 
 
 def test_llm_stream_chunk_reads_openai_and_local_fields() -> None:

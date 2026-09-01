@@ -6,12 +6,16 @@ import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
+from tiny_coder.json_utils import JsonProtocolError, load_json_object
+
 logger = logging.getLogger(__name__)
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 UNSUPPORTED_SCHEMA_HINT = (
     "Current OpenAI-compatible LLM server does not support JSON Schema structured output "
@@ -77,6 +81,18 @@ class LlmChatStreamOutcome:
     started_at: str
     completed_at: str
     llm: dict[str, Any]
+
+    def json(self) -> dict[str, Any] | None:
+        """Return the response JSON object, or None when it cannot be parsed."""
+        try:
+            return load_json_object(self.text)
+        except JsonProtocolError:
+            return None
+
+    def model(self, model_type: type[_ModelT]) -> _ModelT | None:
+        """Validate the response as the requested Pydantic model type."""
+        payload = self.json()
+        return None if payload is None else model_type.model_validate(payload)
 
 
 def _get_value(obj: object, key: str, default: object = None) -> object:

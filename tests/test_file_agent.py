@@ -5,7 +5,7 @@ import json
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import pytest
 from pydantic import BaseModel
@@ -19,9 +19,9 @@ from tiny_coder.file_agent import (
     ConversationResult,
     LlmCallOutcome,
     agent_input_snapshots,
-    parse_structured_output,
     read_agent_file,
 )
+from tiny_coder.json_utils import JsonProtocolError, load_json_object
 from tiny_coder.llm_format_stream import LlmConfig
 from tiny_coder.plugins import (
     AfterConversationHandler,
@@ -55,8 +55,11 @@ from tiny_coder.plugins import (
     TemplateUserPromptPlugin,
     TemplateVarsProvider,
     UserPromptProvider,
+    ValidationRetryLlmConfigPlugin,
 )
 from tiny_coder.text_replacement import TextReplacement
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 
 class _Config(LlmConfig):
@@ -134,11 +137,22 @@ class _Outcome:
     eval_count: int = 2
     llm: dict[str, float] = field(default_factory=dict)
 
+    def json(self) -> dict[str, Any] | None:
+        try:
+            return load_json_object(self.text)
+        except JsonProtocolError:
+            return None
+
+    def model(self, model_type: type[_ModelT]) -> _ModelT | None:
+        payload = self.json()
+        return None if payload is None else model_type.model_validate(payload)
+
 
 @dataclass
 class _QueuedLlmPlugin(ConversationPlugin):
     outputs: list[str | Exception]
     calls: list[tuple[str, str]] = field(default_factory=list)
+    llm_configs: list[LlmConfig] = field(default_factory=list)
     chunks: list[str] = field(default_factory=list)
 
     def on_registered(self, context: ConversationContext) -> None:
@@ -153,7 +167,8 @@ class _QueuedLlmPlugin(ConversationPlugin):
         response_format: dict[str, Any],
         on_chunk: Callable[[str], None],
     ) -> _Outcome:
-        _ = llm_cfg, response_format
+        _ = response_format
+        self.llm_configs.append(llm_cfg)
         self.calls.append((system, prompt))
         output = self.outputs.pop(0)
         if isinstance(output, Exception):
@@ -197,12 +212,6 @@ def test_agent_file_helpers_stay_inside_root(tmp_path: Path) -> None:
     assert read_agent_file(tmp_path, Path("input.md")) == "hello\n"
     with pytest.raises(ValueError, match="outside agent workspace"):
         read_agent_file(tmp_path, Path("../outside.md"))
-
-
-def test_parse_structured_output_validates_model() -> None:
-    assert parse_structured_output('{"summary":"ok"}', output_type=_SummaryOutput).summary == "ok"
-    with pytest.raises(ValueError, match="invalid structured output"):
-        parse_structured_output('{"missing":true}', output_type=_SummaryOutput)
 
 
 def test_agent_input_snapshots_include_labels_and_languages(tmp_path: Path) -> None:
@@ -512,8 +521,12 @@ def test_conditional_conversation_plugin_requires_condition_subclass() -> None:
         ConditionalConversationPlugin(cast(Any, lambda _context: True))
 
 
-def test_conversation_retries_with_validation_errors_in_next_prompt(tmp_path: Path) -> None:
-    llm = _QueuedLlmPlugin(["not json", '{"summary":"fixed"}'])
+@pytest.mark.parametrize("invalid_output", ["not json", '{"missing":true}'])
+def test_conversation_retries_with_validation_errors_in_next_prompt(
+    tmp_path: Path,
+    invalid_output: str,
+) -> None:
+    llm = _QueuedLlmPlugin([invalid_output, '{"summary":"fixed"}'])
     before_calls: list[str] = []
 
     class _PrepareHandler(BeforeConversationHandler):
@@ -549,6 +562,28 @@ def test_conversation_retries_with_validation_errors_in_next_prompt(tmp_path: Pa
     assert before_calls == ["retry"]
     assert llm.calls[0][1] == "first attempt\n"
     assert "invalid structured output" in llm.calls[1][1]
+
+
+def test_validation_retry_can_use_different_llm_config(tmp_path: Path) -> None:
+    llm = _QueuedLlmPlugin(["not json", '{"summary":"fixed"}'])
+    conversation = _conversation(
+        key="retry-config",
+        llm=llm,
+        plugins=[
+            ValidationRetryLlmConfigPlugin(_Config(temperature=0.8)),
+            ConversationRetryPlugin(2),
+        ],
+    )
+
+    result = _run(tmp_path, conversation)
+
+    assert result.conversations["retry-config"].summary == "fixed"
+    assert [config.temperature for config in llm.llm_configs] == [0.0, 0.8]
+
+
+def test_validation_retry_llm_config_plugin_requires_config_subclass() -> None:
+    with pytest.raises(TypeError, match="llm_config must inherit LlmConfig"):
+        ValidationRetryLlmConfigPlugin(cast(Any, object()))
 
 
 def test_after_conversation_validation_participates_in_retry(tmp_path: Path) -> None:

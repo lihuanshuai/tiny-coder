@@ -12,13 +12,12 @@ from collections.abc import (
 )
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias, TypedDict, TypeVar, cast
+from typing import Any, Protocol, TypeAlias, TypedDict, TypeVar
 
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from pydantic import BaseModel, ValidationError
 
 from tiny_coder.executable_script import ScriptExecutionResult
-from tiny_coder.json_utils import JsonProtocolError, load_json_object
 from tiny_coder.llm_format_stream import LlmConfig, stream_llm_chat_format
 from tiny_coder.plugins import (
     AfterConversationHandler,
@@ -30,7 +29,7 @@ from tiny_coder.plugins import (
     resolve_agent_root,
 )
 
-_OutputT = TypeVar("_OutputT", bound=BaseModel)
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
 _SystemPromptCallback: TypeAlias = Callable[["ConversationContext"], str]
 _UserPromptCallback: TypeAlias = Callable[["ConversationContext", Sequence[str]], str]
 _OutputWriterCallback: TypeAlias = Callable[["ConversationContext", BaseModel], list[Path]]
@@ -67,6 +66,10 @@ class LlmCallOutcome(Protocol):
 
     @property
     def eval_count(self) -> int: ...
+
+    def json(self) -> dict[str, Any] | None: ...
+
+    def model(self, model_type: type[_ModelT]) -> _ModelT | None: ...
 
 
 class LlmCall(Protocol):
@@ -128,6 +131,7 @@ class ConversationContext:
     agent: AgentContext
     key: str
     llm_config: LlmConfig | None = None
+    validation_retry_llm_config: LlmConfig | None = None
     llm_call: LlmCall = field(default_factory=_default_llm_call)
     max_attempts: int = 1
     llm_call_outcome: LlmCallOutcome | None = None
@@ -234,16 +238,6 @@ def agent_input_snapshots(root: Path, input_paths: list[Path]) -> list[_AgentInp
     ]
 
 
-def parse_structured_output(raw_output: str, *, output_type: type[_OutputT]) -> _OutputT:
-    """Parse the model JSON response into the conversation's output model."""
-    try:
-        payload = load_json_object(raw_output)
-        model = require_output_model_type(output_type)
-        return cast(_OutputT, model.model_validate(payload))
-    except (JsonProtocolError, ValidationError) as error:
-        raise ValueError(f"invalid structured output: {error}") from error
-
-
 def _print_llm_chunk(chunk: str) -> None:
     print(chunk, end="", flush=True)
 
@@ -322,9 +316,17 @@ class BasicFileAgent:
         retry_errors: list[str] = []
         for attempt in range(1, context.max_attempts + 1):
             user_prompt = self._build_user_prompt(context, retry_errors)
+            llm_config = (
+                context.validation_retry_llm_config
+                if retry_errors and context.validation_retry_llm_config is not None
+                else context.llm_config
+            )
+            if llm_config is None:
+                raise RuntimeError(f"conversation {context.key!r} is not fully configured")
             try:
                 result = await self._call_and_apply_output(
                     context,
+                    llm_config=llm_config,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                 )
@@ -360,22 +362,23 @@ class BasicFileAgent:
         self,
         context: ConversationContext,
         *,
+        llm_config: LlmConfig,
         system_prompt: str,
         user_prompt: str,
     ) -> ConversationResult:
-        llm_config = context.llm_config
         output_type = context.llm_response_output_type
         output_writer = context.output_writer
-        if llm_config is None or output_type is None or output_writer is None:
+        if output_type is None or output_writer is None:
             raise RuntimeError(f"conversation {context.key!r} is not fully configured")
 
         context.llm_call_system_prompt = system_prompt
         context.llm_call_user_prompt = user_prompt
+        output_model = require_output_model_type(output_type)
         outcome = await context.llm_call(
             llm_cfg=llm_config,
             system=system_prompt,
             prompt=user_prompt,
-            response_format=require_output_model_type(output_type).model_json_schema(),
+            response_format=output_model.model_json_schema(),
             on_chunk=_print_llm_chunk,
         )
         context.llm_call_outcome = outcome
@@ -384,7 +387,12 @@ class BasicFileAgent:
         if outcome.text:
             print()
 
-        output = parse_structured_output(outcome.text, output_type=output_type)
+        try:
+            output = outcome.model(output_model)
+        except ValidationError as error:
+            raise ValueError(f"invalid structured output: {error}") from error
+        if output is None:
+            raise ValueError("invalid structured output: response is not a JSON object")
         context.llm_response_output = output
         written_paths = output_writer(context, output)
         self._validate_written_paths(context, written_paths)
@@ -461,6 +469,5 @@ __all__ = [
     "LlmCall",
     "LlmCallOutcome",
     "agent_input_snapshots",
-    "parse_structured_output",
     "read_agent_file",
 ]

@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -16,6 +16,7 @@ from pydantic import BaseModel, ValidationError
 from tiny_coder import file_agent
 from tiny_coder.executable_script import GeneratedScriptOutput
 from tiny_coder.file_agent import Conversation, ConversationContext, LlmCall, LlmCallOutcome
+from tiny_coder.json_utils import JsonProtocolError, load_json_object
 from tiny_coder.llm_format_stream import LlmConfig
 from tiny_coder.plugins import (
     ConversationPlugin,
@@ -28,6 +29,8 @@ from tiny_coder.plugins import (
     TemplateUserPromptPlugin,
 )
 
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
 
 class SampleLlmConfig(LlmConfig):
     base_url: str = "http://localhost:11434/v1"
@@ -39,10 +42,21 @@ class SampleLlmConfig(LlmConfig):
     timeout: float = 30.0
 
 
-class SampleLlmOutcome(BaseModel):
+@dataclass
+class SampleLlmOutcome:
     text: str
     prompt_eval_count: int = 1
     eval_count: int = 1
+
+    def json(self) -> dict[str, object] | None:
+        try:
+            return load_json_object(self.text)
+        except JsonProtocolError:
+            return None
+
+    def model(self, model_type: type[_ModelT]) -> _ModelT | None:
+        payload = self.json()
+        return None if payload is None else model_type.model_validate(payload)
 
 
 class NonScriptOutput(BaseModel):

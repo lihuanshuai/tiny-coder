@@ -590,6 +590,20 @@ class LlmConfigPlugin(ConversationPlugin):
         context.llm_config = self.llm_config
 
 
+@dataclass
+class ValidationRetryLlmConfigPlugin(ConversationPlugin):
+    """Override the model configuration after a response validation failure."""
+
+    llm_config: LlmConfig
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.llm_config, LlmConfig):
+            raise TypeError("llm_config must inherit LlmConfig")
+
+    def on_registered(self, context: ConversationContext) -> None:
+        context.validation_retry_llm_config = self.llm_config
+
+
 class SilentLlmCallPlugin(ConversationPlugin):
     """Suppress streamed chunks while preserving the configured LLM call."""
 
@@ -915,6 +929,7 @@ __all__ = [
     "TemplateUserPromptPlugin",
     "TemplateVarsProvider",
     "UserPromptProvider",
+    "ValidationRetryLlmConfigPlugin",
     "format_llm_call_token_stats",
     "require_output_model_type",
     "resolve_agent_file_path",
