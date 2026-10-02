@@ -1,1 +1,1 @@
-"""Tiny file-agent runtime package."""
+"""Graph runtime for local LLM coding agents."""

@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tiny-coder"
-version = "0.2.4"
-description = "Reusable multi-conversation runtime for local LLM file workflows"
+version = "1.0.1"
+description = "Graph-based LLM agent runtime with tool calling and checkpointing"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = [
+    "httpcore2>=2.13.0",
     "jinja2>=3.1",
     "openai>=1.0",
     "pydantic>=2.0",
@@ -43,6 +44,20 @@ pythonpath = ["src"]
 addopts = ["--basetemp=.tmp/pytest", "-p", "no:cacheprovider"]
 
 [tool.mypy]
-python_version = "3.10"
 ignore_missing_imports = true
+allow_redefinition = true
+disallow_incomplete_defs = true
 check_untyped_defs = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+strict_equality = true
+strict_bytes = true
+enable_error_code = [
+    "redundant-cast",
+    "possibly-undefined",
+    "unused-awaitable",
+    "truthy-iterable",
+    "ignore-without-code",
+    "unused-ignore",
+]
+exclude = ["\\.venv", "build", "\\.tmp"]

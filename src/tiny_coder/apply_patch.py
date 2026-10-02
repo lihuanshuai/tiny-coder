@@ -1,27 +1,27 @@
+"""Structured file mutations from ordered text replacements."""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from tiny_coder.text_replacement import (
     TextReplacement,
     TextReplacementApplyError,
     apply_text_replacements,
+    resolve_text_replacement,
 )
-
-if TYPE_CHECKING:
-    from tiny_coder.file_agent import ConversationContext
 
 
 @dataclass
 class ApplyPatch:
-    """Describe one ordered sequence of replacements for a workspace text file."""
+    """Describe workspace edits; match_original requires disjoint snapshot matches."""
 
     path: Path
     replacements: list[TextReplacement]
     ignore_punctuation_and_symbols: bool = False
+    match_original: bool = False
 
     def __post_init__(self) -> None:
         if not self.replacements:
@@ -42,6 +42,13 @@ class ApplyPatch:
         ]
         if not replacements:
             return original or ""
+
+        if self.match_original:
+            return _apply_snapshot_replacements(
+                original or "",
+                replacements,
+                ignore_punctuation_and_symbols=self.ignore_punctuation_and_symbols,
+            )
 
         updated = original or ""
         for replacement in replacements:
@@ -64,7 +71,14 @@ class ApplyPatchOutput(ABC):
     """Structured output that converts itself to generic workspace patches."""
 
     @abstractmethod
-    def to_apply_patches(self, context: ConversationContext) -> list[ApplyPatch]: ...
+    def to_apply_patches(self) -> list[ApplyPatch]: ...
+
+
+def apply_patch_output(
+    root: Path, output: ApplyPatchOutput, *, allowed_paths: list[Path] | None = None
+) -> list[Path]:
+    """Apply an ApplyPatchOutput's patches to the workspace."""
+    return apply_patches(root, output.to_apply_patches(), allowed_paths=allowed_paths)
 
 
 def resolve_agent_root(root: Path) -> Path:
@@ -136,9 +150,49 @@ def _prepare_apply_patches(
         try:
             updated[target] = patch.apply(updated[target])
         except TextReplacementApplyError as error:
-            label = target.relative_to(root_path).as_posix()
-            raise TextReplacementApplyError(f"failed to apply {label}: {error}") from error
+            relative_path = target.relative_to(root_path).as_posix()
+            raise TextReplacementApplyError(f"failed to apply {relative_path}: {error}") from error
     return originals, updated
+
+
+def _apply_snapshot_replacements(
+    original: str,
+    replacements: list[TextReplacement],
+    *,
+    ignore_punctuation_and_symbols: bool,
+) -> str:
+    """Resolve all edits against one snapshot before applying their disjoint spans."""
+    original = _normalize_newlines(original)
+    edits: list[tuple[int, int, str]] = []
+    for index, replacement in enumerate(replacements, start=1):
+        source = replacement.from_text
+        if source is None:
+            if len(replacements) != 1:
+                raise TextReplacementApplyError(
+                    "whole-file replacement cannot be combined with other replacements"
+                )
+            return replacement.to_text
+        try:
+            start, end, text = resolve_text_replacement(
+                original,
+                replacement,
+                index,
+                ignore_punctuation_and_symbols=ignore_punctuation_and_symbols,
+            )
+        except TextReplacementApplyError as error:
+            snippet = _compact_text_snippet(source)
+            raise TextReplacementApplyError(f"{error}; from_text={snippet!r}") from error
+        for previous, (other_start, other_end, _text) in enumerate(edits, start=1):
+            if start < other_end and other_start < end:
+                raise TextReplacementApplyError(
+                    f"replacement {index} overlaps replacement {previous} in the original snapshot"
+                )
+        edits.append((start, end, text))
+
+    updated = original
+    for start, end, text in sorted(edits, reverse=True):
+        updated = updated[:start] + text + updated[end:]
+    return updated.rstrip("\n") + "\n" if updated else ""
 
 
 def _normalize_newlines(text: str) -> str:

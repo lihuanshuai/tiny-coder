@@ -1,3 +1,5 @@
+"""Model-output JSON extraction and streaming JSON string-field parsing."""
+
 from __future__ import annotations
 
 import json

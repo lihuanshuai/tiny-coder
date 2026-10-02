@@ -1,3 +1,5 @@
+"""Stable YAML dumping for generated project content."""
+
 from __future__ import annotations
 
 import re

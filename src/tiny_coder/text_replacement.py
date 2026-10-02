@@ -1,3 +1,5 @@
+"""Ordered text replacements with fuzzy matching."""
+
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
@@ -170,6 +172,53 @@ def _inherit_fuzzy_match_indentation(
     )
 
 
+def resolve_text_replacement(
+    original: str,
+    replacement: TextReplacement,
+    index: int,
+    *,
+    ignore_punctuation_and_symbols: bool = False,
+) -> tuple[int, int, str]:
+    """Locate a replacement in LF-normalized text and adjust its indentation."""
+    original = _normalize_newlines(original)
+    to_text = _normalize_newlines(replacement.to_text)
+    if replacement.from_text is None:
+        return 0, len(original), to_text
+
+    from_text = _normalize_newlines(replacement.from_text)
+    if not from_text:
+        raise TextReplacementApplyError(f"replacement {index} from_text must not be empty")
+    if from_text == to_text:
+        raise TextReplacementApplyError(f"replacement {index} does not change text")
+    count = original.count(from_text)
+    if count == 0:
+        start, end = _best_fuzzy_span(
+            original,
+            from_text,
+            index,
+            ignore_punctuation_and_symbols=ignore_punctuation_and_symbols,
+        )
+        to_text = _inherit_fuzzy_match_indentation(
+            to_text,
+            from_text=from_text,
+            matched_text=original[start:end],
+        )
+        if original[start:end].endswith("\n") and not to_text.endswith("\n"):
+            to_text += "\n"
+    elif count > 1:
+        raise TextReplacementApplyError(
+            f"replacement {index} from_text matched {count} locations; refusing to apply"
+        )
+    else:
+        start = original.index(from_text)
+        if original.find(from_text, start + 1) != -1:
+            raise TextReplacementApplyError(
+                f"replacement {index} from_text matched multiple locations; refusing to apply"
+            )
+        end = start + len(from_text)
+    return start, end, to_text
+
+
 def apply_text_replacements(
     original: str,
     replacements: Sequence[TextReplacement],
@@ -181,38 +230,16 @@ def apply_text_replacements(
         raise TextReplacementApplyError("replacement list must not be empty")
     updated = _normalize_newlines(original)
     for index, replacement in enumerate(replacements, start=1):
-        to_text = _normalize_newlines(replacement.to_text)
         if replacement.from_text is None:
-            updated = to_text
+            updated = _normalize_newlines(replacement.to_text)
             continue
-
-        from_text = _normalize_newlines(replacement.from_text)
-        if not from_text:
-            raise TextReplacementApplyError(f"replacement {index} from_text must not be empty")
-        if from_text == to_text:
-            raise TextReplacementApplyError(f"replacement {index} does not change text")
-        count = updated.count(from_text)
-        if count == 0:
-            start, end = _best_fuzzy_span(
-                updated,
-                from_text,
-                index,
-                ignore_punctuation_and_symbols=ignore_punctuation_and_symbols,
-            )
-            replacement_text = _inherit_fuzzy_match_indentation(
-                to_text,
-                from_text=from_text,
-                matched_text=updated[start:end],
-            )
-            if updated[start:end].endswith("\n") and not replacement_text.endswith("\n"):
-                replacement_text += "\n"
-            updated = updated[:start] + replacement_text + updated[end:]
-        elif count > 1:
-            raise TextReplacementApplyError(
-                f"replacement {index} from_text matched {count} locations; refusing to apply"
-            )
-        else:
-            updated = updated.replace(from_text, to_text, 1)
+        start, end, to_text = resolve_text_replacement(
+            updated,
+            replacement,
+            index,
+            ignore_punctuation_and_symbols=ignore_punctuation_and_symbols,
+        )
+        updated = updated[:start] + to_text + updated[end:]
         updated = updated.rstrip("\n") + "\n" if updated else ""
     return updated
 
@@ -221,4 +248,5 @@ __all__ = [
     "TextReplacement",
     "TextReplacementApplyError",
     "apply_text_replacements",
+    "resolve_text_replacement",
 ]

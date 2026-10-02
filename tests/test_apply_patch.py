@@ -4,9 +4,16 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel
 
-from tiny_coder.apply_patch import ApplyPatch, apply_patches, preview_apply_patches
-from tiny_coder.text_replacement import TextReplacement
+from tiny_coder.apply_patch import (
+    ApplyPatch,
+    ApplyPatchOutput,
+    apply_patch_output,
+    apply_patches,
+    preview_apply_patches,
+)
+from tiny_coder.text_replacement import TextReplacement, TextReplacementApplyError
 
 
 @pytest.fixture
@@ -36,6 +43,104 @@ def test_apply_patch_applies_ordered_whole_file_and_matched_replacements() -> No
     )
 
     assert patch.apply("discarded\n") == "final"
+
+
+def test_apply_patch_matches_all_independent_edits_in_original_snapshot() -> None:
+    patch = ApplyPatch(
+        path=Path("notes.txt"),
+        match_original=True,
+        replacements=[
+            TextReplacement(from_text="first", to_text="second"),
+            TextReplacement(from_text="second", to_text="finished with a longer line"),
+        ],
+    )
+
+    assert patch.apply("first\r\nsecond\r\n") == "second\nfinished with a longer line\n"
+
+
+@pytest.mark.parametrize(
+    ("original", "replacements", "reason"),
+    [
+        (
+            "first second\n",
+            [
+                TextReplacement(from_text="first second", to_text="updated"),
+                TextReplacement(from_text="second", to_text="finished"),
+            ],
+            "overlaps replacement",
+        ),
+        (
+            "first\n",
+            [
+                TextReplacement(from_text="first", to_text="draft"),
+                TextReplacement(from_text="draft", to_text="final"),
+            ],
+            "from_text was not found",
+        ),
+        (
+            "- old goal for chapter one\n",
+            [
+                TextReplacement(from_text="- old goal for chpater one", to_text="- new goal A"),
+                TextReplacement(from_text="- old goal for chaptor one", to_text="- new goal B"),
+            ],
+            "overlaps replacement",
+        ),
+        (
+            "first first\n",
+            [TextReplacement(from_text="first", to_text="updated")],
+            "matched .*locations",
+        ),
+        (
+            "aaaa\n",
+            [TextReplacement(from_text="aaa", to_text="updated")],
+            "matched multiple locations",
+        ),
+        (
+            "first\n",
+            [TextReplacement(to_text="draft"), TextReplacement(from_text="first", to_text="final")],
+            "whole-file replacement cannot",
+        ),
+    ],
+)
+def test_snapshot_edits_are_rejected_before_any_file_is_written(
+    workspace_tmp_path: Path,
+    original: str,
+    replacements: list[TextReplacement],
+    reason: str,
+) -> None:
+    target = workspace_tmp_path / "notes.txt"
+    target.write_text(original, encoding="utf-8", newline="\n")
+    created = workspace_tmp_path / "created.txt"
+    patches = [
+        ApplyPatch(path=created, replacements=[TextReplacement(to_text="new file")]),
+        ApplyPatch(path=target, replacements=replacements, match_original=True),
+    ]
+
+    with pytest.raises(TextReplacementApplyError, match=reason):
+        apply_patches(workspace_tmp_path, patches)
+
+    assert target.read_text(encoding="utf-8") == original
+    assert not created.exists()
+
+
+def test_snapshot_edits_allow_adjacent_deletions_and_whole_file_creation() -> None:
+    patch = ApplyPatch(
+        path=Path("notes.txt"),
+        match_original=True,
+        replacements=[
+            TextReplacement(from_text="first", to_text=""),
+            TextReplacement(from_text="second", to_text=""),
+        ],
+    )
+    assert patch.apply("firstsecond") == ""
+    assert (
+        ApplyPatch(
+            path=Path("new.txt"),
+            match_original=True,
+            replacements=[TextReplacement(to_text="whole file")],
+        ).apply(None)
+        == "whole file"
+    )
 
 
 def test_preview_apply_patches_combines_operations_without_writing(
@@ -116,3 +221,24 @@ def test_apply_patches_skips_equivalent_replacement(workspace_tmp_path: Path) ->
 
     assert written == []
     assert target.read_bytes() == b"same\r\ntext\r\n"
+
+
+class _PatchOutput(BaseModel, ApplyPatchOutput):
+    content: str
+
+    def to_apply_patches(self) -> list[ApplyPatch]:
+        return [
+            ApplyPatch(
+                path=Path("note.md"),
+                replacements=[TextReplacement(to_text=self.content)],
+            )
+        ]
+
+
+def test_apply_patch_output_writes_converted_patches(workspace_tmp_path: Path) -> None:
+    target = workspace_tmp_path / "note.md"
+
+    written = apply_patch_output(workspace_tmp_path, _PatchOutput(content="# Note\n"))
+
+    assert written == [target.resolve()]
+    assert target.read_text(encoding="utf-8") == "# Note\n"
