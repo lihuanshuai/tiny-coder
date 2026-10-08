@@ -9,9 +9,13 @@ import pytest
 from pydantic import BaseModel
 
 from tiny_coder.graph import GraphError
-from tiny_coder.llm import LlmChatOutcome, LlmConfig, ToolCall
+from tiny_coder.llm import LlmChatOutcome, LlmConfig, LlmExchange, ToolCall
 from tiny_coder.state import State
 from tiny_coder.structured_agent import (
+    AFTER_CALL,
+    BEFORE_CALL,
+    CALL_FAILED,
+    EXCHANGE_RECEIVED,
     AgentCall,
     StructuredInput,
     StructuredResult,
@@ -265,28 +269,29 @@ def test_create_structured_agent_without_tools_sends_none(
     assert seen_tools == [None]
 
 
-def test_create_structured_agent_forwards_on_exchange(
+def test_structured_agent_publishes_exchanges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    seen: list[Any] = []
+    seen: list[LlmExchange] = []
+    exchange = LlmExchange(messages=[], response=_outcome(text='{"name": "a", "count": 1}'))
 
     async def recording_fake(*, on_exchange: Any, **_kwargs: Any) -> LlmChatOutcome:
-        seen.append(on_exchange)
+        await on_exchange(exchange)
         return _outcome(text='{"name": "a", "count": 1}')
 
     monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", recording_fake)
 
-    async def recorder(exchange: Any) -> None:
-        _ = exchange
+    async def recorder(exchange: LlmExchange) -> None:
+        seen.append(exchange)
 
     agent = create_structured_agent(
         llm_config=SampleLlmConfig(),
         response_model=SampleStructured,
-        on_exchange=recorder,
     )
+    agent.events.subscribe(EXCHANGE_RECEIVED, recorder)
     asyncio.run(agent.invoke(StructuredInput(prompt="go")))
 
-    assert seen == [recorder]
+    assert seen == [exchange]
 
 
 def test_hooks_prepare_validate_and_retry_with_updated_config(
@@ -326,9 +331,9 @@ def test_hooks_prepare_validate_and_retry_with_updated_config(
         failures.append(call.outcome.text)
         call.retry = True
 
-    agent.add_hook("before_call", prepare)
-    agent.add_hook("after_call", validate)
-    agent.add_hook("on_error", retry)
+    agent.events.subscribe(BEFORE_CALL, prepare)
+    agent.events.subscribe(AFTER_CALL, validate)
+    agent.events.subscribe(CALL_FAILED, retry)
     result = asyncio.run(agent.invoke(StructuredInput()))
 
     assert result.model(SampleStructured) == SampleStructured(name="done", count=1)
@@ -365,8 +370,8 @@ def test_error_hook_appends_feedback_after_the_rejected_response(
         call.messages.append({"role": "user", "content": str(call.error)})
         call.retry = True
 
-    agent.add_hook("after_call", validate)
-    agent.add_hook("on_error", retry)
+    agent.events.subscribe(AFTER_CALL, validate)
+    agent.events.subscribe(CALL_FAILED, retry)
     result = asyncio.run(agent.invoke(StructuredInput(prompt="go")))
 
     assert requests[1][-2:] == [
@@ -401,7 +406,7 @@ def test_hook_loop_preserves_tool_results_and_json_checkpoint(
         assert call.outcome is not None
         call.retry = "interim" in call.outcome.text
 
-    agent.add_hook("after_call", continue_after_interim)
+    agent.events.subscribe(AFTER_CALL, continue_after_interim)
     result = asyncio.run(agent.invoke(StructuredInput(prompt="go")))
     checkpoint = asyncio.run(checkpointer.load())
 
@@ -427,7 +432,7 @@ def test_hook_loop_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
         attempts.append(call.attempt)
         call.retry = True
 
-    agent.add_hook("after_call", keep_going)
+    agent.events.subscribe(AFTER_CALL, keep_going)
     with pytest.raises(GraphError, match="max_steps=2"):
         asyncio.run(agent.invoke(StructuredInput(prompt="go")))
     assert attempts == [1, 2]
@@ -462,8 +467,8 @@ def test_hooks_are_ordered_and_call_contexts_are_isolated(monkeypatch: pytest.Mo
     async def second(call: AgentCall) -> None:
         events.append(("second", call.messages[-1]["content"], call.attempt))
 
-    agent.add_hook("before_call", first)
-    agent.add_hook("before_call", second)
+    agent.events.subscribe(BEFORE_CALL, first)
+    agent.events.subscribe(BEFORE_CALL, second)
 
     async def run() -> list[StructuredResult]:
         return list(
@@ -523,7 +528,7 @@ def test_repeated_invocations_reset_overrides_and_attempts(monkeypatch: pytest.M
         if call.outcome.text == "invalid":
             call.retry = True
 
-    agent.add_hook("after_call", validate)
+    agent.events.subscribe(AFTER_CALL, validate)
 
     async def run() -> None:
         results.append(
@@ -595,7 +600,7 @@ def test_concurrent_runs_keep_schemas_separate_with_a_shared_budget(
         assert call.outcome is not None
         call.retry = '"echo"' in call.outcome.text and call.attempt == 1
 
-    agent.add_hook("after_call", continue_echo)
+    agent.events.subscribe(AFTER_CALL, continue_echo)
 
     async def run() -> list[StructuredResult]:
         return list(

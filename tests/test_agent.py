@@ -8,9 +8,10 @@ from typing import Any
 import pytest
 from test_structured_agent import SampleLlmConfig, SampleStructured, _outcome
 
-from tiny_coder.agent import Agent
+from tiny_coder.agent import Agent, Invocation
 from tiny_coder.llm import LlmChatOutcome
 from tiny_coder.structured_agent import (
+    AFTER_CALL,
     AgentCall,
     StructuredAgent,
     StructuredInput,
@@ -21,6 +22,62 @@ from tiny_coder.structured_agent import (
 class Double(Agent[int, int]):
     async def _invoke(self, prompt: int) -> int:
         return prompt * 2
+
+
+def test_invoke_and_send_publish_completed_tasks_on_each_agents_bus() -> None:
+    observed: list[tuple[int, int]] = []
+
+    async def receive(invocation: Invocation[int, int]) -> None:
+        observed.append((invocation.input, invocation.output))
+
+    async def run() -> None:
+        async with Main() as parent:
+            child = parent.spawn("calculator", Double)
+            child.events.subscribe(child.invoked, receive)
+            assert await parent.invoke(3) == 7
+            assert await parent.send(4) == 9
+            assert observed == [(3, 6), (4, 8)]
+            assert parent.spawn("calculator", Double) is child
+            assert child.events is not parent.events
+
+    asyncio.run(run())
+
+
+def test_completion_subscriber_can_dispatch_and_await_a_reused_sibling() -> None:
+    reviewed: list[int] = []
+
+    async def run() -> None:
+        async with Agent[int, int]() as main:
+            writer = main.spawn("writer", Double)
+            reviewer = main.spawn("reviewer", Double)
+
+            async def review(invocation: Invocation[int, int]) -> None:
+                reviewed.append(await reviewer.send(invocation.output))
+
+            writer.events.subscribe(writer.invoked, review)
+            assert await writer.send(3) == 6
+            assert reviewed == [12]
+            assert await writer.invoke(4) == 8
+            assert reviewed == [12, 16]
+            assert main.spawn("reviewer", Double) is reviewer
+
+    asyncio.run(run())
+
+
+def test_completion_subscribers_keep_child_restrictions() -> None:
+    async def run() -> None:
+        async with Agent[int, int]() as main:
+            child = main.spawn("writer", Double)
+
+            async def spawn(invocation: Invocation[int, int]) -> None:
+                main.spawn("forbidden", Double)
+
+            child.events.subscribe(child.invoked, spawn)
+            with pytest.raises(RuntimeError, match="child agents cannot spawn"):
+                await child.invoke(3)
+            assert tuple(main.children) == ("writer",)
+
+    asyncio.run(run())
 
 
 @dataclass
@@ -292,7 +349,7 @@ def test_invoke_and_send_accept_the_same_input_for_all_agents(
 
     def factory() -> StructuredAgent:
         child = create_structured_agent(llm_config=SampleLlmConfig(), max_steps=1)
-        child.add_hook("after_call", observe)
+        child.events.subscribe(AFTER_CALL, observe)
         return child
 
     async def run() -> None:

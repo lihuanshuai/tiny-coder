@@ -198,14 +198,15 @@ OpenAI-compatible server supports both together. If a server rejects the combina
 structured-output-only agent or a manual `Graph` where tool rounds and the final structured call
 are separate nodes.
 
-Register async hooks with `agent.add_hook(event, hook)`. Events are `before_call`, `after_call`,
-`on_error`, and `on_chunk`; hooks for each event run in registration order and receive an `AgentCall`.
-Before-call hooks may update `messages`, `system_prompt`, and `llm_config`. After-call hooks
-can inspect `outcome`; error hooks receive `error` and any completed outcome. Set `call.retry`
-to request another LLM call. Errors propagate unless an error hook requests a retry.
+Register async subscribers with `agent.events.subscribe(event, handler)`. Typed event keys
+`BEFORE_CALL`, `AFTER_CALL`, `CALL_FAILED`, and `CHUNK_RECEIVED` carry an `AgentCall`.
+Subscribers run in registration order and are awaited. Before-call subscribers may update
+`messages`, `system_prompt`, and `llm_config`. After-call subscribers inspect `outcome`;
+failure subscribers receive `error` and any completed outcome. Set `call.retry` to request
+another LLM call. Errors propagate unless a failure subscriber requests a retry.
 
 ```python
-from tiny_coder.structured_agent import AgentCall
+from tiny_coder.structured_agent import AFTER_CALL, CALL_FAILED, AgentCall
 
 
 async def validate(call: AgentCall) -> None:
@@ -220,16 +221,21 @@ async def retry_validation(call: AgentCall) -> None:
         call.retry = True
 
 
-agent.add_hook("after_call", validate)
-agent.add_hook("on_error", retry_validation)
+agent.events.subscribe(AFTER_CALL, validate)
+agent.events.subscribe(CALL_FAILED, retry_validation)
 ```
 
-A before-call hook can supply messages for `agent.invoke(StructuredInput())` without a prompt.
-Hook contexts and attempt counters are local to each invocation. Custom values placed
+A before-call subscriber can supply messages for `agent.invoke(StructuredInput())` without a prompt.
+Call contexts and attempt counters are local to each invocation. Custom values placed
 in `call.state` must be JSON-compatible when checkpointing.
 
-`max_steps` (default `100`) bounds both LLM calls and tool-node executions, including hook-requested
+`max_steps` (default `100`) bounds both LLM calls and tool-node executions, including subscriber-requested
 retries, and raises `GraphError` when exceeded.
+
+`CALL_STARTED` runs before preparation. Register attempt resources with
+`call.resources.enter_context(...)` or `call.resources.callback(...)`; they are released
+before failure dispatch, including on cancellation. Subscribe to `EXCHANGE_RECEIVED`
+for raw `LlmExchange` records. Stream and exchange callbacks on the LLM API are unchanged.
 
 ## Agent Communication
 
@@ -262,12 +268,15 @@ async def main():
 agent can inherit `Agent` and reuse a structured agent in its `_invoke` method. Each invocation
 retains its own configuration, schema, and retry state. Keep the main agent open across tasks
 to reuse its children. Closing it cancels and joins outstanding work in itself and its children.
+Each agent owns an `EventBus`. `invoke` dispatches through that bus, then publishes
+`agent.invoked` with an `Invocation` containing `input` and `output`. Subscribers can await
+another agent's work. `send` uses the same dispatch with serial scheduling.
 
 ## Composable Capabilities
 
 Pass `extensions=(...)` to `create_structured_agent` to register capabilities once, or compose
-them during setup with `agent.use(*extensions)`. Hooks run in registration order. Each extension must inherit
-`AgentExtension` and implement `register(hooks: AgentHooks)` to register its async hooks.
+them during setup with `agent.use(*extensions)`. Subscribers run in registration order. Each extension must inherit
+`AgentExtension` and implement `register(events: EventBus)` to subscribe its async handlers.
 Registration rejects objects that do not inherit `AgentExtension` with `TypeError`.
 
 The capabilities in `tiny_coder.agent_extensions` can be used independently:

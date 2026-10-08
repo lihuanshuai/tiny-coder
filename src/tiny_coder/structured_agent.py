@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeAlias, TypeVar
+from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
 from tiny_coder.agent import Agent
 from tiny_coder.checkpoint import Checkpointer
+from tiny_coder.eventbus import Event, EventBus
 from tiny_coder.graph import END, Graph
 from tiny_coder.llm import (
     LlmChatOutcome,
@@ -35,14 +36,12 @@ _RETRY_KEY = "_retry"
 _RESPONSE_FORMAT_KEY = "_response_format"
 _SYSTEM_PROMPT_KEY = "_system_prompt"
 
-HookEvent: TypeAlias = Literal["before_call", "after_call", "on_error", "on_chunk"]
-
 
 @dataclass
 class AgentCall:
     """One call's mutable request and loop decision, local to an invocation.
 
-    Hooks may replace messages/config before a call; afterward, messages include
+    Subscribers may replace messages/config before a call; afterward, messages include
     the assistant response. Set retry=True to request another call. State is shared
     with tool handlers;
     keep custom state values JSON-compatible when using a checkpointer.
@@ -63,10 +62,15 @@ class AgentCall:
     previous_outcome: LlmChatOutcome | None = None
     feedback: list[str] = field(default_factory=list)
     chunk: str = ""
+    resources: ExitStack = field(default_factory=ExitStack, repr=False)
 
 
-AgentHook: TypeAlias = Callable[[AgentCall], Awaitable[None]]
-AgentScope: TypeAlias = Callable[[AgentCall], AbstractContextManager[None]]
+CALL_STARTED = Event[AgentCall]("llm.call_started")
+BEFORE_CALL = Event[AgentCall]("llm.before_call")
+AFTER_CALL = Event[AgentCall]("llm.after_call")
+CALL_FAILED = Event[AgentCall]("llm.call_failed")
+CHUNK_RECEIVED = Event[AgentCall]("llm.chunk_received")
+EXCHANGE_RECEIVED = Event[LlmExchange]("llm.exchange_received")
 
 
 @dataclass(frozen=True)
@@ -105,56 +109,8 @@ class AgentExtension(ABC):
     """Base class for composable agent capabilities."""
 
     @abstractmethod
-    def register(self, hooks: AgentHooks) -> None:
-        """Register this capability's hooks."""
-
-
-class AgentHooks:
-    """Ordered hook registration shared by agents and their extensions."""
-
-    def __init__(self) -> None:
-        self._hooks: dict[HookEvent, list[AgentHook]] = {
-            "before_call": [],
-            "after_call": [],
-            "on_error": [],
-            "on_chunk": [],
-        }
-        self._scopes: list[AgentScope] = []
-
-    def add_hook(self, event: HookEvent, hook: AgentHook) -> None:
-        if event not in self._hooks:
-            raise ValueError(f"unknown hook event: {event!r}")
-        self._hooks[event].append(hook)
-
-    def add_scope(self, scope: AgentScope) -> None:
-        """Manage extension state for each LLM attempt, including cancellation."""
-        self._scopes.append(scope)
-
-    @contextmanager
-    def scope(self, call: AgentCall) -> Iterator[None]:
-        with ExitStack() as stack:
-            for scope in self._scopes:
-                stack.enter_context(scope(call))
-            yield
-
-    def use(self, *extensions: AgentExtension) -> None:
-        for extension in extensions:
-            if not isinstance(extension, AgentExtension):
-                raise TypeError("extensions must be AgentExtension instances")
-            extension.register(self)
-
-    def copy(self) -> AgentHooks:
-        copied = AgentHooks()
-        copied._hooks = {event: list(hooks) for event, hooks in self._hooks.items()}
-        copied._scopes = list(self._scopes)
-        return copied
-
-    def has(self, event: HookEvent) -> bool:
-        return bool(self._hooks[event])
-
-    async def emit(self, event: HookEvent, call: AgentCall) -> None:
-        for hook in tuple(self._hooks[event]):
-            await hook(call)
+    def register(self, events: EventBus) -> None:
+        """Subscribe this capability to agent events."""
 
 
 @dataclass
@@ -171,7 +127,6 @@ class StructuredInput:
 
 @dataclass
 class _Invocation:
-    hooks: AgentHooks
     response_model: type[BaseModel] | None
     context: object | None
     feedback: list[str] = field(default_factory=list)
@@ -188,22 +143,18 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     tools: list[Tool] = field(default_factory=list)
     checkpointer: Checkpointer | None = None
-    on_chunk: Callable[[str], Awaitable[None]] | None = None
-    on_exchange: Callable[[LlmExchange], Awaitable[None]] | None = None
-    _hooks: AgentHooks = field(default_factory=AgentHooks, init=False, repr=False)
     _invocation: ContextVar[_Invocation | None] = field(
         default_factory=lambda: ContextVar("structured_agent_invocation", default=None),
         init=False,
         repr=False,
     )
 
-    def add_hook(self, event: HookEvent, hook: AgentHook) -> None:
-        """Register an async hook in execution order."""
-        self._hooks.add_hook(event, hook)
-
     def use(self, *extensions: AgentExtension) -> StructuredAgent:
         """Compose capabilities for all future invocations."""
-        self._hooks.use(*extensions)
+        for extension in extensions:
+            if not isinstance(extension, AgentExtension):
+                raise TypeError("extensions must be AgentExtension instances")
+            extension.register(self.events)
         return self
 
     async def _emit_chunk(self, chunk: str) -> None:
@@ -211,9 +162,10 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
         assert invocation is not None and invocation.call is not None
         call = invocation.call
         call.chunk = chunk
-        await invocation.hooks.emit("on_chunk", call)
-        if self.on_chunk is not None:
-            await self.on_chunk(chunk)
+        await self.events.emit(CHUNK_RECEIVED, call)
+
+    async def _emit_exchange(self, exchange: LlmExchange) -> None:
+        await self.events.emit(EXCHANGE_RECEIVED, exchange)
 
     async def _invoke(self, input: StructuredInput) -> StructuredResult:
         """Invoke this agent with fresh messages and retry state.
@@ -221,28 +173,13 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
         Omitted options inherit the agent's defaults. Repeated invocations reuse
         the graph. Use spawn/send for child agents and scheduled invocations.
         """
-        hooks = self._hooks.copy()
-        history = [dict(message) for message in input.messages]
-        if input.prompt:
-            history.append({"role": "user", "content": input.prompt})
-        if not history and not hooks.has("before_call"):
-            raise ValueError("prompt or messages is required")
-        config = input.llm_config or self.llm_config
         model = input.response_model or self.response_model
-        invocation = _Invocation(hooks=hooks, response_model=model, context=input.context)
+        initial = self._initial_state(input, model)
+        invocation = _Invocation(response_model=model, context=input.context)
         token = self._invocation.set(invocation)
         try:
             state = await self.graph.run(
-                {
-                    "messages": history,
-                    _LLM_CONFIG_KEY: config.model_dump(),
-                    _RESPONSE_FORMAT_KEY: schema_response_format(model)
-                    if model is not None
-                    else None,
-                    _SYSTEM_PROMPT_KEY: self.system_prompt
-                    if input.system_prompt is None
-                    else input.system_prompt,
-                },
+                initial,
                 checkpointer=self.checkpointer,
             )
             call = invocation.call
@@ -254,7 +191,35 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
         finally:
             self._invocation.reset(token)
 
+    def _initial_state(self, input: StructuredInput, model: type[BaseModel] | None) -> State:
+        history = [dict(message) for message in input.messages]
+        if input.prompt:
+            history.append({"role": "user", "content": input.prompt})
+        if not history and not self.events.has_subscribers(BEFORE_CALL):
+            raise ValueError("prompt or messages is required")
+        config = input.llm_config or self.llm_config
+        return {
+            "messages": history,
+            _LLM_CONFIG_KEY: config.model_dump(),
+            _RESPONSE_FORMAT_KEY: schema_response_format(model) if model is not None else None,
+            _SYSTEM_PROMPT_KEY: self.system_prompt
+            if input.system_prompt is None
+            else input.system_prompt,
+        }
+
     async def _call(self, state: State) -> dict[str, Any]:
+        call = self._create_call(state)
+        await self._run_call(call)
+        state["messages"] = call.messages
+        return {
+            _LLM_CONFIG_KEY: call.llm_config.model_dump(),
+            _ATTEMPT_KEY: call.attempt,
+            _RETRY_KEY: call.retry,
+            _RESPONSE_FORMAT_KEY: call.response_format,
+            _SYSTEM_PROMPT_KEY: call.system_prompt,
+        }
+
+    def _create_call(self, state: State) -> AgentCall:
         invocation = self._invocation.get()
         assert invocation is not None
         previous_outcome = invocation.call.outcome if invocation.call is not None else None
@@ -273,36 +238,37 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
             feedback=invocation.feedback,
         )
         invocation.call = call
+        return call
+
+    async def _run_call(self, call: AgentCall) -> None:
+        """Run the ordered lifecycle; release resources before dispatching failures."""
         try:
-            with invocation.hooks.scope(call):
-                await invocation.hooks.emit("before_call", call)
-                if not call.messages:
-                    raise ValueError("prompt or messages is required")
-                call.outcome = await stream_llm_chat(
-                    llm_cfg=call.llm_config,
-                    messages=[{"role": "system", "content": call.system_prompt}, *call.messages],
-                    tools=self.tools or None,
-                    response_format=call.response_format,
-                    on_chunk=self._emit_chunk
-                    if self.on_chunk is not None or invocation.hooks.has("on_chunk")
-                    else None,
-                    on_exchange=self.on_exchange,
-                )
+            with call.resources:
+                await self.events.emit(CALL_STARTED, call)
+                await self.events.emit(BEFORE_CALL, call)
+                call.outcome = await self._complete(call)
                 call.messages.append(call.outcome.message)
-                await invocation.hooks.emit("after_call", call)
+                await self.events.emit(AFTER_CALL, call)
         except Exception as error:
             call.error = error
-            await invocation.hooks.emit("on_error", call)
+            await self.events.emit(CALL_FAILED, call)
             if not call.retry:
                 raise
-        state["messages"] = call.messages
-        return {
-            _LLM_CONFIG_KEY: call.llm_config.model_dump(),
-            _ATTEMPT_KEY: call.attempt,
-            _RETRY_KEY: call.retry,
-            _RESPONSE_FORMAT_KEY: call.response_format,
-            _SYSTEM_PROMPT_KEY: call.system_prompt,
-        }
+
+    async def _complete(self, call: AgentCall) -> LlmChatOutcome:
+        """Translate a prepared call to the LLM transport and publish streamed data."""
+        if not call.messages:
+            raise ValueError("prompt or messages is required")
+        return await stream_llm_chat(
+            llm_cfg=call.llm_config,
+            messages=[{"role": "system", "content": call.system_prompt}, *call.messages],
+            tools=self.tools or None,
+            response_format=call.response_format,
+            on_chunk=self._emit_chunk if self.events.has_subscribers(CHUNK_RECEIVED) else None,
+            on_exchange=self._emit_exchange
+            if self.events.has_subscribers(EXCHANGE_RECEIVED)
+            else None,
+        )
 
     def _route(self, state: State) -> str:
         if state.get(_RETRY_KEY):
@@ -318,8 +284,6 @@ def create_structured_agent(
     tools: Sequence[Tool] | None = None,
     checkpointer: Checkpointer | None = None,
     max_steps: int = 100,
-    on_chunk: Callable[[str], Awaitable[None]] | None = None,
-    on_exchange: Callable[[LlmExchange], Awaitable[None]] | None = None,
     extensions: Sequence[AgentExtension] = (),
 ) -> StructuredAgent:
     """Build an agent that returns one structured response, or routes tool calls when tools are given.
@@ -327,7 +291,7 @@ def create_structured_agent(
     Set ``response_model`` to force JSON schema output. When tools are configured and no
     response model is set, the run is a pure tool loop whose results arrive through the
     tool handlers, so the server is not forced into structured output on every turn.
-    Register hooks with ``agent.add_hook``. A hook's ``call.retry`` requests another
+    Subscribe through ``agent.events``. A subscriber's ``call.retry`` requests another
     LLM call; ``max_steps`` bounds both these calls and tool-node executions.
     """
     if max_steps < 1:
@@ -341,8 +305,6 @@ def create_structured_agent(
         system_prompt=system_prompt,
         tools=resolved_tools,
         checkpointer=checkpointer,
-        on_chunk=on_chunk,
-        on_exchange=on_exchange,
     )
     graph.add_node("llm", agent._call)
     if resolved_tools:
@@ -376,10 +338,12 @@ __all__ = [
     "DEFAULT_SYSTEM_PROMPT",
     "AgentCall",
     "AgentExtension",
-    "AgentHooks",
-    "AgentHook",
-    "AgentScope",
-    "HookEvent",
+    "CALL_STARTED",
+    "BEFORE_CALL",
+    "AFTER_CALL",
+    "CALL_FAILED",
+    "CHUNK_RECEIVED",
+    "EXCHANGE_RECEIVED",
     "StructuredAgent",
     "StructuredInput",
     "StructuredResult",

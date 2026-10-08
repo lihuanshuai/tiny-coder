@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -15,9 +14,18 @@ from openai import APIConnectionError, APITimeoutError, InternalServerError, Rat
 from pydantic import BaseModel, ValidationError
 
 from tiny_coder.apply_patch import resolve_agent_file_path, resolve_agent_root
+from tiny_coder.eventbus import EventBus
 from tiny_coder.json_utils import JsonStringFieldStreamer
 from tiny_coder.llm import LlmConfig
-from tiny_coder.structured_agent import AgentCall, AgentExtension, AgentHooks
+from tiny_coder.structured_agent import (
+    AFTER_CALL,
+    BEFORE_CALL,
+    CALL_FAILED,
+    CALL_STARTED,
+    CHUNK_RECEIVED,
+    AgentCall,
+    AgentExtension,
+)
 
 _T = TypeVar("_T")
 
@@ -66,8 +74,8 @@ class JinjaPrompt(AgentExtension):
         default_factory=dict
     )
 
-    def register(self, hooks: AgentHooks) -> None:
-        hooks.add_hook("before_call", self.prepare)
+    def register(self, events: EventBus) -> None:
+        events.subscribe(BEFORE_CALL, self.prepare)
 
     async def prepare(self, call: AgentCall) -> None:
         source = _resolve(self.variables, call)
@@ -113,13 +121,12 @@ class StreamOutput(AgentExtension):
         if isinstance(self.max_chars, int) and self.max_chars < 0:
             raise ValueError("max_chars must not be negative")
 
-    def register(self, hooks: AgentHooks) -> None:
-        hooks.add_scope(self.scope)
-        hooks.add_hook("on_chunk", self.feed)
-        hooks.add_hook("after_call", self.finish)
+    def register(self, events: EventBus) -> None:
+        events.subscribe(CALL_STARTED, self.start)
+        events.subscribe(CHUNK_RECEIVED, self.feed)
+        events.subscribe(AFTER_CALL, self.finish)
 
-    @contextmanager
-    def scope(self, call: AgentCall) -> Iterator[None]:
+    async def start(self, call: AgentCall) -> None:
         field = _resolve(self.field, call)
         max_chars = _resolve(self.max_chars, call)
         if max_chars is not None and max_chars < 0:
@@ -131,10 +138,7 @@ class StreamOutput(AgentExtension):
                 self.sink if _resolve(self.enabled, call) else None,
             )
         )
-        try:
-            yield
-        finally:
-            self._stream.reset(token)
+        call.resources.callback(self._stream.reset, token)
 
     async def feed(self, call: AgentCall) -> None:
         stream = self._stream.get()
@@ -163,8 +167,8 @@ class StructuredOutput(AgentExtension):
 
     accept: Callable[[AgentCall, BaseModel], Awaitable[None]] | None = None
 
-    def register(self, hooks: AgentHooks) -> None:
-        hooks.add_hook("after_call", self.parse)
+    def register(self, events: EventBus) -> None:
+        events.subscribe(AFTER_CALL, self.parse)
 
     async def parse(self, call: AgentCall) -> None:
         assert call.outcome is not None
@@ -192,8 +196,8 @@ class CallRecording(AgentExtension):
         default_factory=dict
     )
 
-    def register(self, hooks: AgentHooks) -> None:
-        hooks.add_hook("after_call", self.record)
+    def register(self, events: EventBus) -> None:
+        events.subscribe(AFTER_CALL, self.record)
 
     async def record(self, call: AgentCall) -> None:
         assert call.outcome is not None
@@ -230,9 +234,9 @@ class RetryPolicy(AgentExtension):
         if isinstance(self.max_attempts, int) and self.max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
 
-    def register(self, hooks: AgentHooks) -> None:
-        hooks.add_hook("before_call", self.configure)
-        hooks.add_hook("on_error", self.retry)
+    def register(self, events: EventBus) -> None:
+        events.subscribe(BEFORE_CALL, self.configure)
+        events.subscribe(CALL_FAILED, self.retry)
 
     async def configure(self, call: AgentCall) -> None:
         self._attempt_limit(call)

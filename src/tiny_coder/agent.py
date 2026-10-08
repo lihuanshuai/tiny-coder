@@ -7,10 +7,20 @@ from dataclasses import dataclass, field
 from types import MappingProxyType, TracebackType
 from typing import Generic, Self, TypeVar, final
 
+from tiny_coder.eventbus import Event, EventBus
+
 InputT = TypeVar("InputT")
 OutputT = TypeVar("OutputT")
 
 _CHILD_RUNNING: ContextVar[bool] = ContextVar("child_agent_running", default=False)
+
+
+@dataclass(eq=False)
+class Invocation(Generic[InputT, OutputT]):
+    """One input and its output, populated by the agent's event handler."""
+
+    input: InputT
+    output: OutputT = field(init=False, repr=False)
 
 
 @dataclass(eq=False, repr=False)
@@ -18,6 +28,13 @@ class Agent(Generic[InputT, OutputT]):
     """An invokable agent that owns reusable, serially scheduled child agents."""
 
     name: str = field(default="main", init=False, repr=False, compare=False)
+    events: EventBus = field(default_factory=EventBus, init=False, repr=False, compare=False)
+    invoked: Event[Invocation[InputT, OutputT]] = field(
+        default_factory=lambda: Event("agent.invoked"), init=False, repr=False, compare=False
+    )
+    _invoke_event: Event[Invocation[InputT, OutputT]] = field(
+        default_factory=lambda: Event("agent.invoke"), init=False, repr=False, compare=False
+    )
     _parent: Agent[InputT, OutputT] | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -29,6 +46,9 @@ class Agent(Generic[InputT, OutputT]):
     )
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False, compare=False)
     _closed: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self.events.subscribe(self._invoke_event, self._receive)
 
     async def __aenter__(self) -> Self:
         self._ensure_open()
@@ -49,10 +69,16 @@ class Agent(Generic[InputT, OutputT]):
     @final
     async def invoke(self, input: InputT) -> OutputT:
         """Execute one input with the agent's lifecycle and child restrictions."""
+        invocation = Invocation[InputT, OutputT](input)
+        await self.events.emit(self._invoke_event, invocation)
+        return invocation.output
+
+    async def _receive(self, invocation: Invocation[InputT, OutputT]) -> None:
         self._ensure_open()
         token = _CHILD_RUNNING.set(self._parent is not None or _CHILD_RUNNING.get())
         try:
-            return await self._invoke(input)
+            invocation.output = await self._invoke(invocation.input)
+            await self.events.emit(self.invoked, invocation)
         finally:
             _CHILD_RUNNING.reset(token)
 
@@ -114,4 +140,4 @@ class Agent(Generic[InputT, OutputT]):
             raise RuntimeError("agent is closed")
 
 
-__all__ = ["Agent"]
+__all__ = ["Agent", "Invocation"]

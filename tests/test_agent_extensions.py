@@ -27,11 +27,16 @@ from tiny_coder.agent_extensions import (
     read_file_snapshots,
 )
 from tiny_coder.checkpoint import JsonCheckpointer
+from tiny_coder.eventbus import EventBus
 from tiny_coder.llm import LlmChatOutcome
 from tiny_coder.structured_agent import (
+    AFTER_CALL,
+    BEFORE_CALL,
+    CALL_FAILED,
+    CALL_STARTED,
+    CHUNK_RECEIVED,
     AgentCall,
     AgentExtension,
-    AgentHooks,
     StructuredInput,
     create_structured_agent,
 )
@@ -169,9 +174,9 @@ class Events(AgentExtension):
     name: str
     events: list[str]
 
-    def register(self, hooks: AgentHooks) -> None:
-        hooks.add_hook("before_call", self.before)
-        hooks.add_hook("after_call", self.after)
+    def register(self, events: EventBus) -> None:
+        events.subscribe(BEFORE_CALL, self.before)
+        events.subscribe(AFTER_CALL, self.after)
 
     async def before(self, call: AgentCall) -> None:
         self.events.append(f"{self.name}:before:{call.context}")
@@ -187,8 +192,11 @@ class ScopedResource(AgentExtension):
     events: list[str]
     fail_on_enter: bool = False
 
-    def register(self, hooks: AgentHooks) -> None:
-        hooks.add_scope(self.scope)
+    def register(self, events: EventBus) -> None:
+        events.subscribe(CALL_STARTED, self.start)
+
+    async def start(self, call: AgentCall) -> None:
+        call.resources.enter_context(self.scope(call))
 
     @contextmanager
     def scope(self, call: AgentCall) -> Iterator[None]:
@@ -235,7 +243,7 @@ def test_call_scopes_unwind_before_error_hooks_and_can_be_reused(
             ScopedResource("inner", active, events, fail_on_enter=failure == "scope"),
         ),
     )
-    agent.add_hook("on_error", retry)
+    agent.events.subscribe(CALL_FAILED, retry)
 
     async def run() -> None:
         if failure == "cancel":
@@ -258,7 +266,7 @@ def test_extension_requires_register_implementation() -> None:
 @pytest.mark.parametrize("entrypoint", ["use", "factory"])
 def test_registration_rejects_duck_typed_extensions(entrypoint: str) -> None:
     class DuckExtension:
-        def register(self, hooks: AgentHooks) -> None:
+        def register(self, events: EventBus) -> None:
             raise AssertionError("invalid extension must not be registered")
 
     agent = create_structured_agent(llm_config=SampleLlmConfig())
@@ -515,7 +523,7 @@ def test_nested_invocation_preserves_the_outer_stream(monkeypatch: pytest.Monkey
             result = await agent.invoke(StructuredInput(prompt="inner"))
             assert result.model(Output) == Output(summary="inner")
 
-    agent.add_hook("on_chunk", invoke_inner)
+    agent.events.subscribe(CHUNK_RECEIVED, invoke_inner)
     result = asyncio.run(agent.invoke(StructuredInput(prompt="outer", context="outer")))
     assert result.model(Output) == Output(summary="outer")
     assert chunks == ["out", "inner", "\n", "er", "\n"]
@@ -542,7 +550,7 @@ def test_stream_extension_does_not_retain_finished_calls(
     agent = create_structured_agent(
         llm_config=SampleLlmConfig(), extensions=(StreamOutput(sink=None),)
     )
-    agent.add_hook("before_call", observe)
+    agent.events.subscribe(BEFORE_CALL, observe)
 
     async def run() -> None:
         if termination == "success":
