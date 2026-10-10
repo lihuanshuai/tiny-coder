@@ -60,6 +60,7 @@ class AgentCall:
     output: BaseModel | None = None
     context: object | None = None
     previous_outcome: LlmChatOutcome | None = None
+    previous_error: Exception | None = None
     feedback: list[str] = field(default_factory=list)
     chunk: str = ""
     resources: ExitStack = field(default_factory=ExitStack, repr=False)
@@ -223,6 +224,7 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
         invocation = self._invocation.get()
         assert invocation is not None
         previous_outcome = invocation.call.outcome if invocation.call is not None else None
+        previous_error = invocation.call.error if invocation.call is not None else None
         messages = state.get("messages")
         history = messages if isinstance(messages, list) else []
         call = AgentCall(
@@ -235,6 +237,7 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
             response_model=invocation.response_model,
             context=invocation.context,
             previous_outcome=previous_outcome,
+            previous_error=previous_error,
             feedback=invocation.feedback,
         )
         invocation.call = call

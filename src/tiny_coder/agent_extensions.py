@@ -7,11 +7,12 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path
-from typing import TypedDict, TypeVar
+from typing import NoReturn, TypedDict, TypeVar
 
 from jinja2 import Template
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from pydantic import BaseModel, ValidationError
+from pydantic_core import ErrorDetails
 
 from tiny_coder.apply_patch import resolve_agent_file_path, resolve_agent_root
 from tiny_coder.eventbus import EventBus
@@ -28,6 +29,69 @@ from tiny_coder.structured_agent import (
 )
 
 _T = TypeVar("_T")
+
+
+class ResponseValidationError(ValueError):
+    """A rejected response with actionable guidance for the next attempt."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        suggestion: str = (
+            "根据字段错误逐项修正上一份结果，保留已满足的约束；"
+            "重新校验后提交完整 JSON 对象，不要只返回修改说明、局部字段或原样重复无效内容。"
+        ),
+    ) -> None:
+        self.message = message
+        self.suggestion = suggestion
+        super().__init__(f"{message}\n响应建议：{suggestion}")
+
+
+def _response_suggestion(error: Exception) -> str:
+    if isinstance(error, ResponseValidationError):
+        return error.suggestion
+    if isinstance(error, OSError):
+        return "检查失败的文件路径、访问权限和输入文件，解决读写问题后重试。"
+    return (
+        "根据错误修正上一份结果，保留已满足的约束并遵守原输出格式；"
+        "重新校验后提交完整结果，不要只返回修改说明或原样重复无效内容。"
+    )
+
+
+def _error_feedback(error: Exception) -> str:
+    if isinstance(error, ResponseValidationError):
+        return str(error)
+    return f"{error}\n响应建议：{_response_suggestion(error)}"
+
+
+def _validation_failure_message(failure: ErrorDetails) -> str:
+    original = failure.get("ctx", {}).get("error")
+    return original.message if isinstance(original, ResponseValidationError) else failure["msg"]
+
+
+def _validation_error_message(error: ValidationError) -> str:
+    return "; ".join(
+        f"{'.'.join(map(str, failure['loc'])) or '$'}: {_validation_failure_message(failure)}"
+        for failure in error.errors(include_url=False)
+    )
+
+
+def _reraise_response_validation_error(error: ValidationError) -> NoReturn:
+    """Preserve validator-owned errors and advice across Pydantic's wrapper."""
+    failures = error.errors(include_url=False)
+    suggestions: list[str] = []
+    for failure in failures:
+        original = failure.get("ctx", {}).get("error")
+        if isinstance(original, ResponseValidationError):
+            if len(failures) == 1:
+                raise original from error
+            location = ".".join(map(str, failure["loc"])) or "$"
+            suggestions.append(f"{location}: {original.suggestion}")
+    message = f"invalid structured output: {_validation_error_message(error)}"
+    if suggestions:
+        raise ResponseValidationError(message, suggestion="\n".join(suggestions)) from error
+    raise ResponseValidationError(message) from error
 
 
 def _resolve(value: _T | Callable[[AgentCall], _T], call: AgentCall) -> _T:
@@ -66,7 +130,7 @@ async def render_prompt(prompt: str | Template, variables: Mapping[str, object])
 
 @dataclass
 class JinjaPrompt(AgentExtension):
-    """Render fresh prompts before each call, retaining completed tool exchanges."""
+    """Refresh the initial prompts while retaining conversation history."""
 
     system: str | Template | Callable[[AgentCall], str | Template]
     user: str | Template | Callable[[AgentCall], str | Template]
@@ -84,13 +148,11 @@ class JinjaPrompt(AgentExtension):
         user_prompt = self.user(call) if callable(self.user) else self.user
         call.system_prompt = await render_prompt(system_prompt, variables)
         user = {"role": "user", "content": await render_prompt(user_prompt, variables)}
-        if any(message.get("role") == "tool" for message in call.messages):
-            for index, message in enumerate(call.messages):
-                if message.get("role") == "user":
-                    call.messages[index] = user
-                    break
-        else:
-            call.messages = [user]
+        for index, message in enumerate(call.messages):
+            if message.get("role") == "user":
+                call.messages[index] = user
+                return
+        call.messages.insert(0, user)
 
 
 def _print_chunk(text: str) -> None:
@@ -179,9 +241,15 @@ class StructuredOutput(AgentExtension):
         try:
             output = call.outcome.model(call.response_model)
         except ValidationError as error:
-            raise ValueError(f"invalid structured output: {error}") from error
+            _reraise_response_validation_error(error)
         if output is None:
-            raise ValueError("invalid structured output: response is not a JSON object")
+            raise ResponseValidationError(
+                "invalid structured output: response is not a JSON object",
+                suggestion=(
+                    "返回单个完整、合法且符合响应 Schema 的 JSON 对象；"
+                    "检查引号、转义和括号，不要添加代码块、解释文字或额外对象。"
+                ),
+            )
         if self.accept is not None:
             await self.accept(call, output)
         call.output = output
@@ -251,24 +319,91 @@ class RetryPolicy(AgentExtension):
             raise ValueError("max_attempts must be at least 1")
         return limit
 
+    def _check_validation_progress(self, call: AgentCall, error: ValueError) -> None:
+        if call.outcome is None or call.previous_outcome is None:
+            return
+        current = error.__cause__
+        previous = call.previous_error.__cause__ if call.previous_error is not None else None
+        if isinstance(current, ValidationError) and isinstance(previous, ValidationError):
+            failures = current.errors(include_url=False, include_context=False)
+            if failures != previous.errors(include_url=False, include_context=False):
+                return
+            explanation = _validation_error_message(current)
+        elif (
+            isinstance(error, ResponseValidationError)
+            and isinstance(call.previous_error, ResponseValidationError)
+            and error.message == call.previous_error.message
+            and call.outcome.text == call.previous_outcome.text
+        ):
+            explanation = error.message
+        else:
+            return
+        raise RuntimeError(
+            f"repeated validation failure after {call.attempt} attempt(s): {explanation}\n"
+            f"响应建议：{_response_suggestion(error)}"
+        ) from error
+
+    def _add_feedback(self, call: AgentCall) -> None:
+        if call.outcome is None or call.outcome.tool_calls:
+            return
+        assert call.error is not None
+        cause = call.error.__cause__
+        errors: list[dict[str, object]] = (
+            [
+                {
+                    "loc": failure["loc"],
+                    "type": failure["type"],
+                    "msg": _validation_failure_message(failure),
+                }
+                for failure in cause.errors(include_url=False)
+            ]
+            if isinstance(cause, ValidationError)
+            else [
+                {
+                    "msg": call.error.message
+                    if isinstance(call.error, ResponseValidationError)
+                    else str(call.error)
+                }
+            ]
+        )
+        call.messages.append(
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "validation_errors": errors,
+                        "response_suggestion": _response_suggestion(call.error),
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
     async def retry(self, call: AgentCall) -> None:
         error = call.error
+        detail = str(error)
         if isinstance(
             error, (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError)
         ):
             failure = "LLM call failed"
         elif isinstance(error, (ValueError, OSError)):
-            call.feedback.append(str(error))
+            if isinstance(error, ValueError):
+                self._check_validation_progress(call, error)
+            detail = _error_feedback(error)
+            call.feedback.append(detail)
             failure = "failed"
         else:
             return
         limit = self._attempt_limit(call)
         if call.attempt >= limit:
-            raise RuntimeError(f"{failure} after {limit} attempt(s): {error}") from error
+            raise RuntimeError(f"{failure} after {limit} attempt(s): {detail}") from error
+        if isinstance(error, (ValueError, OSError)):
+            self._add_feedback(call)
         call.retry = True
 
 
 __all__ = [
+    "ResponseValidationError",
     "JinjaPrompt",
     "StreamOutput",
     "StructuredOutput",

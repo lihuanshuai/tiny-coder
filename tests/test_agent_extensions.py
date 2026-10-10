@@ -15,12 +15,13 @@ import pytest
 from httpx import Request
 from jinja2 import Environment
 from openai import APIConnectionError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from test_structured_agent import SampleLlmConfig, _echo_call, _outcome, echo_tool
 
 from tiny_coder.agent_extensions import (
     CallRecording,
     JinjaPrompt,
+    ResponseValidationError,
     RetryPolicy,
     StreamOutput,
     StructuredOutput,
@@ -389,6 +390,306 @@ def test_retry_rules_and_stream_reset(failure: str, monkeypatch: pytest.MonkeyPa
     assert accepted == [Output(summary="done")]
     assert temperatures == [0.0, 0.0 if failure == "network" else 0.2]
     assert chunks[-2:] == ["ok", "\n"]
+
+
+def test_retry_stops_repeated_invalid_fields_and_agent_can_be_reused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LengthOutput(BaseModel):
+        summary: str
+        content: str = Field(min_length=5)
+
+    responses = iter(
+        [
+            '{"summary":"first","content":"abc"}',
+            '{"summary":"different summary","content":"abc"}',
+            '{"summary":"recovered","content":"valid"}',
+        ]
+    )
+    calls = 0
+
+    async def llm_call(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal calls
+        calls += 1
+        return _outcome(next(responses))
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm_call)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=LengthOutput,
+        max_steps=20,
+        extensions=(RetryPolicy(20), StructuredOutput()),
+    )
+
+    async def run() -> None:
+        with pytest.raises(
+            RuntimeError, match="repeated validation failure after 2 attempt"
+        ) as error:
+            await agent.invoke(StructuredInput(prompt="prompt"))
+        assert "响应建议：" in str(error.value)
+        assert "完整" in str(error.value)
+        assert "原样重复" in str(error.value)
+        assert calls == 2
+        result = await agent.invoke(StructuredInput(prompt="prompt"))
+        assert result.output == LengthOutput(summary="recovered", content="valid")
+
+    asyncio.run(run())
+    assert calls == 3
+
+
+def test_retry_continues_when_invalid_field_values_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    class LengthOutput(BaseModel):
+        content: str = Field(min_length=5)
+
+    responses = iter(['{"content":"abc"}', '{"content":"abd"}', '{"content":"valid"}'])
+    calls = 0
+
+    async def llm_call(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal calls
+        calls += 1
+        return _outcome(next(responses))
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm_call)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=LengthOutput,
+        max_steps=3,
+        extensions=(RetryPolicy(3), StructuredOutput()),
+    )
+    result = asyncio.run(agent.invoke(StructuredInput(prompt="prompt")))
+    assert result.output == LengthOutput(content="valid")
+    assert calls == 3
+
+
+def test_retry_stops_identical_business_validation_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    async def accept(call: AgentCall, output: BaseModel) -> None:
+        raise ResponseValidationError(
+            "summary is not an allowed name", suggestion="将 summary 改为 approved。"
+        )
+
+    async def llm_call(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal calls
+        calls += 1
+        return _outcome('{"summary":"unlisted"}')
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm_call)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=Output,
+        max_steps=20,
+        extensions=(RetryPolicy(20), StructuredOutput(accept)),
+    )
+    with pytest.raises(RuntimeError, match="repeated validation failure after 2 attempt") as error:
+        asyncio.run(agent.invoke(StructuredInput(prompt="neutral task")))
+    assert "将 summary 改为 approved。" in str(error.value)
+    assert calls == 2
+
+
+@pytest.mark.parametrize("templated", [False, True])
+@pytest.mark.parametrize("retry_first", [False, True])
+def test_validation_retry_sends_rejected_response_and_feedback(
+    templated: bool, retry_first: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class LengthOutput(BaseModel):
+        content: str = Field(min_length=5)
+
+    rejected = '{"content":"abc"}'
+    calls: list[list[dict[str, Any]]] = []
+
+    async def llm_call(**kwargs: Any) -> LlmChatOutcome:
+        messages = kwargs["messages"]
+        calls.append(messages)
+        if len(calls) == 1:
+            return _outcome(rejected)
+        assert [message["role"] for message in messages] == ["system", "user", "assistant", "user"]
+        assert messages[-2]["content"] == rejected
+        feedback = json.loads(messages[-1]["content"])
+        assert feedback["validation_errors"] == [
+            {
+                "loc": ["content"],
+                "type": "string_too_short",
+                "msg": "String should have at least 5 characters",
+            }
+        ]
+        assert "完整" in feedback["response_suggestion"]
+        assert "JSON" in feedback["response_suggestion"]
+        assert "原样重复" in feedback["response_suggestion"]
+        assert messages[1]["content"] == ("attempt 2\n" if templated else "prompt")
+        return _outcome('{"content":"valid"}')
+
+    extensions: list[AgentExtension] = [RetryPolicy(3)] if retry_first else []
+    if templated:
+        extensions.append(
+            JinjaPrompt(
+                "system",
+                Environment().from_string("attempt {{ attempt }}"),
+                lambda call: {"attempt": call.attempt},
+            )
+        )
+    if not retry_first:
+        extensions.append(RetryPolicy(3))
+    extensions.append(StructuredOutput())
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm_call)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(), response_model=LengthOutput, extensions=extensions
+    )
+    result = asyncio.run(agent.invoke(StructuredInput(prompt=None if templated else "prompt")))
+    assert result.output == LengthOutput(content="valid")
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("failure", ["json", "schema", "accept"])
+@pytest.mark.parametrize("max_attempts", [1, 2])
+def test_response_advice_reaches_templates_messages_and_final_errors(
+    failure: str, max_attempts: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    custom_advice = "从允许的名称中选择一个，再重新提交完整结果。"
+    rejected = {
+        "json": "not-json",
+        "schema": '{"summary":null}',
+        "accept": '{"summary":"unlisted"}',
+    }[failure]
+    calls = 0
+
+    async def accept(call: AgentCall, output: BaseModel) -> None:
+        assert isinstance(output, Output)
+        if output.summary == "unlisted":
+            raise ResponseValidationError(
+                "summary is not an allowed name", suggestion=custom_advice
+            )
+
+    async def llm_call(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _outcome(rejected)
+        messages = kwargs["messages"]
+        advice = json.loads(messages[-1]["content"])["response_suggestion"]
+        assert advice in messages[1]["content"]
+        assert "完整" in advice
+        assert "input_value" not in messages[1]["content"]
+        assert "errors.pydantic.dev" not in messages[1]["content"]
+        if failure == "accept":
+            assert advice == custom_advice
+        if failure == "json":
+            assert "引号" in advice
+        return _outcome('{"summary":"approved"}')
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm_call)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=Output,
+        extensions=(
+            JinjaPrompt("system", Environment().from_string("{{ retry_errors | join('\n') }}")),
+            RetryPolicy(max_attempts),
+            StructuredOutput(accept),
+        ),
+    )
+    if max_attempts == 1:
+        with pytest.raises(RuntimeError, match="failed after 1 attempt") as error:
+            asyncio.run(agent.invoke(StructuredInput()))
+        message = str(error.value)
+        assert message.count("响应建议：") == 1
+        assert "完整" in message
+        assert "input_value" not in message
+        assert "errors.pydantic.dev" not in message
+        if failure == "accept":
+            assert custom_advice in message
+    else:
+        result = asyncio.run(agent.invoke(StructuredInput()))
+        assert result.output == Output(summary="approved")
+    assert calls == max_attempts
+
+
+@pytest.mark.parametrize("max_attempts", [1, 2])
+@pytest.mark.parametrize(
+    ("rejected", "failed_fields"),
+    [
+        ({"summary": "unlisted", "content": "valid"}, ["summary"]),
+        ({"summary": "approved", "content": "blocked"}, ["content"]),
+        ({"summary": "unlisted", "content": "blocked"}, ["summary", "content"]),
+        ({"summary": "unlisted", "content": None}, ["summary", "content"]),
+    ],
+)
+def test_schema_retry_preserves_business_errors_and_advice(
+    rejected: dict[str, str | None],
+    failed_fields: list[str],
+    max_attempts: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BusinessError(ResponseValidationError):
+        pass
+
+    business_errors: list[BusinessError] = []
+
+    class ValidatedOutput(BaseModel):
+        summary: str
+        content: str
+
+        @field_validator("summary")
+        @classmethod
+        def allowed_summary(cls, value: str) -> str:
+            if value != "approved":
+                error = BusinessError(
+                    "summary is not allowed",
+                    suggestion="将 summary 改为 approved，提交完整 JSON 对象。",
+                )
+                business_errors.append(error)
+                raise error
+            return value
+
+        @field_validator("content")
+        @classmethod
+        def allowed_content(cls, value: str) -> str:
+            if value != "valid":
+                error = BusinessError(
+                    "content is not allowed",
+                    suggestion="将 content 改为 valid，提交完整 JSON 对象。",
+                )
+                business_errors.append(error)
+                raise error
+            return value
+
+    calls = 0
+
+    async def llm_call(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _outcome(json.dumps(rejected, ensure_ascii=False))
+        feedback = json.loads(kwargs["messages"][-1]["content"])
+        assert [item["loc"][0] for item in feedback["validation_errors"]] == failed_fields
+        assert all("响应建议" not in item["msg"] for item in feedback["validation_errors"])
+        for error in business_errors:
+            assert error.suggestion in feedback["response_suggestion"]
+        if len(failed_fields) == 1:
+            assert feedback["response_suggestion"] == business_errors[0].suggestion
+        return _outcome('{"summary":"approved","content":"valid"}')
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm_call)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=ValidatedOutput,
+        extensions=(RetryPolicy(max_attempts), StructuredOutput()),
+    )
+    if max_attempts == 1:
+        with pytest.raises(RuntimeError) as error:
+            asyncio.run(agent.invoke(StructuredInput(prompt="neutral task")))
+        for original in business_errors:
+            assert original.suggestion in str(error.value)
+        if len(failed_fields) == 1:
+            assert error.value.__cause__ is business_errors[0]
+            assert isinstance(error.value.__cause__, BusinessError)
+        else:
+            for field in failed_fields:
+                assert field in str(error.value)
+        assert str(error.value).count("响应建议：") == 1
+    else:
+        result = asyncio.run(agent.invoke(StructuredInput(prompt="neutral task")))
+        assert result.output == ValidatedOutput(summary="approved", content="valid")
+    assert calls == max_attempts
 
 
 def test_agent_recovers_from_failure_with_fresh_invocation_options(
