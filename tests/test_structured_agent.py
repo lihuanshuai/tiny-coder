@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import BaseModel
 
+from tiny_coder.agent_extensions import CallRecording, JinjaPrompt, RetryPolicy, StructuredOutput
 from tiny_coder.graph import GraphError
 from tiny_coder.llm import LlmChatOutcome, LlmConfig, LlmExchange, ToolCall
 from tiny_coder.state import State
+from tiny_coder.steering import Steering
 from tiny_coder.structured_agent import (
     AFTER_CALL,
     BEFORE_CALL,
@@ -54,6 +58,139 @@ async def _echo(state: State, text: str) -> str:
 
 
 echo_tool = Tool.from_model(EchoArgs, _echo, name="echo")
+
+
+def test_steering_reaches_reused_children_and_rendered_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[list[dict[str, Any]]] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def llm(*, messages: list[dict[str, Any]], **kwargs: Any) -> LlmChatOutcome:
+        calls.append(messages)
+        if len(calls) == 1:
+            started.set()
+            await release.wait()
+            return _outcome(text='{"name": "invalid"}')
+        return _outcome(text='{"name": "ok", "count": 1}')
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+    record = tmp_path / "calls.jsonl"
+
+    async def run() -> None:
+        async with create_structured_agent(llm_config=SampleLlmConfig()) as parent:
+            factory = partial(
+                create_structured_agent,
+                llm_config=SampleLlmConfig(),
+                response_model=SampleStructured,
+                extensions=(
+                    JinjaPrompt("Return JSON", "task"),
+                    CallRecording(record),
+                    RetryPolicy(3),
+                    StructuredOutput(),
+                ),
+            )
+            child = parent.spawn("writer", factory)
+            steering = Steering()
+            with steering.activate():
+                task = child.send(StructuredInput())
+                await started.wait()
+                steering.add("keep the ending")
+                steering.add("use short paragraphs")
+                assert steering.pending == 2
+                release.set()
+                await task
+                assert steering.pending == 0
+                assert parent.spawn("writer", factory) is child
+                await child.send(StructuredInput())
+            with Steering().activate():
+                await child.send(StructuredInput())
+            with pytest.raises(RuntimeError, match="not active"):
+                steering.add("too late")
+
+    asyncio.run(run())
+    assert [m["content"] for m in calls[0][1:]] == ["task"]
+    for call in calls[1:3]:
+        assert [m["content"] for m in call[-2:]] == ["keep the ending", "use short paragraphs"]
+        assert sum(m["content"] == "keep the ending" for m in call) == 1
+    assert [m["content"] for m in calls[3][1:]] == ["task"]
+    with record.open(encoding="utf-8", newline="\n") as stream:
+        records = [json.loads(line) for line in stream]
+    assert [r.get("steering", []) for r in records] == [
+        [],
+        ["keep the ending", "use short paragraphs"],
+        ["keep the ending", "use short paragraphs"],
+        [],
+    ]
+
+
+def test_steering_tool_loop_does_not_duplicate_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[dict[str, Any]]] = []
+    steering = Steering()
+
+    async def llm(*, messages: list[dict[str, Any]], **kwargs: Any) -> LlmChatOutcome:
+        calls.append(messages)
+        if len(calls) == 1:
+            steering.add("second instruction")
+            return _outcome(tool_calls=(_echo_call("hi"),))
+        return _outcome(text="done")
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+
+    async def run() -> None:
+        agent = create_structured_agent(llm_config=SampleLlmConfig(), tools=[echo_tool])
+        with steering.activate():
+            steering.add("first instruction")
+            result = await agent.invoke(StructuredInput(prompt="go"))
+        assert result.text == "done"
+
+    asyncio.run(run())
+    assert [m["content"] for m in calls[0][-1:]] == ["first instruction"]
+    assert [m["content"] for m in calls[1][-2:]] == ["first instruction", "second instruction"]
+    assert sum(m.get("content") == "first instruction" for m in calls[1]) == 1
+
+
+def test_steering_scopes_are_isolated_and_close_on_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[dict[str, Any]]] = []
+    started = asyncio.Event()
+
+    async def llm(*, messages: list[dict[str, Any]], **kwargs: Any) -> LlmChatOutcome:
+        calls.append(messages)
+        if messages[1]["content"] == "cancel":
+            started.set()
+            await asyncio.Future[None]()
+        return _outcome(text="done")
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+
+    async def run() -> None:
+        agent = create_structured_agent(llm_config=SampleLlmConfig())
+        cancelled = Steering()
+
+        async def cancel_call() -> None:
+            with cancelled.activate():
+                await agent.invoke(StructuredInput(prompt="cancel"))
+
+        task = asyncio.create_task(cancel_call())
+        await started.wait()
+        cancelled.add("never leak")
+        with Steering().activate():
+            await agent.invoke(StructuredInput(prompt="other"))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cancelled.snapshot() == ()
+        assert cancelled.pending == 1
+        await agent.invoke(StructuredInput(prompt="next"))
+
+    asyncio.run(run())
+    assert [m["content"] for m in calls[1][1:]] == ["other"]
+    assert [m["content"] for m in calls[2][1:]] == ["next"]
 
 
 def _outcome(

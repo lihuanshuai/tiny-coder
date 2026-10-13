@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from pathlib import Path
 from unicodedata import category, normalize
 
 _FUZZY_MIN_RATIO = 0.82
@@ -20,6 +21,19 @@ class TextReplacement:
 
 class TextReplacementApplyError(ValueError):
     """A model-provided text replacement cannot be safely applied."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        path: Path | None = None,
+        replacement_index: int | None = None,
+        from_text: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.path = path
+        self.replacement_index = replacement_index
+        self.from_text = from_text
 
 
 def _normalize_newlines(text: str) -> str:
@@ -93,12 +107,6 @@ def _best_fuzzy_span(
         from_text,
         ignore_punctuation_and_symbols=ignore_punctuation_and_symbols,
     )
-    if len(query) < _FUZZY_MIN_CHARS:
-        raise TextReplacementApplyError(
-            f"replacement {index} from_text was not found; fuzzy fallback requires at least "
-            f"{_FUZZY_MIN_CHARS} comparable characters"
-        )
-
     candidates: list[tuple[int, int, str]] = []
     canonical_spans: list[tuple[int, int]] = []
     scored: list[tuple[float, int, int]] = []
@@ -120,6 +128,12 @@ def _best_fuzzy_span(
 
     if canonical_spans:
         return _unique_canonical_span(canonical_spans, index=index)
+
+    if len(query) < _FUZZY_MIN_CHARS:
+        raise TextReplacementApplyError(
+            f"replacement {index} from_text was not found; fuzzy fallback requires at least "
+            f"{_FUZZY_MIN_CHARS} comparable characters"
+        )
 
     for start, end, candidate_text in candidates:
         ratio = SequenceMatcher(None, query, candidate_text).ratio()

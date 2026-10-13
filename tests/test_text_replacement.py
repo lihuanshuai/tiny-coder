@@ -209,6 +209,43 @@ def test_apply_text_replacements_rejects_missing_from_text_without_safe_fuzzy_ma
         apply_text_replacements("# Plan\n- old goal\n", replacements)
 
 
+@pytest.mark.parametrize(
+    "source",
+    ["## 注意事项\n- TODO", "# 注意事项\n\n- TODO。", "注意事项\n\nTODO"],
+)
+def test_short_normalized_exact_match_preserves_surrounding_text(source: str) -> None:
+    original = "# Plan\n\n## 注意事项\n\n- TODO\n\n## Next\nKeep this.\n"
+    target = "## 注意事项\n\n- 核对交接记录。"
+
+    assert (
+        apply_text_replacements(
+            original,
+            [TextReplacement(from_text=source, to_text=target)],
+            ignore_punctuation_and_symbols=True,
+        )
+        == "# Plan\n\n" + target + "\n\n## Next\nKeep this.\n"
+    )
+
+
+def test_short_normalized_match_still_rejects_multiple_locations() -> None:
+    with pytest.raises(TextReplacementApplyError, match="normalized.*multiple locations"):
+        apply_text_replacements(
+            "## 注意事项\n\n- TODO\n\n## 注意事项\n\n- TODO。\n",
+            [TextReplacement(from_text="## 注意事项\n- TODO", to_text="已完成。")],
+            ignore_punctuation_and_symbols=True,
+        )
+
+
+@pytest.mark.parametrize("source", ["## 注意事顶\n\n- TODO", "### ---"])
+def test_short_missing_or_symbol_only_source_cannot_use_approximate_matching(source: str) -> None:
+    with pytest.raises(TextReplacementApplyError, match="fuzzy fallback requires"):
+        apply_text_replacements(
+            "## 注意事项\n\n- TODO\n",
+            [TextReplacement(from_text=source, to_text="已完成。")],
+            ignore_punctuation_and_symbols=True,
+        )
+
+
 def test_apply_text_replacements_rejects_ambiguous_from_text() -> None:
     replacements = [TextReplacement(from_text="- duplicate", to_text="- new goal")]
 

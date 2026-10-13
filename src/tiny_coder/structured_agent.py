@@ -24,6 +24,7 @@ from tiny_coder.llm import (
     stream_llm_chat,
 )
 from tiny_coder.state import State
+from tiny_coder.steering import current_instructions
 from tiny_coder.tool_node import Tool, ToolNode, has_tool_calls
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -63,6 +64,7 @@ class AgentCall:
     previous_error: Exception | None = None
     feedback: list[str] = field(default_factory=list)
     chunk: str = ""
+    steering: tuple[str, ...] = ()
     resources: ExitStack = field(default_factory=ExitStack, repr=False)
 
 
@@ -262,9 +264,16 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
         """Translate a prepared call to the LLM transport and publish streamed data."""
         if not call.messages:
             raise ValueError("prompt or messages is required")
+        # Apply after prompt extensions render. Keep supplementary instructions
+        # out of graph history so retries and tool loops cannot duplicate them.
+        call.steering = current_instructions()
         return await stream_llm_chat(
             llm_cfg=call.llm_config,
-            messages=[{"role": "system", "content": call.system_prompt}, *call.messages],
+            messages=[
+                {"role": "system", "content": call.system_prompt},
+                *call.messages,
+                *({"role": "user", "content": text} for text in call.steering),
+            ],
             tools=self.tools or None,
             response_format=call.response_format,
             on_chunk=self._emit_chunk if self.events.has_subscribers(CHUNK_RECEIVED) else None,

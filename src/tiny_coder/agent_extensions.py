@@ -32,7 +32,7 @@ _T = TypeVar("_T")
 
 
 class ResponseValidationError(ValueError):
-    """A rejected response with actionable guidance for the next attempt."""
+    """A rejected response with guidance and optional JSON-compatible metadata."""
 
     def __init__(
         self,
@@ -42,10 +42,22 @@ class ResponseValidationError(ValueError):
             "根据字段错误逐项修正上一份结果，保留已满足的约束；"
             "重新校验后提交完整 JSON 对象，不要只返回修改说明、局部字段或原样重复无效内容。"
         ),
+        code: str | None = None,
+        context: Mapping[str, object] | None = None,
     ) -> None:
         self.message = message
         self.suggestion = suggestion
+        self.code = code
+        self.context = dict(context or {})
         super().__init__(f"{message}\n响应建议：{suggestion}")
+
+    def feedback(self) -> dict[str, object]:
+        detail: dict[str, object] = {"msg": self.message}
+        if self.code is not None:
+            detail["type"] = self.code
+        if self.context:
+            detail["ctx"] = dict(self.context)
+        return detail
 
 
 def _response_suggestion(error: Exception) -> str:
@@ -286,6 +298,8 @@ class CallRecording(AgentExtension):
             },
             **_resolve(self.metadata, call),
         }
+        if call.steering:
+            record["steering"] = list(call.steering)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8", newline="\n") as file:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -348,24 +362,22 @@ class RetryPolicy(AgentExtension):
             return
         assert call.error is not None
         cause = call.error.__cause__
-        errors: list[dict[str, object]] = (
-            [
-                {
+        errors: list[dict[str, object]] = []
+        if isinstance(cause, ValidationError):
+            for failure in cause.errors(include_url=False):
+                detail: dict[str, object] = {
                     "loc": failure["loc"],
                     "type": failure["type"],
-                    "msg": _validation_failure_message(failure),
+                    "msg": failure["msg"],
                 }
-                for failure in cause.errors(include_url=False)
-            ]
-            if isinstance(cause, ValidationError)
-            else [
-                {
-                    "msg": call.error.message
-                    if isinstance(call.error, ResponseValidationError)
-                    else str(call.error)
-                }
-            ]
-        )
+                original = failure.get("ctx", {}).get("error")
+                if isinstance(original, ResponseValidationError):
+                    detail.update(original.feedback())
+                errors.append(detail)
+        elif isinstance(call.error, ResponseValidationError):
+            errors.append(call.error.feedback())
+        else:
+            errors.append({"msg": str(call.error)})
         call.messages.append(
             {
                 "role": "user",

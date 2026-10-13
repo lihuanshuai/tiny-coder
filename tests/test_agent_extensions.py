@@ -557,7 +557,10 @@ def test_response_advice_reaches_templates_messages_and_final_errors(
         assert isinstance(output, Output)
         if output.summary == "unlisted":
             raise ResponseValidationError(
-                "summary is not an allowed name", suggestion=custom_advice
+                "summary is not an allowed name",
+                suggestion=custom_advice,
+                code="summary_not_allowed",
+                context={"expected": "approved", "actual": output.summary},
             )
 
     async def llm_call(**kwargs: Any) -> LlmChatOutcome:
@@ -566,13 +569,21 @@ def test_response_advice_reaches_templates_messages_and_final_errors(
         if calls == 1:
             return _outcome(rejected)
         messages = kwargs["messages"]
-        advice = json.loads(messages[-1]["content"])["response_suggestion"]
+        feedback = json.loads(messages[-1]["content"])
+        advice = feedback["response_suggestion"]
         assert advice in messages[1]["content"]
         assert "完整" in advice
         assert "input_value" not in messages[1]["content"]
         assert "errors.pydantic.dev" not in messages[1]["content"]
         if failure == "accept":
             assert advice == custom_advice
+            assert feedback["validation_errors"] == [
+                {
+                    "type": "summary_not_allowed",
+                    "msg": "summary is not an allowed name",
+                    "ctx": {"expected": "approved", "actual": "unlisted"},
+                }
+            ]
         if failure == "json":
             assert "引号" in advice
         return _outcome('{"summary":"approved"}')
@@ -635,6 +646,8 @@ def test_schema_retry_preserves_business_errors_and_advice(
                 error = BusinessError(
                     "summary is not allowed",
                     suggestion="将 summary 改为 approved，提交完整 JSON 对象。",
+                    code="summary_not_allowed",
+                    context={"expected": "approved", "actual": value},
                 )
                 business_errors.append(error)
                 raise error
@@ -647,6 +660,8 @@ def test_schema_retry_preserves_business_errors_and_advice(
                 error = BusinessError(
                     "content is not allowed",
                     suggestion="将 content 改为 valid，提交完整 JSON 对象。",
+                    code="content_not_allowed",
+                    context={"expected": "valid", "actual": value},
                 )
                 business_errors.append(error)
                 raise error
@@ -664,6 +679,19 @@ def test_schema_retry_preserves_business_errors_and_advice(
         assert all("响应建议" not in item["msg"] for item in feedback["validation_errors"])
         for error in business_errors:
             assert error.suggestion in feedback["response_suggestion"]
+        for field, expected in (("summary", "approved"), ("content", "valid")):
+            if rejected[field] is not None and field in failed_fields:
+                detail = next(
+                    item for item in feedback["validation_errors"] if item["loc"] == [field]
+                )
+                assert detail["type"] == f"{field}_not_allowed"
+                assert detail["ctx"] == {"expected": expected, "actual": rejected[field]}
+            elif rejected[field] is None:
+                detail = next(
+                    item for item in feedback["validation_errors"] if item["loc"] == [field]
+                )
+                assert detail["type"] == "string_type"
+                assert "ctx" not in detail
         if len(failed_fields) == 1:
             assert feedback["response_suggestion"] == business_errors[0].suggestion
         return _outcome('{"summary":"approved","content":"valid"}')

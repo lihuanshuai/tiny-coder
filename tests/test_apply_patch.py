@@ -186,6 +186,33 @@ def test_apply_patches_validates_every_target_before_writing(
     assert not allowed.exists()
 
 
+def test_patch_failure_preserves_path_index_and_unabridged_source(
+    workspace_tmp_path: Path,
+) -> None:
+    target = workspace_tmp_path / "notes.md"
+    original = "# Draft\n- Pending\n\n## Notes\n\n- TODO\n"
+    target.write_text(original, encoding="utf-8", newline="\n")
+    source = "## Note\n- TODO"
+    patch = ApplyPatch(
+        path=Path("notes.md"),
+        match_original=True,
+        ignore_punctuation_and_symbols=True,
+        replacements=[
+            TextReplacement(from_text="# Draft", to_text="# Plan"),
+            TextReplacement(from_text="- Pending", to_text="- Ready"),
+            TextReplacement(from_text=source, to_text="## Notes\n\n- Check records"),
+        ],
+    )
+
+    with pytest.raises(TextReplacementApplyError) as caught:
+        apply_patches(workspace_tmp_path, [patch])
+
+    assert caught.value.path == target.resolve()
+    assert caught.value.replacement_index == 3
+    assert caught.value.from_text == source
+    assert target.read_text(encoding="utf-8") == original
+
+
 def test_apply_patches_creates_file_from_whole_file_replacement(
     workspace_tmp_path: Path,
 ) -> None:
