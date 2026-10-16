@@ -335,6 +335,11 @@ restore the outer stream automatically.
 
 ## Structured Output
 
+`stream_llm_chat(..., client=client)` accepts a caller-owned `AsyncOpenAI` client for connection
+reuse and custom transport settings. The caller must close the injected client; streams are
+closed after each request, including failures. Without injection, the function creates and closes
+its own client.
+
 Any node can request a JSON-schema response instead of tool calls:
 
 ```python

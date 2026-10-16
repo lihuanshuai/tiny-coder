@@ -314,6 +314,37 @@ def test_stream_llm_chat_records_exchange(
     assert seen[0].response is outcome
 
 
+def test_stream_llm_chat_reuses_caller_owned_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(monkeypatch, PACKETS_TEXT)
+    client = FakeAsyncOpenAI()
+
+    async def twice() -> None:
+        for _ in range(2):
+            outcome = await stream_llm_chat(
+                llm_cfg=SampleOpenAIConfig(),
+                messages=[{"role": "user", "content": "hello"}],
+                client=client,  # type: ignore[arg-type]
+            )
+            assert outcome.text == "hello world"
+            assert not client.closed
+
+    asyncio.run(twice())
+
+
+def test_stream_error_does_not_close_caller_owned_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(monkeypatch, [_chunk(error={"message": "stream failed"})])
+    client = FakeAsyncOpenAI()
+    with pytest.raises(RuntimeError, match="stream failed"):
+        asyncio.run(
+            stream_llm_chat(
+                llm_cfg=SampleOpenAIConfig(),
+                messages=[{"role": "user", "content": "hello"}],
+                client=client,  # type: ignore[arg-type]
+            )
+        )
+    assert not client.closed
+
+
 def test_stream_llm_chat_with_response_format(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

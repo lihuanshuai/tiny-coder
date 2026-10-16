@@ -324,8 +324,9 @@ async def stream_llm_chat(
     response_format: dict[str, Any] | None = None,
     on_chunk: Callable[[str], Awaitable[None]] | None = None,
     on_exchange: Callable[[LlmExchange], Awaitable[None]] | None = None,
+    client: AsyncOpenAI | None = None,
 ) -> LlmChatOutcome:
-    """Stream an OpenAI-compatible chat completion with optional tools or structured output."""
+    """Stream chat; an injected client remains open and is owned by the caller."""
     if not isinstance(llm_cfg, LlmConfig):
         raise TypeError("llm_cfg must inherit LlmConfig")
     if not messages:
@@ -333,10 +334,15 @@ async def stream_llm_chat(
     config = llm_cfg
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
-    client = AsyncOpenAI(
-        base_url=config.base_url,
-        api_key=openai_api_key(),
-        timeout=config.timeout,
+    owns_client = client is None
+    client = (
+        client
+        if client is not None
+        else AsyncOpenAI(
+            base_url=config.base_url,
+            api_key=openai_api_key(),
+            timeout=config.timeout,
+        )
     )
     prompt_eval_count = 0
     eval_count = 0
@@ -422,10 +428,11 @@ async def stream_llm_chat(
                 await stream_response.close()
             except Exception:
                 pass
-        try:
-            await client.close()
-        except Exception:
-            pass
+        if owns_client:
+            try:
+                await client.close()
+            except Exception:
+                pass
     if not had_prompt_metric or not had_eval_metric:
         logger.debug(
             "OpenAI-compatible chat stream missing usage metrics (prompt=%s eval=%s); using zeros",
