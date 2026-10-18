@@ -29,11 +29,13 @@ class TextReplacementApplyError(ValueError):
         path: Path | None = None,
         replacement_index: int | None = None,
         from_text: str | None = None,
+        candidate_spans: tuple[tuple[int, int], ...] = (),
     ) -> None:
         super().__init__(message)
         self.path = path
         self.replacement_index = replacement_index
         self.from_text = from_text
+        self.candidate_spans = candidate_spans
 
 
 def _normalize_newlines(text: str) -> str:
@@ -66,7 +68,8 @@ def _unique_canonical_span(
     if len(minimal_spans) > 1:
         raise TextReplacementApplyError(
             f"replacement {index} normalized from_text matched multiple locations; "
-            "refusing to apply"
+            "refusing to apply",
+            candidate_spans=tuple(minimal_spans),
         )
     return minimal_spans[0]
 
@@ -91,7 +94,15 @@ def _line_windows(text: str, from_text: str) -> Iterator[tuple[int, int, str]]:
             continue
         for start_line in range(0, len(lines) - window_length + 1):
             end_line = start_line + window_length
-            start = offsets[start_line]
+            # Windows differing only by surrounding blank lines are one location.
+            first_line = start_line
+            while first_line < end_line and not lines[first_line].strip():
+                first_line += 1
+            while end_line > first_line and not lines[end_line - 1].strip():
+                end_line -= 1
+            if first_line == end_line:
+                continue
+            start = offsets[first_line]
             end = offsets[end_line]
             yield start, end, text[start:end]
 
@@ -151,7 +162,12 @@ def _best_fuzzy_span(
     if len(scored) > 1 and best_ratio - scored[1][0] < _FUZZY_MIN_MARGIN:
         raise TextReplacementApplyError(
             f"replacement {index} fuzzy from_text matched multiple similar locations; "
-            "refusing to apply"
+            "refusing to apply",
+            candidate_spans=tuple(
+                (start, end)
+                for ratio, start, end in scored
+                if best_ratio - ratio < _FUZZY_MIN_MARGIN
+            ),
         )
     return best_start, best_end
 

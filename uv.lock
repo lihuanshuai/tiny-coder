@@ -830,7 +830,7 @@ wheels = [
 
 [[package]]
 name = "tiny-coder"
-version = "1.1.2"
+version = "1.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpcore2" },

@@ -63,7 +63,9 @@ class ApplyPatch:
                 )
             except TextReplacementApplyError as error:
                 snippet = _compact_text_snippet(replacement.from_text)
-                raise TextReplacementApplyError(f"{error}; from_text={snippet!r}") from error
+                raise TextReplacementApplyError(
+                    f"{error}; from_text={snippet!r}", candidate_spans=error.candidate_spans
+                ) from error
         return updated
 
 
@@ -156,6 +158,7 @@ def _prepare_apply_patches(
                 path=target,
                 replacement_index=error.replacement_index,
                 from_text=error.from_text,
+                candidate_spans=error.candidate_spans,
             ) from error
     return originals, updated
 
@@ -190,6 +193,7 @@ def _apply_snapshot_replacements(
                 f"{error}; from_text={snippet!r}",
                 replacement_index=index,
                 from_text=source,
+                candidate_spans=error.candidate_spans,
             ) from error
         for previous, (other_start, other_end, _text) in enumerate(edits, start=1):
             if start < other_end and other_start < end:

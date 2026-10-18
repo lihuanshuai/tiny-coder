@@ -71,6 +71,16 @@ def test_apply_text_replacements_uses_fuzzy_fallback_for_minor_typo() -> None:
     )
 
 
+@pytest.mark.parametrize("spacing", ["\n\n", "\n\n\n\n"])
+def test_fuzzy_match_treats_surrounding_blank_lines_as_one_location(spacing: str) -> None:
+    original = f"# Plan{spacing}- old goal for chapter one{spacing}# Next section\n"
+    replacements = [TextReplacement(from_text="- old goal for chpater one", to_text="- new goal")]
+
+    assert apply_text_replacements(original, replacements) == original.replace(
+        "- old goal for chapter one", "- new goal"
+    )
+
+
 def test_apply_text_replacements_uses_fuzzy_fallback_for_whitespace_drift() -> None:
     original = "# Plan\n  - old goal for chapter one\n- keep\n"
     replacements = [
@@ -261,8 +271,25 @@ def test_apply_text_replacements_rejects_ambiguous_fuzzy_match() -> None:
         )
     ]
 
-    with pytest.raises(TextReplacementApplyError, match="multiple similar locations"):
+    original = "# Plan\n- old goal for chapter one\n- old goal for chapter two\n"
+    with pytest.raises(TextReplacementApplyError, match="multiple similar locations") as error:
         apply_text_replacements(
-            "# Plan\n- old goal for chapter one\n- old goal for chapter two\n",
+            original,
             replacements,
         )
+    assert {original[start:end] for start, end in error.value.candidate_spans} == {
+        "- old goal for chapter one\n",
+        "- old goal for chapter two\n",
+    }
+
+
+def test_normalized_duplicate_locations_include_candidate_spans() -> None:
+    original = "# Plan\n\n- old goal for chapter one\n\n- old goal for chapter one\n"
+    with pytest.raises(TextReplacementApplyError, match="multiple locations") as error:
+        apply_text_replacements(
+            original,
+            [TextReplacement(from_text="- old   goal for chapter one", to_text="- new goal")],
+        )
+    assert len(error.value.candidate_spans) == 2
+    for start, end in error.value.candidate_spans:
+        assert original[start:end] == "- old goal for chapter one\n"

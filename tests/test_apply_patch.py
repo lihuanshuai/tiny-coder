@@ -143,6 +143,28 @@ def test_snapshot_edits_allow_adjacent_deletions_and_whole_file_creation() -> No
     )
 
 
+@pytest.mark.parametrize("match_original", [False, True])
+def test_ambiguous_patch_keeps_candidates_and_does_not_write(
+    workspace_tmp_path: Path, match_original: bool
+) -> None:
+    target = workspace_tmp_path / "notes.txt"
+    original = "# Plan\n- old goal for chapter one\n- old goal for chapter two\n"
+    target.write_text(original, encoding="utf-8", newline="\n")
+    patch = ApplyPatch(
+        path=target,
+        replacements=[
+            TextReplacement(from_text="- old goal for chaptr three", to_text="- new goal")
+        ],
+        match_original=match_original,
+    )
+    with pytest.raises(TextReplacementApplyError, match="multiple similar locations") as error:
+        apply_patches(workspace_tmp_path, [patch])
+    assert error.value.path == target
+    assert len(error.value.candidate_spans) == 2
+    with target.open(encoding="utf-8", newline="\n") as source:
+        assert source.read() == original
+
+
 def test_preview_apply_patches_combines_operations_without_writing(
     workspace_tmp_path: Path,
 ) -> None:
