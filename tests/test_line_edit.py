@@ -47,11 +47,39 @@ def test_adaptive_typo_in_locator_preserves_actual_unchanged_text() -> None:
     assert apply_line_replacements(source, [_adaptive(old, old)]) == source
 
 
+def test_adaptive_unique_close_match_allows_more_than_two_missing_characters() -> None:
+    source = "The investigator checked the original city archive before leaving.\n"
+    old = source.replace("city ", "").rstrip("\n")
+    new = old.replace("before leaving", "and recorded the result")
+    assert apply_line_replacements(source, [_adaptive(old, new)]) == source.replace(
+        "before leaving", "and recorded the result"
+    )
+
+
+def test_adaptive_low_similarity_reports_difference_and_verbatim_candidate() -> None:
+    source = "The investigator checked archive A before leaving the building.\n"
+    old = source.replace("archive A", "archives ABCDEFGH").rstrip("\n")
+    with pytest.raises(ValueError, match="differs too much") as error:
+        apply_line_replacements(source, [_adaptive(old, "updated")])
+    assert "lines 1..1" in str(error.value)
+    assert source.rstrip("\n") in str(error.value)
+
+
 @pytest.mark.parametrize("source,old", [("detail", "detail\n"), ("one\n\ntwo\n", "one\ntwo")])
 def test_adaptive_unchanged_context_keeps_actual_line_endings_and_blank_lines(
     source: str, old: str
 ) -> None:
     assert apply_line_replacements(source, [_adaptive(old, old)]) == source
+
+
+def test_identical_old_and_new_are_ignored_before_source_matching() -> None:
+    source = "same\nsame\noriginal detail\n"
+    unchanged = _adaptive("same", "same")
+    assert resolve_line_replacements(source, [unchanged]) == []
+    assert (
+        apply_line_replacements(source, [unchanged, _adaptive("original detail", "updated detail")])
+        == "same\nsame\nupdated detail\n"
+    )
 
 
 @pytest.mark.parametrize(
@@ -63,6 +91,11 @@ def test_adaptive_unchanged_context_keeps_actual_line_endings_and_blank_lines(
             "The investigator checked archive A before leaving the building.\n"
             "The investigator checked archive B before leaving the building.\n",
             "The investigator checked archive C before leaving the building.",
+        ),
+        (
+            "The investigator checked the original city archive before leaving.\n"
+            "The investigator checked the original town archive before leaving.\n",
+            "The investigator checked the original archive before leaving.",
         ),
     ],
 )

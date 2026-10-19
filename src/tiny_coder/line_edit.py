@@ -20,12 +20,17 @@ class LineReplacement(BaseModel):
     old_count: int = Field(
         ge=0, strict=True, description="Number of original lines; zero inserts before old_start."
     )
-    new_text: str = Field(description="Complete replacement lines, without line-number prefixes.")
+    new_text: str = Field(
+        description=(
+            "Complete replacement lines, without line-number prefixes. "
+            "Omit replacements where old_text and new_text are identical."
+        )
+    )
     old_text: str | None = Field(
         default=None,
         description=(
             "Source fragment for adaptive positioning. When supplied, line numbers are hints; "
-            "small whitespace/punctuation differences or up to two character errors may be "
+            "small whitespace, punctuation, or character differences may be "
             "accepted only at a unique location. Include adjacent context to disambiguate. "
             "For insertion, include an existing anchor in both old_text and new_text."
         ),
@@ -117,7 +122,7 @@ def _find_fragment(lines: list[str], old: str, hint: int) -> tuple[int, int]:
                 f"old_text matches multiple locations ({positions}); include more context"
             )
 
-    scores: list[tuple[float, int, tuple[int, int]]] = []
+    scores: list[tuple[float, tuple[int, int]]] = []
     if len(wanted) >= 24:
         for bounds, text in fragments.items():
             matcher = SequenceMatcher(None, wanted, _comparable(text), autojunk=False)
@@ -126,25 +131,23 @@ def _find_fragment(lines: list[str], old: str, hint: int) -> tuple[int, int]:
             score = matcher.ratio()
             if score < 0.9:
                 continue
-            errors = sum(
-                max(end - start, other_end - other_start)
-                for tag, start, end, other_start, other_end in matcher.get_opcodes()
-                if tag != "equal"
-            )
-            scores.append((score, errors, bounds))
+            scores.append((score, bounds))
     scores.sort(key=lambda entry: entry[0], reverse=True)
     if scores:
-        score, errors, bounds = scores[0]
-        if score >= 0.94 and errors <= 2:
+        score, bounds = scores[0]
+        if score >= 0.94:
             if len(scores) == 1 or score - scores[1][0] >= 0.04:
                 return bounds
-        options = "; ".join(
-            f"lines {start + 1}..{end} ({score:.3f}): {fragments[start, end]!r}"
-            for score, _, (start, end) in scores[:3]
+        options = "\n".join(
+            f"lines {start + 1}..{end} ({score:.3f}):\n{fragments[start, end]}"
+            for score, (start, end) in scores[:3]
         )
-        raise ValueError(
-            f"old_text has no unambiguous close match; copy exact source from {options}"
+        reason = (
+            "old_text differs too much from source (minimum similarity 0.940)"
+            if score < 0.94
+            else "old_text has no unambiguous close match (multiple similarly close locations)"
         )
+        raise ValueError(f"{reason}; copy exact source from:\n{options}")
     raise ValueError(
         "old_text not found; copy a nonempty, unique source fragment from the snapshot"
     )
@@ -202,6 +205,8 @@ def resolve_line_replacements(
     lines = text_lines(original)
     resolved: list[LineReplacement] = []
     for index, item in enumerate(replacements, 1):
+        if item.old_text == item.new_text:
+            continue
         if item.old_text is None:
             resolved.append(item)
             continue
