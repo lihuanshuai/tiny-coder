@@ -127,9 +127,31 @@ become `error: ...` tool results instead of aborting the run.
 
 Built-in workspace tools live in `tiny_coder.file_tools`:
 
-- `read_file`, `write_file`, `list_dir`, `run_command`.
+- `search_files`, `read_file`, `edit_file`, `write_file`, `list_dir`, `run_command`.
 
-`default_file_tools(root)` binds all four to a workspace root and blocks paths that escape it.
+`default_file_tools(root)` binds these tools to a workspace root and blocks paths that escape it.
+
+Use `search_files` to find literal text or a regex, then `read_file` to inspect a line range.
+Both return original line numbers and a source `revision`. `read_file` returns JSON with
+`path`, `revision`, `total_lines`, and numbered `content`.
+
+`edit_file` takes `path`, `expected_revision`, and `replacements`, for example:
+
+```json
+{"path":"notes.md","expected_revision":"<revision from read_file>","replacements":[{"start_line":12,"end_line":14,"content":"Complete replacement lines"}]}
+```
+
+Line numbers start at 1 and both ends are included. All ranges refer to the same read,
+regardless of other edits in the batch. Empty `content` deletes the range;
+`end_line=start_line-1` inserts before `start_line` (use `N+1,N` to append to an N-line file).
+Replacement content contains complete lines without the displayed line-number prefixes.
+Overlapping ranges and stale revisions are rejected before writing. `write_file` creates a
+file or replaces its full content; overwriting also requires `expected_revision`.
+
+For Python callers, `ApplyPatch(path, content=...)` writes a complete file. Line edits use
+`ApplyPatch(path, replacements=[LineReplacement(...)], expected_revision=text_revision(source))`.
+`LineReplacement` and `text_revision` live in `tiny_coder.line_edit`. The former `TextReplacement`
+and `from_text`/`to_text` API has been replaced by these line ranges; callers must migrate.
 
 ## Structured Agent (Factory)
 

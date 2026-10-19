@@ -1,6 +1,5 @@
-import shutil
-import uuid
-from collections.abc import Iterator
+from __future__ import annotations
+
 from pathlib import Path
 
 import pytest
@@ -13,281 +12,81 @@ from tiny_coder.apply_patch import (
     apply_patches,
     preview_apply_patches,
 )
-from tiny_coder.text_replacement import TextReplacement, TextReplacementApplyError
+from tiny_coder.line_edit import LineReplacement, text_revision
 
 
-@pytest.fixture
-def workspace_tmp_path() -> Iterator[Path]:
-    root = Path(".test-tmp") / uuid.uuid4().hex
-    root.mkdir(parents=True)
-    try:
-        yield root.resolve()
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
-
-
-def test_apply_patch_requires_replacements() -> None:
-    with pytest.raises(ValueError, match="at least one replacement"):
-        ApplyPatch(path=Path("notes.txt"), replacements=[])
-
-
-def test_apply_patch_applies_ordered_whole_file_and_matched_replacements() -> None:
+def test_preview_and_write_line_patch(tmp_path: Path) -> None:
+    target = tmp_path / "notes.md"
+    target.write_text("same\nsame\n", encoding="utf-8", newline="\n")
     patch = ApplyPatch(
-        path=Path("notes.txt"),
-        replacements=[
-            TextReplacement(from_text="discarded", to_text="intermediate"),
-            TextReplacement(to_text="first\nsecond\n"),
-            TextReplacement(from_text="second", to_text="finished"),
-            TextReplacement(to_text="final"),
-        ],
+        Path("notes.md"),
+        replacements=[LineReplacement(start_line=2, end_line=2, content="updated")],
+        expected_revision=text_revision("same\nsame\n"),
     )
-
-    assert patch.apply("discarded\n") == "final"
-
-
-def test_apply_patch_matches_all_independent_edits_in_original_snapshot() -> None:
-    patch = ApplyPatch(
-        path=Path("notes.txt"),
-        match_original=True,
-        replacements=[
-            TextReplacement(from_text="first", to_text="second"),
-            TextReplacement(from_text="second", to_text="finished with a longer line"),
-        ],
-    )
-
-    assert patch.apply("first\r\nsecond\r\n") == "second\nfinished with a longer line\n"
+    assert preview_apply_patches(tmp_path, [patch]) == {target: "same\nupdated\n"}
+    assert target.read_text(encoding="utf-8") == "same\nsame\n"
+    assert apply_patches(tmp_path, [patch]) == [target]
+    assert target.read_text(encoding="utf-8") == "same\nupdated\n"
 
 
-@pytest.mark.parametrize(
-    ("original", "replacements", "reason"),
-    [
-        (
-            "first second\n",
+def test_stale_second_patch_prevents_all_writes(tmp_path: Path) -> None:
+    target = tmp_path / "existing.md"
+    target.write_text("external change\n", encoding="utf-8", newline="\n")
+    with pytest.raises(ValueError, match="source revision changed"):
+        apply_patches(
+            tmp_path,
             [
-                TextReplacement(from_text="first second", to_text="updated"),
-                TextReplacement(from_text="second", to_text="finished"),
+                ApplyPatch(Path("new.md"), content="new\n"),
+                ApplyPatch(
+                    Path("existing.md"),
+                    replacements=[LineReplacement(start_line=1, end_line=1, content="updated")],
+                    expected_revision=text_revision("old\n"),
+                ),
             ],
-            "overlaps replacement",
-        ),
-        (
-            "first\n",
-            [
-                TextReplacement(from_text="first", to_text="draft"),
-                TextReplacement(from_text="draft", to_text="final"),
-            ],
-            "from_text was not found",
-        ),
-        (
-            "- old goal for chapter one\n",
-            [
-                TextReplacement(from_text="- old goal for chpater one", to_text="- new goal A"),
-                TextReplacement(from_text="- old goal for chaptor one", to_text="- new goal B"),
-            ],
-            "overlaps replacement",
-        ),
-        (
-            "first first\n",
-            [TextReplacement(from_text="first", to_text="updated")],
-            "matched .*locations",
-        ),
-        (
-            "aaaa\n",
-            [TextReplacement(from_text="aaa", to_text="updated")],
-            "matched multiple locations",
-        ),
-        (
-            "first\n",
-            [TextReplacement(to_text="draft"), TextReplacement(from_text="first", to_text="final")],
-            "whole-file replacement cannot",
-        ),
-    ],
-)
-def test_snapshot_edits_are_rejected_before_any_file_is_written(
-    workspace_tmp_path: Path,
-    original: str,
-    replacements: list[TextReplacement],
-    reason: str,
-) -> None:
-    target = workspace_tmp_path / "notes.txt"
-    target.write_text(original, encoding="utf-8", newline="\n")
-    created = workspace_tmp_path / "created.txt"
-    patches = [
-        ApplyPatch(path=created, replacements=[TextReplacement(to_text="new file")]),
-        ApplyPatch(path=target, replacements=replacements, match_original=True),
-    ]
-
-    with pytest.raises(TextReplacementApplyError, match=reason):
-        apply_patches(workspace_tmp_path, patches)
-
-    assert target.read_text(encoding="utf-8") == original
-    assert not created.exists()
+        )
+    assert not (tmp_path / "new.md").exists()
+    assert target.read_text(encoding="utf-8") == "external change\n"
 
 
-def test_snapshot_edits_allow_adjacent_deletions_and_whole_file_creation() -> None:
-    patch = ApplyPatch(
-        path=Path("notes.txt"),
-        match_original=True,
-        replacements=[
-            TextReplacement(from_text="first", to_text=""),
-            TextReplacement(from_text="second", to_text=""),
-        ],
-    )
-    assert patch.apply("firstsecond") == ""
-    assert (
+@pytest.mark.parametrize("paths", [None, []])
+def test_workspace_and_explicit_empty_allowlist(tmp_path: Path, paths: list[Path] | None) -> None:
+    with pytest.raises(ValueError, match="outside|not allowed"):
+        apply_patches(
+            tmp_path, [ApplyPatch(Path("../escape.md"), content="x")], allowed_paths=paths
+        )
+    if paths == []:
+        with pytest.raises(ValueError, match="not allowed"):
+            apply_patches(tmp_path, [ApplyPatch(Path("inside.md"), content="x")], allowed_paths=[])
+
+
+def test_duplicate_file_batches_are_rejected_before_writing(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="duplicate patch path"):
+        apply_patches(
+            tmp_path,
+            [ApplyPatch(Path("a.md"), content="x"), ApplyPatch(Path("./a.md"), content="y")],
+        )
+    assert not (tmp_path / "a.md").exists()
+
+
+def test_patch_requires_one_operation_and_line_source_version() -> None:
+    with pytest.raises(ValueError, match="either content"):
+        ApplyPatch(Path("a.md"))
+    with pytest.raises(ValueError, match="expected_revision"):
         ApplyPatch(
-            path=Path("new.txt"),
-            match_original=True,
-            replacements=[TextReplacement(to_text="whole file")],
-        ).apply(None)
-        == "whole file"
-    )
+            Path("a.md"), replacements=[LineReplacement(start_line=1, end_line=1, content="x")]
+        )
 
 
-@pytest.mark.parametrize("match_original", [False, True])
-def test_ambiguous_patch_keeps_candidates_and_does_not_write(
-    workspace_tmp_path: Path, match_original: bool
-) -> None:
-    target = workspace_tmp_path / "notes.txt"
-    original = "# Plan\n- old goal for chapter one\n- old goal for chapter two\n"
-    target.write_text(original, encoding="utf-8", newline="\n")
-    patch = ApplyPatch(
-        path=target,
-        replacements=[
-            TextReplacement(from_text="- old goal for chaptr three", to_text="- new goal")
-        ],
-        match_original=match_original,
-    )
-    with pytest.raises(TextReplacementApplyError, match="multiple similar locations") as error:
-        apply_patches(workspace_tmp_path, [patch])
-    assert error.value.path == target
-    assert len(error.value.candidate_spans) == 2
-    with target.open(encoding="utf-8", newline="\n") as source:
-        assert source.read() == original
-
-
-def test_preview_apply_patches_combines_operations_without_writing(
-    workspace_tmp_path: Path,
-) -> None:
-    target = workspace_tmp_path / "notes.txt"
-    target.write_text("first\nsecond\n", encoding="utf-8", newline="\n")
-    patches = [
-        ApplyPatch(
-            path=Path("notes.txt"),
-            replacements=[TextReplacement(from_text="first", to_text="updated")],
-        ),
-        ApplyPatch(
-            path=Path("notes.txt"),
-            replacements=[TextReplacement(from_text="second", to_text="finished")],
-        ),
-    ]
-
-    assert preview_apply_patches(workspace_tmp_path, patches) == {
-        target.resolve(): "updated\nfinished\n"
-    }
-    assert target.read_text(encoding="utf-8") == "first\nsecond\n"
-
-
-def test_apply_patches_validates_every_target_before_writing(
-    workspace_tmp_path: Path,
-) -> None:
-    allowed = workspace_tmp_path / "allowed.txt"
-    patches = [
-        ApplyPatch(
-            path=allowed,
-            replacements=[TextReplacement(to_text="written only after validation\n")],
-        ),
-        ApplyPatch(
-            path=Path("blocked.txt"),
-            replacements=[TextReplacement(to_text="blocked\n")],
-        ),
-    ]
-
-    with pytest.raises(ValueError, match="output file is not allowed"):
-        apply_patches(workspace_tmp_path, patches, allowed_paths=[allowed])
-
-    assert not allowed.exists()
-
-
-def test_patch_failure_preserves_path_index_and_unabridged_source(
-    workspace_tmp_path: Path,
-) -> None:
-    target = workspace_tmp_path / "notes.md"
-    original = "# Draft\n- Pending\n\n## Notes\n\n- TODO\n"
-    target.write_text(original, encoding="utf-8", newline="\n")
-    source = "## Note\n- TODO"
-    patch = ApplyPatch(
-        path=Path("notes.md"),
-        match_original=True,
-        ignore_punctuation_and_symbols=True,
-        replacements=[
-            TextReplacement(from_text="# Draft", to_text="# Plan"),
-            TextReplacement(from_text="- Pending", to_text="- Ready"),
-            TextReplacement(from_text=source, to_text="## Notes\n\n- Check records"),
-        ],
-    )
-
-    with pytest.raises(TextReplacementApplyError) as caught:
-        apply_patches(workspace_tmp_path, [patch])
-
-    assert caught.value.path == target.resolve()
-    assert caught.value.replacement_index == 3
-    assert caught.value.from_text == source
-    assert target.read_text(encoding="utf-8") == original
-
-
-def test_apply_patches_creates_file_from_whole_file_replacement(
-    workspace_tmp_path: Path,
-) -> None:
-    target = workspace_tmp_path / "created.md"
-
-    written = apply_patches(
-        workspace_tmp_path,
-        [
-            ApplyPatch(
-                path=Path("created.md"),
-                replacements=[TextReplacement(to_text="# Created\n")],
-            )
-        ],
-    )
-
-    assert written == [target.resolve()]
-    assert target.read_text(encoding="utf-8") == "# Created\n"
-
-
-def test_apply_patches_skips_equivalent_replacement(workspace_tmp_path: Path) -> None:
-    target = workspace_tmp_path / "notes.txt"
-    target.write_text("same\r\ntext\r\n", encoding="utf-8", newline="")
-
-    written = apply_patches(
-        workspace_tmp_path,
-        [
-            ApplyPatch(
-                path=target,
-                replacements=[TextReplacement(from_text="same\r\ntext", to_text="same\ntext")],
-            )
-        ],
-    )
-
-    assert written == []
-    assert target.read_bytes() == b"same\r\ntext\r\n"
-
-
-class _PatchOutput(BaseModel, ApplyPatchOutput):
+class _Output(BaseModel, ApplyPatchOutput):
     content: str
 
     def to_apply_patches(self) -> list[ApplyPatch]:
-        return [
-            ApplyPatch(
-                path=Path("note.md"),
-                replacements=[TextReplacement(to_text=self.content)],
-            )
-        ]
+        return [ApplyPatch(Path("nested/note.md"), content=self.content)]
 
 
-def test_apply_patch_output_writes_converted_patches(workspace_tmp_path: Path) -> None:
-    target = workspace_tmp_path / "note.md"
-
-    written = apply_patch_output(workspace_tmp_path, _PatchOutput(content="# Note\n"))
-
-    assert written == [target.resolve()]
-    assert target.read_text(encoding="utf-8") == "# Note\n"
+def test_whole_file_output_and_unchanged_file(tmp_path: Path) -> None:
+    output = _Output(content="# Note\r\n")
+    target = tmp_path / "nested/note.md"
+    assert apply_patch_output(tmp_path, output) == [target]
+    assert target.read_bytes() == b"# Note\n"
+    assert apply_patch_output(tmp_path, output) == []
