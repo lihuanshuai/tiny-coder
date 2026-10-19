@@ -138,20 +138,29 @@ Both return original line numbers and a source `revision`. `read_file` returns J
 `edit_file` takes `path`, `expected_revision`, and `replacements`, for example:
 
 ```json
-{"path":"notes.md","expected_revision":"<revision from read_file>","replacements":[{"start_line":12,"end_line":14,"content":"Complete replacement lines"}]}
+{"path":"notes.md","expected_revision":"<revision from read_file>","replacements":[{"old_start":12,"old_count":3,"new_text":"Complete replacement lines"}]}
 ```
 
-Line numbers start at 1 and both ends are included. All ranges refer to the same read,
-regardless of other edits in the batch. Empty `content` deletes the range;
-`end_line=start_line-1` inserts before `start_line` (use `N+1,N` to append to an N-line file).
+Include `old_text` in a replacement to use adaptive positioning: line numbers become hints,
+and the source fragment identifies the location. A unique exact match takes priority over
+limited whitespace, punctuation, or typo tolerance. Ambiguous matches fail with source
+candidates. Unchanged context is preserved and only minimal changed lines are written;
+insertion can use an existing anchor in both `old_text` and `new_text`. Revision checks still apply.
+
+The diff-style fields `old_start` and `old_count` identify the first original line (1-based)
+and number of lines. All ranges refer to the same read, regardless of other edits in the batch.
+Empty `new_text` deletes the range; without `old_text`, `old_count=0` inserts before `old_start`
+(use `old_start=N+1` to append to an N-line file). With `old_text`, count the anchor lines too.
+New positions and line counts are calculated, not supplied by the caller.
 Replacement content contains complete lines without the displayed line-number prefixes.
 Overlapping ranges and stale revisions are rejected before writing. `write_file` creates a
 file or replaces its full content; overwriting also requires `expected_revision`.
 
 For Python callers, `ApplyPatch(path, content=...)` writes a complete file. Line edits use
 `ApplyPatch(path, replacements=[LineReplacement(...)], expected_revision=text_revision(source))`.
-`LineReplacement` and `text_revision` live in `tiny_coder.line_edit`. The former `TextReplacement`
-and `from_text`/`to_text` API has been replaced by these line ranges; callers must migrate.
+`LineReplacement` and `text_revision` live in `tiny_coder.line_edit`. Callers using the former
+`start_line`/`end_line`/`content` fields must migrate to `old_start`/`old_count`/`new_text`,
+with `old_count=end_line-start_line+1`. `TextReplacement` and `from_text`/`to_text` are not supported.
 
 ## Structured Agent (Factory)
 

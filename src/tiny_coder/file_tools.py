@@ -50,7 +50,7 @@ class WriteFileArgs(BaseModel):
 
 
 class EditFileArgs(BaseModel):
-    """Replace entire inclusive line ranges from one numbered read; no text matching."""
+    """Edit with old_start/old_count/new_text; add old_text for adaptive minimal edits."""
 
     path: str
     expected_revision: str = Field(description="Revision returned by read_file or search_files.")

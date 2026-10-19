@@ -115,7 +115,7 @@ def test_search_read_and_edit_duplicate_lines(tmp_path: Path) -> None:
         {
             "path": "notes.md",
             "expected_revision": read["revision"],
-            "replacements": [{"start_line": 5, "end_line": 5, "content": "updated"}],
+            "replacements": [{"old_start": 5, "old_count": 1, "new_text": "updated"}],
         },
     )
     assert result.startswith("edited")
@@ -132,11 +132,33 @@ def test_stale_line_edit_leaves_external_change_intact(tmp_path: Path) -> None:
         {
             "path": "notes.md",
             "expected_revision": read["revision"],
-            "replacements": [{"start_line": 1, "end_line": 1, "content": "updated"}],
+            "replacements": [{"old_start": 1, "old_count": 1, "new_text": "updated"}],
         },
     )
     assert "revision changed" in result
     assert target.read_bytes() == b"new header\nold\n"
+
+
+def test_adaptive_tool_edit_corrects_hints_but_never_bypasses_revision(tmp_path: Path) -> None:
+    target = tmp_path / "notes.md"
+    target.write_text("# Notes\n\noriginal detail\n", encoding="utf-8", newline="\n")
+    read = json.loads(_invoke(read_file_tool(tmp_path), {"path": "notes.md"}))
+    arguments = {
+        "path": "notes.md",
+        "expected_revision": read["revision"],
+        "replacements": [
+            {
+                "old_start": 999,
+                "old_count": 2,
+                "old_text": "original detail",
+                "new_text": "updated detail",
+            }
+        ],
+    }
+    assert _invoke(edit_file_tool(tmp_path), arguments).startswith("edited")
+    assert target.read_text(encoding="utf-8") == "# Notes\n\nupdated detail\n"
+    assert "revision changed" in _invoke(edit_file_tool(tmp_path), arguments)
+    assert target.read_text(encoding="utf-8") == "# Notes\n\nupdated detail\n"
 
 
 def test_write_existing_file_requires_current_revision(tmp_path: Path) -> None:

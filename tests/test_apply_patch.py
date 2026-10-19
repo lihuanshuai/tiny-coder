@@ -20,7 +20,7 @@ def test_preview_and_write_line_patch(tmp_path: Path) -> None:
     target.write_text("same\nsame\n", encoding="utf-8", newline="\n")
     patch = ApplyPatch(
         Path("notes.md"),
-        replacements=[LineReplacement(start_line=2, end_line=2, content="updated")],
+        replacements=[LineReplacement(old_start=2, old_count=1, new_text="updated")],
         expected_revision=text_revision("same\nsame\n"),
     )
     assert preview_apply_patches(tmp_path, [patch]) == {target: "same\nupdated\n"}
@@ -39,7 +39,7 @@ def test_stale_second_patch_prevents_all_writes(tmp_path: Path) -> None:
                 ApplyPatch(Path("new.md"), content="new\n"),
                 ApplyPatch(
                     Path("existing.md"),
-                    replacements=[LineReplacement(start_line=1, end_line=1, content="updated")],
+                    replacements=[LineReplacement(old_start=1, old_count=1, new_text="updated")],
                     expected_revision=text_revision("old\n"),
                 ),
             ],
@@ -59,6 +59,30 @@ def test_workspace_and_explicit_empty_allowlist(tmp_path: Path, paths: list[Path
             apply_patches(tmp_path, [ApplyPatch(Path("inside.md"), content="x")], allowed_paths=[])
 
 
+def test_ambiguous_adaptive_second_file_prevents_entire_batch(tmp_path: Path) -> None:
+    target = tmp_path / "existing.md"
+    source = "same\nsame\n"
+    target.write_text(source, encoding="utf-8", newline="\n")
+    with pytest.raises(ValueError, match="multiple locations"):
+        apply_patches(
+            tmp_path,
+            [
+                ApplyPatch(Path("new.md"), content="new\n"),
+                ApplyPatch(
+                    Path("existing.md"),
+                    replacements=[
+                        LineReplacement(
+                            old_start=1, old_count=1, old_text="same", new_text="updated"
+                        )
+                    ],
+                    expected_revision=text_revision(source),
+                ),
+            ],
+        )
+    assert not (tmp_path / "new.md").exists()
+    assert target.read_text(encoding="utf-8") == source
+
+
 def test_duplicate_file_batches_are_rejected_before_writing(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="duplicate patch path"):
         apply_patches(
@@ -73,7 +97,7 @@ def test_patch_requires_one_operation_and_line_source_version() -> None:
         ApplyPatch(Path("a.md"))
     with pytest.raises(ValueError, match="expected_revision"):
         ApplyPatch(
-            Path("a.md"), replacements=[LineReplacement(start_line=1, end_line=1, content="x")]
+            Path("a.md"), replacements=[LineReplacement(old_start=1, old_count=1, new_text="x")]
         )
 
 
