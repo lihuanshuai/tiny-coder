@@ -28,6 +28,56 @@ def test_adaptive_edit_uses_source_instead_of_incorrect_line_numbers() -> None:
     assert apply_line_replacements(source, edits) == source.replace("original", "updated")
 
 
+@pytest.mark.parametrize("ending", ["", "\n", "\r\n"])
+def test_exact_inline_fragment_preserves_surrounding_paragraph(ending: str) -> None:
+    source = "# Overview\n\nEarlier events. Current event. Later events.\n\n# Notes\n"
+    edit = _adaptive("Current event." + ending, "Updated event." + ending)
+    assert apply_line_replacements(source, [edit]) == source.replace(
+        "Current event.", "Updated event."
+    )
+
+
+def test_disjoint_inline_changes_on_same_line_share_original_source() -> None:
+    source = "Earlier events. Current event. Later events.\n"
+    edits = [_adaptive("Current event.", "Revised event."), _adaptive("Later events.", "Next.")]
+    resolved = resolve_line_replacements(source, edits)
+    assert len(resolved) == 1
+    assert apply_line_replacements(source, edits) == "Earlier events. Revised event. Next.\n"
+
+
+def test_exact_fragment_crossing_partial_lines_preserves_both_boundaries() -> None:
+    source = "prefix: first detail\nsecond detail: suffix\n"
+    assert (
+        apply_line_replacements(
+            source, [_adaptive("first detail\nsecond detail", "updated detail")]
+        )
+        == "prefix: updated detail: suffix\n"
+    )
+
+
+def test_inline_delete_and_insert_preserve_other_text() -> None:
+    source = "First. Redundant. Last.\n"
+    assert apply_line_replacements(source, [_adaptive("Redundant. ", "")]) == "First. Last.\n"
+    assert (
+        apply_line_replacements(source, [_adaptive("First.", "First. Added.")])
+        == "First. Added. Redundant. Last.\n"
+    )
+
+
+@pytest.mark.parametrize("source", ["prefix repeat repeat suffix\n", "repeat\nprefix repeat\n"])
+def test_repeated_inline_fragment_is_rejected_despite_line_hint(source: str) -> None:
+    with pytest.raises(ValueError, match="multiple locations"):
+        apply_line_replacements(source, [_adaptive("repeat", "updated", hint=1)])
+
+
+def test_overlapping_inline_changes_are_rejected() -> None:
+    with pytest.raises(ValueError, match="overlapping"):
+        apply_line_replacements(
+            "prefix current detail suffix\n",
+            [_adaptive("current detail", "replacement"), _adaptive("detail", "other")],
+        )
+
+
 def test_adaptive_formatting_errors_do_not_rewrite_unchanged_source() -> None:
     source = '- 项目:待确认 "线索"\n'
     old = '  - 项目：待确认 “线索”'
