@@ -126,11 +126,24 @@ def _find_fragment(lines: list[str], old: str, hint: int) -> tuple[int, int]:
 
     scores: list[tuple[float, tuple[int, int]]] = []
     if len(wanted) >= 24:
+        wanted_lines = [_comparable(line) for line in old_lines if line.strip()]
         for bounds, text in fragments.items():
             matcher = SequenceMatcher(None, wanted, _comparable(text), autojunk=False)
             if matcher.quick_ratio() < 0.9:
                 continue
             score = matcher.ratio()
+            if score < 0.9:
+                continue
+            # Long lines must not hide shifted headings or different section boundaries.
+            actual_lines = [_comparable(line) for line in text_lines(text) if line.strip()]
+            line_score = (
+                sum(
+                    SequenceMatcher(None, left, right, autojunk=False).ratio()
+                    for left, right in zip(wanted_lines, actual_lines, strict=True)
+                )
+                / size
+            )
+            score = min(score, line_score)
             if score < 0.9:
                 continue
             scores.append((score, bounds))

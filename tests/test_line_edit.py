@@ -106,6 +106,43 @@ def test_adaptive_unique_close_match_allows_more_than_two_missing_characters() -
     )
 
 
+def test_long_section_typo_is_not_ambiguous_with_shifted_overlapping_windows() -> None:
+    details = " ".join(
+        f"The investigator checked record {i} and confirmed its origin." for i in range(12)
+    )
+    section = f"## Progress\n\n- Start: ready.\n- Development: {details}\n- End: confirmed."
+    source = f"# Report\n\n{section}\n\n## Notes\n\nKeep the original records.\n"
+    old = section.replace("record 3", "recrod 3")
+    new = old.replace("- End: confirmed.", "- End: archived.")
+    assert apply_line_replacements(source, [_adaptive(old, new)]) == source.replace(
+        "- End: confirmed.", "- End: archived."
+    )
+
+
+def test_long_section_boundary_difference_is_not_hidden_by_shared_body() -> None:
+    details = " ".join(
+        f"The investigator checked record {i} and confirmed its origin." for i in range(12)
+    )
+    source = f"## First\n\n{details}\n\n## End\n"
+    old = f"## Missing\n\n{details.replace('record 3', 'recrod 3')}\n\n## End"
+    with pytest.raises(ValueError, match="not found|differs too much"):
+        apply_line_replacements(source, [_adaptive(old, old.replace("record 5", "record 6"))])
+
+
+def test_long_sections_with_same_boundaries_remain_ambiguous() -> None:
+    details = " ".join(
+        f"The investigator checked record {i} and confirmed its origin." for i in range(12)
+    )
+    first = f"## Progress\n\n- Start: ready.\n- Development: {details}\n- End: confirmed."
+    second = first.replace("record 3", "record B")
+    old = first.replace("record 3", "record C")
+    with pytest.raises(ValueError, match="unambiguous"):
+        apply_line_replacements(
+            first + "\n\n" + second + "\n",
+            [_adaptive(old, old.replace("- End: confirmed.", "- End: archived."), hint=1)],
+        )
+
+
 def test_adaptive_low_similarity_reports_difference_and_verbatim_candidate() -> None:
     source = "The investigator checked archive A before leaving the building.\n"
     old = source.replace("archive A", "archives ABCDEFGH").rstrip("\n")
