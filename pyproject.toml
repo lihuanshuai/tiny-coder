@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tiny-coder"
-version = "1.3.0"
+version = "1.3.1"
 description = "Graph-based LLM agent runtime with tool calling and checkpointing"
 readme = "README.md"
 requires-python = ">=3.11"

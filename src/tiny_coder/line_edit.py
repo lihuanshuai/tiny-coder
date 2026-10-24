@@ -30,29 +30,30 @@ class LineReplacement(BaseModel):
     old_text: str | None = Field(
         default=None,
         description=(
-            "Source fragment for adaptive positioning. When supplied, line numbers are hints; "
-            "small whitespace, punctuation, or character differences may be "
-            "accepted only at a unique location. Include adjacent context to disambiguate. "
+            "Source fragment for adaptive positioning. Coordinates are hints for unique matches; "
+            "a repeated full-line fragment requires a matching start and line count. "
+            "small character differences require a unique match. A matching full-line range may "
+            "ignore whitespace or equivalent punctuation. Include context when needed. "
             "For insertion, include an existing anchor in both old_text and new_text."
         ),
     )
 
 
 class AdaptiveLineReplacement(LineReplacement):
-    """Source-grounded edit; coordinates hint at a location instead of selecting it."""
+    """Source-grounded edit; matching full-line coordinates can disambiguate repeats."""
 
     old_start: int = Field(
-        ge=1, strict=True, description="Approximate original first line; a hint only."
+        ge=1, strict=True, description="Original first line; must be accurate for repeated source."
     )
     old_count: int = Field(
-        ge=0, strict=True, description="Approximate original line count; a hint only."
+        ge=0, strict=True, description="Original line count; must be accurate for repeated source."
     )
     old_text: str = Field(
         min_length=1,
         description=(
             "Required source fragment copied from the original snapshot. Coordinates are "
-            "hints; an exact fragment may start or end inside a line but must identify a unique "
-            "location. Surrounding source is preserved. Preserve any disambiguating context in "
+            "hints for unique fragments. Repeated full lines need matching coordinates and source; "
+            "inline fragments must be unique. Surrounding source is preserved. Preserve context in "
             "new_text; only actual changes become line replacements."
         ),
     )
@@ -96,7 +97,22 @@ def _comparable(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
 
-def _find_fragment(lines: list[str], old: str, hint: int) -> tuple[int, int]:
+def _matching_line_hint(
+    lines: list[str], old: str, hint: int, count: int
+) -> tuple[int, int] | None:
+    start, end = hint - 1, hint - 1 + count
+    old_lines = text_lines(old)
+    if count <= 0 or end > len(lines) or count != len(old_lines):
+        return None
+    if all(
+        _comparable(actual) == _comparable(expected)
+        for actual, expected in zip(lines[start:end], old_lines, strict=True)
+    ):
+        return start, end
+    return None
+
+
+def _find_fragment(lines: list[str], old: str, hint: int, count: int) -> tuple[int, int]:
     old_lines = text_lines(old)
     size = sum(bool(line.strip()) for line in old_lines)
     if not size:
@@ -119,9 +135,13 @@ def _find_fragment(lines: list[str], old: str, hint: int) -> tuple[int, int]:
         if len(matches) == 1:
             return matches[0]
         if matches:
+            hinted = _matching_line_hint(lines, old, hint, count)
+            if hinted is not None and hinted in matches:
+                return hinted
             positions = ", ".join(f"{start + 1}..{end}" for start, end in matches)
             raise ValueError(
-                f"old_text matches multiple locations ({positions}); include more context"
+                f"old_text matches multiple locations ({positions}); provide a matching full-line "
+                "range and source, or include more context"
             )
 
     scores: list[tuple[float, tuple[int, int]]] = []
@@ -235,10 +255,17 @@ def resolve_line_replacements(
         try:
             fragment = old.strip("\n")
             start = source.find(fragment) if fragment.strip() else -1
-            if start >= 0:
+            if start >= 0 and source.find(fragment, start + 1) >= 0:
+                hinted = _matching_line_hint(lines, fragment, item.old_start, item.old_count)
+                if hinted is None:
+                    raise ValueError(
+                        "old_text matches multiple locations; provide a matching full-line range "
+                        "and source, or include more context"
+                    )
+                start, end = offsets[hinted[0]], offsets[hinted[1]]
+                updated = _adapt_content(old, source[start:end], content)
+            elif start >= 0:
                 end = start + len(fragment)
-                if source.find(fragment, start + 1) >= 0:
-                    raise ValueError("old_text matches multiple locations; include more context")
                 whole_lines = (start == 0 or source[start - 1] == "\n") and (
                     end == len(source) or source[end] == "\n"
                 )
@@ -249,7 +276,7 @@ def resolve_line_replacements(
                     # A mirrored terminal LF describes the fragment, not the untouched suffix.
                     updated = content.removesuffix("\n") if old.endswith("\n") else content
             else:
-                first, last = _find_fragment(lines, fragment, item.old_start)
+                first, last = _find_fragment(lines, fragment, item.old_start, item.old_count)
                 start, end = offsets[first], offsets[last]
                 updated = _adapt_content(old, source[start:end], content)
             for tag, left, right, new_left, new_right in SequenceMatcher(

@@ -72,7 +72,7 @@ def test_ambiguous_adaptive_second_file_prevents_entire_batch(tmp_path: Path) ->
                     Path("existing.md"),
                     replacements=[
                         LineReplacement(
-                            old_start=1, old_count=1, old_text="same", new_text="updated"
+                            old_start=3, old_count=1, old_text="same", new_text="updated"
                         )
                     ],
                     expected_revision=text_revision(source),
@@ -81,6 +81,27 @@ def test_ambiguous_adaptive_second_file_prevents_entire_batch(tmp_path: Path) ->
         )
     assert not (tmp_path / "new.md").exists()
     assert target.read_text(encoding="utf-8") == source
+
+
+def test_verified_repeated_range_can_be_applied_with_another_file(tmp_path: Path) -> None:
+    target = tmp_path / "existing.md"
+    source = "same\nsame\n"
+    target.write_text(source, encoding="utf-8", newline="\n")
+    apply_patches(
+        tmp_path,
+        [
+            ApplyPatch(Path("new.md"), content="new\n"),
+            ApplyPatch(
+                Path("existing.md"),
+                replacements=[
+                    LineReplacement(old_start=2, old_count=1, old_text="same", new_text="updated")
+                ],
+                expected_revision=text_revision(source),
+            ),
+        ],
+    )
+    assert (tmp_path / "new.md").read_text(encoding="utf-8") == "new\n"
+    assert target.read_text(encoding="utf-8") == "same\nupdated\n"
 
 
 def test_duplicate_file_batches_are_rejected_before_writing(tmp_path: Path) -> None:

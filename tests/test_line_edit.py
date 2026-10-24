@@ -70,6 +70,67 @@ def test_repeated_inline_fragment_is_rejected_despite_line_hint(source: str) -> 
         apply_line_replacements(source, [_adaptive("repeat", "updated", hint=1)])
 
 
+@pytest.mark.parametrize(
+    "first,second,old",
+    [
+        ("repeat", "repeat", "repeat"),
+        ("  - status： pending", "- status: pending", "- status：pending"),
+        ("first\nrepeat", "first\nrepeat", "first\nrepeat"),
+    ],
+)
+def test_matching_full_line_range_disambiguates_repeated_source(
+    first: str, second: str, old: str
+) -> None:
+    prefix = f"# First\n{first}\n\n# Second\n"
+    source = prefix + second + "\n"
+    edit = LineReplacement(
+        old_start=prefix.count("\n") + 1,
+        old_count=len(old.splitlines()),
+        old_text=old,
+        new_text="updated",
+    )
+    assert apply_line_replacements(source, [edit]) == prefix + "updated\n"
+
+
+@pytest.mark.parametrize("start,count", [(1, 1), (3, 1), (99, 1), (2, 0), (2, 2)])
+def test_repeated_source_requires_a_matching_start_count_and_complete_lines(
+    start: int, count: int
+) -> None:
+    edit = LineReplacement(old_start=start, old_count=count, old_text="repeat", new_text="updated")
+    with pytest.raises(ValueError, match="multiple locations"):
+        apply_line_replacements("heading\nrepeat\n\nrepeat\n", [edit])
+
+
+def test_repeated_inline_source_still_requires_unique_context_with_accurate_coordinates() -> None:
+    edit = LineReplacement(old_start=1, old_count=1, old_text="repeat", new_text="updated")
+    with pytest.raises(ValueError, match="multiple locations"):
+        apply_line_replacements("repeat repeat\n", [edit])
+
+
+def test_coordinates_do_not_disambiguate_fuzzy_character_matches() -> None:
+    source = (
+        "The investigator checked archive A before leaving the building.\n"
+        "The investigator checked archive B before leaving the building.\n"
+    )
+    edit = LineReplacement(
+        old_start=1,
+        old_count=1,
+        old_text="The investigator checked archive C before leaving the building.",
+        new_text="updated",
+    )
+    with pytest.raises(ValueError, match="unambiguous"):
+        apply_line_replacements(source, [edit])
+
+
+def test_repeat_coordinates_refer_to_original_snapshot_after_an_earlier_insertion() -> None:
+    source = "heading\nrepeat\n\nrepeat\n"
+    edits = [
+        _adaptive("heading", "heading\ninserted"),
+        LineReplacement(old_start=4, old_count=1, old_text="repeat", new_text="updated"),
+    ]
+    assert apply_line_replacements(source, edits) == "heading\ninserted\nrepeat\n\nupdated\n"
+
+
 def test_overlapping_inline_changes_are_rejected() -> None:
     with pytest.raises(ValueError, match="overlapping"):
         apply_line_replacements(
