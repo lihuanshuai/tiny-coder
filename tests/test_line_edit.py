@@ -230,6 +230,47 @@ def test_identical_old_and_new_are_ignored_before_source_matching() -> None:
     )
 
 
+@pytest.mark.parametrize("ending", ["", "\n", "\r\n"])
+def test_missing_old_is_ignored_when_exact_unique_result_already_fills_declared_range(
+    ending: str,
+) -> None:
+    result = "## Report\n\n- Status: verified\n- Result: accepted"
+    source = "prefix\n" + result + "\nsuffix\n"
+    edit = LineReplacement(old_start=2, old_count=4, old_text="obsolete", new_text=result + ending)
+    assert resolve_line_replacements(source, [edit]) == []
+    assert apply_line_replacements(source, [edit]) == source
+    assert apply_line_replacements(source, [edit, _adaptive("prefix", "updated prefix")]) == (
+        "updated " + source
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "start", "count", "new"),
+    [
+        ("before\nalready\nafter\n", 1, 1, "already"),
+        ("before\nalready\nafter\n", 2, 2, "already"),
+        ("before\nalready\nafter\n", 2, 0, "already"),
+        ("prefix already suffix\n", 1, 1, "already"),
+        ("already\n", 1, 1, "already "),
+        ("already\nalready\n", 1, 1, "already"),
+        ("\n", 1, 1, ""),
+    ],
+)
+def test_missing_old_still_fails_without_exact_unique_result_at_declared_range(
+    source: str, start: int, count: int, new: str
+) -> None:
+    edit = LineReplacement(old_start=start, old_count=count, old_text="obsolete", new_text=new)
+    with pytest.raises(ValueError, match="old_text not found"):
+        apply_line_replacements(source, [edit])
+
+
+def test_existing_result_does_not_override_real_or_ambiguous_source_matches() -> None:
+    edit = LineReplacement(old_start=1, old_count=1, old_text="old detail", new_text="already")
+    assert apply_line_replacements("already\nold detail\n", [edit]) == "already\nalready\n"
+    with pytest.raises(ValueError, match="multiple locations"):
+        apply_line_replacements("already\nold detail\nold detail\n", [edit])
+
+
 @pytest.mark.parametrize(
     "source,old",
     [

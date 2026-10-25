@@ -11,6 +11,10 @@ from hashlib import sha256
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class _SourceNotFoundError(ValueError):
+    """No sufficiently close source exists; an exact result may already be present."""
+
+
 class LineReplacement(BaseModel):
     """Replace old_count original lines at old_start; zero inserts before that line."""
 
@@ -177,13 +181,16 @@ def _find_fragment(lines: list[str], old: str, hint: int, count: int) -> tuple[i
             f"lines {start + 1}..{end} ({score:.3f}):\n{fragments[start, end]}"
             for score, (start, end) in scores[:3]
         )
-        reason = (
-            "old_text differs too much from source (minimum similarity 0.940)"
-            if score < 0.94
-            else "old_text has no unambiguous close match (multiple similarly close locations)"
+        if score < 0.94:
+            raise _SourceNotFoundError(
+                "old_text differs too much from source (minimum similarity 0.940); "
+                f"copy exact source from:\n{options}"
+            )
+        raise ValueError(
+            "old_text has no unambiguous close match (multiple similarly close locations); "
+            f"copy exact source from:\n{options}"
         )
-        raise ValueError(f"{reason}; copy exact source from:\n{options}")
-    raise ValueError(
+    raise _SourceNotFoundError(
         "old_text not found; copy a nonempty, unique source fragment from the snapshot"
     )
 
@@ -276,7 +283,21 @@ def resolve_line_replacements(
                     # A mirrored terminal LF describes the fragment, not the untouched suffix.
                     updated = content.removesuffix("\n") if old.endswith("\n") else content
             else:
-                first, last = _find_fragment(lines, fragment, item.old_start, item.old_count)
+                try:
+                    first, last = _find_fragment(lines, fragment, item.old_start, item.old_count)
+                except _SourceNotFoundError:
+                    first = item.old_start - 1
+                    last = first + item.old_count
+                    result = content.removesuffix("\n")
+                    if (
+                        result.strip()
+                        and item.old_count > 0
+                        and last <= len(lines)
+                        and "".join(lines[first:last]).removesuffix("\n") == result
+                        and source.count(result) == 1
+                    ):
+                        continue
+                    raise
                 start, end = offsets[first], offsets[last]
                 updated = _adapt_content(old, source[start:end], content)
             for tag, left, right, new_left, new_right in SequenceMatcher(
