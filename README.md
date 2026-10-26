@@ -224,13 +224,65 @@ agent = create_structured_agent(
 )
 ```
 
-When tools are given, `tools` and `response_format` are sent in the same request; not every
-OpenAI-compatible server supports both together. If a server rejects the combination, use a
-structured-output-only agent or a manual `Graph` where tool rounds and the final structured call
-are separate nodes.
+With tools and a response model, the loop exposes a `submit_result` tool carrying the final
+schema. Exploration uses normal tool calls without `response_format`; a submission is parsed
+and validated before acceptance. Validation feedback is returned as a tool result so the model
+can read more context and correct its next submission. A structured text response is also
+validated. Without tools, the agent requests JSON-schema output directly.
+
+Set `max_attempts=3` to enable bounded transport and validation retries, and use an optional async
+`accept(call, output)` callback for business validation. Successful context tool rounds do not
+consume this failure budget; `max_steps` still bounds the entire loop. No output extension is
+needed for the default parser. Use either `max_attempts` or an explicit `RetryPolicy`.
+
+For multiple task turns, open an isolated conversation:
+
+```python
+conversation = agent.conversation()
+await conversation.send(StructuredInput(prompt="Inspect the current design."))
+result = await conversation.send(StructuredInput(prompt="Now revise it using those findings."))
+```
+
+Each conversation retains successful user, assistant and tool messages and serializes its sends.
+Public state, including read receipts, also carries over; LLM settings and failure counters are
+reset for each send. `StructuredInput(state=...)` can supply application state, while messages
+and runtime settings always come from their explicit input fields.
+Failed invocations leave the last successful transcript intact; tool side effects are not rolled
+back. Ordinary `agent.invoke` and `agent.send` still start independent tasks. Input-specific tools
+can be supplied with `StructuredInput(tools=[...])` without mutating the agent defaults.
+
+For program-selected context, expose snapshots through `ContextTools` instead of interpolating
+file contents into prompts:
+
+```python
+from tiny_coder.context_tools import ContextFile, ContextTools
+
+agent = create_structured_agent(
+    llm_config=LocalLlmConfig(),
+    response_model=Plan,
+    system_prompt="Use list_files and read_file to inspect context, then submit_result.",
+    max_attempts=3,
+    extensions=(ContextTools([
+        ContextFile(path="design.md", content=design_source, required=True),
+    ]),),
+)
+result = await agent.invoke(StructuredInput(prompt="Plan the refactoring."))
+```
+
+The tools are `list_files`, `read_file` (full files or line ranges), and `grep` (regex location).
+They only expose the supplied snapshots and never access the filesystem or write files.
+`required=True` blocks final acceptance until every line of the current revision has been read;
+disjoint reads can cover a file, but grep hits cannot. A callable snapshot provider receiving
+`AgentCall` may publish a revised in-memory draft or different context for each invocation.
+`list_files` marks already-read current revisions with `read=true`; conversations can reuse
+those reads, while changed revisions require a new read.
+These tools share names with workspace file tools; choose the appropriate toolset rather than
+registering duplicate names. File write permissions and persistence remain application-owned.
 
 Register async subscribers with `agent.events.subscribe(event, handler)`. Typed event keys
-`BEFORE_CALL`, `AFTER_CALL`, `CALL_FAILED`, and `CHUNK_RECEIVED` carry an `AgentCall`.
+`BEFORE_CALL`, `RESPONSE_RECEIVED`, `BEFORE_OUTPUT`, `AFTER_CALL`, `CALL_FAILED`, and
+`CHUNK_RECEIVED` carry an `AgentCall`. `RESPONSE_RECEIVED` records raw outcomes, including rejected
+submissions. `BEFORE_OUTPUT` runs context preflight checks before output acceptance callbacks.
 Subscribers run in registration order and are awaited. Before-call subscribers may update
 `messages`, `system_prompt`, and `llm_config`. After-call subscribers inspect `outcome`;
 failure subscribers receive `error` and any completed outcome. Set `call.retry` to request
@@ -312,7 +364,7 @@ Registration rejects objects that do not inherit `AgentExtension` with `TypeErro
 
 The capabilities in `tiny_coder.agent_extensions` can be used independently:
 
-- `JinjaPrompt`: render system/user templates from a mapping or a callback receiving `AgentCall`.
+- `JinjaPrompt`: render the initial system/user templates once from a mapping or a callback.
 - `StreamOutput`: display raw text or a JSON string field; optionally limit raw response size.
 - `StructuredOutput`: parse the final response and optionally validate or persist it through
   an async `accept(call, output)` callback. The accepted model is available as `result.output`.
@@ -335,7 +387,7 @@ agent = create_structured_agent(
     extensions=(
         JinjaPrompt(
             system="You are a planner.",
-            user=env.from_string("Plan {{ topic }}. {{ retry_errors | join('; ') }}"),
+            user=env.from_string("Plan {{ topic }}."),
             variables=prompt_variables,
         ),
         StreamOutput(field="summary"),
@@ -348,9 +400,10 @@ async def generate(topic: str):
     return await agent.invoke(StructuredInput(context=topic))
 ```
 
-`JinjaPrompt` refreshes variables on every attempt and supplies `retry_errors` from feedback.
-Use `read_file_snapshots(cwd, paths)` in the variables callback for fresh file contents.
-Completed tool exchanges are retained when rendering the next prompt.
+`JinjaPrompt` renders once per invocation and leaves its initial messages unchanged on retries.
+Corrections arrive in later messages, and completed tool exchanges are retained. Use
+`ContextTools` for context that the model must fetch or re-read after a revision. `CallRecording`
+records the conversation and submission arguments, including rejected candidates.
 
 For task-dependent options, supply callbacks receiving `AgentCall`: `JinjaPrompt.system/user`,
 `StreamOutput.field/max_chars/enabled`, and `RetryPolicy.max_attempts/validation_llm_config`.

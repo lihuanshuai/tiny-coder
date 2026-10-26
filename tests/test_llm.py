@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, Literal, TypeVar
 
@@ -24,9 +25,81 @@ from tiny_coder.llm import (
     nonnegative_int_from_llm_field,
     schema_response_format,
     stream_llm_chat,
+    tool_openai_spec,
 )
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+
+def test_tool_wire_schema_exposes_nested_arrays_and_preserves_constraints() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"files": {"type": "array", "items": {"$ref": "#/$defs/File"}}},
+        "required": ["files"],
+        "$defs": {
+            "File": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "path": {"type": "string", "enum": ["note.md"]},
+                    "replacements": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"$ref": "#/$defs/Edit"},
+                    },
+                    "default": {"$ref": "#/$defs/Edit"},
+                },
+                "required": ["path", "replacements"],
+            },
+            "Edit": {
+                "type": "object",
+                "properties": {"old_count": {"type": "integer", "minimum": 1}},
+            },
+        },
+    }
+    original = deepcopy(schema)
+    wire = tool_openai_spec(SimpleNamespace(name="submit_result", parameters=schema))["function"][
+        "parameters"
+    ]
+    file = wire["properties"]["files"]["items"]
+    assert file["type"] == "object"
+    assert file["properties"]["path"]["enum"] == ["note.md"]
+    assert file["additionalProperties"] is False
+    assert file["properties"]["replacements"]["minItems"] == 1
+    assert file["properties"]["replacements"]["items"]["properties"]["old_count"]["minimum"] == 1
+    assert file["properties"]["default"]["type"] == "object"
+    assert "$defs" not in wire and "$ref" not in str(wire)
+    assert schema == original
+    file["properties"]["path"]["enum"].append("other.md")
+    assert schema == original
+
+
+def test_recursive_tool_schema_keeps_resolvable_definitions() -> None:
+    schema = {
+        "$ref": "#/$defs/Node",
+        "$defs": {"Node": {"type": "object", "properties": {"child": {"$ref": "#/$defs/Node"}}}},
+    }
+    wire = tool_openai_spec(SimpleNamespace(name="tree", parameters=schema))["function"][
+        "parameters"
+    ]
+    assert wire == schema
+    assert wire is not schema
+
+
+def test_tool_ref_sibling_constraints_remain_intersected_and_examples_are_data() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"value": {"$ref": "#/$defs/Value", "enum": ["b", "c"]}},
+        "$defs": {"Value": {"type": "string", "enum": ["a", "b"]}},
+        "examples": [{"$ref": "#/$defs/Value"}],
+    }
+    wire = tool_openai_spec(SimpleNamespace(name="choose", parameters=schema))["function"][
+        "parameters"
+    ]
+    assert wire["properties"]["value"] == {
+        "allOf": [{"type": "string", "enum": ["a", "b"]}, {"enum": ["b", "c"]}]
+    }
+    assert wire["examples"] == schema["examples"]
 
 
 class SampleOpenAIConfig(LlmConfig):

@@ -7,6 +7,7 @@ import math
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, TypeAlias, TypeVar, cast
@@ -302,6 +303,52 @@ def openai_extra_body(llm_cfg: LlmConfig) -> dict[str, Any]:
     }
 
 
+def _inline_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Expose nested argument fields to tool renderers that do not follow local refs.
+
+    Recursive or unsupported references retain their original schema. Validation
+    still uses the original Pydantic model, including all runtime constraints.
+    """
+    definitions = schema.get("$defs", {})
+    unresolved = False
+    annotations = {"title", "description", "default", "examples", "example"}
+    data_keywords = {"default", "examples", "example", "enum", "const"}
+
+    def expand(value: Any, trail: tuple[str, ...]) -> Any:
+        nonlocal unresolved
+        if isinstance(value, list):
+            return [expand(item, trail) for item in value]
+        if not isinstance(value, dict):
+            return value
+        reference = value.get("$ref")
+        if reference is not None:
+            if not isinstance(reference, str) or not reference.startswith("#/$defs/"):
+                unresolved = True
+                return deepcopy(value)
+            name = reference.removeprefix("#/$defs/").replace("~1", "/").replace("~0", "~")
+            target = definitions.get(name)
+            if reference in trail or not isinstance(target, dict):
+                unresolved = True
+                return deepcopy(value)
+            resolved = expand(target, (*trail, reference))
+            siblings = expand({key: item for key, item in value.items() if key != "$ref"}, trail)
+            if (resolved.keys() & siblings.keys()) - annotations:
+                return {"allOf": [resolved, siblings]}
+            return {**resolved, **siblings}
+        result = {}
+        for key, item in value.items():
+            if key == "$defs":
+                continue
+            if key in {"properties", "patternProperties", "dependentSchemas"}:
+                result[key] = {name: expand(child, trail) for name, child in item.items()}
+            else:
+                result[key] = deepcopy(item) if key in data_keywords else expand(item, trail)
+        return result
+
+    result = expand(schema, ())
+    return deepcopy(schema) if unresolved else result
+
+
 def tool_openai_spec(tool: object) -> dict[str, Any]:
     name = getattr(tool, "name", None)
     description = getattr(tool, "description", "")
@@ -315,7 +362,7 @@ def tool_openai_spec(tool: object) -> dict[str, Any]:
         "function": {
             "name": name,
             "description": str(description or ""),
-            "parameters": parameters,
+            "parameters": _inline_tool_schema(parameters),
         },
     }
 

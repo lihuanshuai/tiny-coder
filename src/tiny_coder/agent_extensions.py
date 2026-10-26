@@ -17,13 +17,15 @@ from pydantic_core import ErrorDetails
 from tiny_coder.apply_patch import resolve_agent_file_path, resolve_agent_root
 from tiny_coder.eventbus import EventBus
 from tiny_coder.json_utils import JsonStringFieldStreamer
-from tiny_coder.llm import LlmConfig
+from tiny_coder.llm import LlmConfig, parse_structured
 from tiny_coder.structured_agent import (
     AFTER_CALL,
     BEFORE_CALL,
     CALL_FAILED,
     CALL_STARTED,
     CHUNK_RECEIVED,
+    RESPONSE_RECEIVED,
+    SUBMIT_RESULT,
     AgentCall,
     AgentExtension,
 )
@@ -142,7 +144,7 @@ async def render_prompt(prompt: str | Template, variables: Mapping[str, object])
 
 @dataclass
 class JinjaPrompt(AgentExtension):
-    """Refresh the initial prompts while retaining conversation history."""
+    """Render the initial task once; subsequent calls retain its exact messages."""
 
     system: str | Template | Callable[[AgentCall], str | Template]
     user: str | Template | Callable[[AgentCall], str | Template]
@@ -154,17 +156,20 @@ class JinjaPrompt(AgentExtension):
         events.subscribe(BEFORE_CALL, self.prepare)
 
     async def prepare(self, call: AgentCall) -> None:
+        if id(self) in call.prepared_extensions:
+            return
         source = _resolve(self.variables, call)
         variables = {**source, "retry_errors": list(call.feedback)}
         system_prompt = self.system(call) if callable(self.system) else self.system
         user_prompt = self.user(call) if callable(self.user) else self.user
-        call.system_prompt = await render_prompt(system_prompt, variables)
+        system = await render_prompt(system_prompt, variables)
         user = {"role": "user", "content": await render_prompt(user_prompt, variables)}
-        for index, message in enumerate(call.messages):
-            if message.get("role") == "user":
-                call.messages[index] = user
-                return
-        call.messages.insert(0, user)
+        call.system_prompt = system
+        if call.messages and call.messages[-1].get("role") == "user":
+            call.messages[-1] = user
+        else:
+            call.messages.append(user)
+        call.prepared_extensions.add(id(self))
 
 
 def _print_chunk(text: str) -> None:
@@ -246,15 +251,31 @@ class StructuredOutput(AgentExtension):
 
     async def parse(self, call: AgentCall) -> None:
         assert call.outcome is not None
-        if call.outcome.tool_calls:
+        if call.outcome.tool_calls and call.submission is None:
             return
         if call.response_model is None:
             raise ValueError("structured output requires a response_model")
         try:
-            output = call.outcome.model(call.response_model)
+            output = parse_structured(call.response_text, call.response_model)
         except ValidationError as error:
             _reraise_response_validation_error(error)
         if output is None:
+            if call.submission is not None:
+                try:
+                    json.loads(call.response_text)
+                except json.JSONDecodeError as error:
+                    raise ResponseValidationError(
+                        f"invalid structured output: submit_result JSON at line {error.lineno}, column {error.colno}: {error.msg}",
+                        code="invalid_submission_json",
+                        context={"line": error.lineno, "column": error.colno, "offset": error.pos},
+                        suggestion=(
+                            f"Correct the JSON syntax at line {error.lineno}, column {error.colno} "
+                            f"(offset {error.pos}): {error.msg}. Resubmit one complete argument object; "
+                            "keep arrays and objects as JSON values, not JSON-encoded strings. "
+                            "Escape quotes and line breaks inside string fields exactly once. "
+                            "The invalid submission was not accepted."
+                        ),
+                    ) from error
             raise ResponseValidationError(
                 "invalid structured output: response is not a JSON object",
                 suggestion=(
@@ -277,7 +298,7 @@ class CallRecording(AgentExtension):
     )
 
     def register(self, events: EventBus) -> None:
-        events.subscribe(AFTER_CALL, self.record)
+        events.subscribe(RESPONSE_RECEIVED, self.record)
 
     async def record(self, call: AgentCall) -> None:
         assert call.outcome is not None
@@ -291,7 +312,9 @@ class CallRecording(AgentExtension):
                 ),
                 "",
             ),
-            "output": call.outcome.text,
+            "output": call.response_text,
+            "messages": call.messages,
+            "turn": call.turn,
             "stats": {
                 "prompt_eval_count": call.outcome.prompt_eval_count,
                 "eval_count": call.outcome.eval_count,
@@ -347,7 +370,13 @@ class RetryPolicy(AgentExtension):
             isinstance(error, ResponseValidationError)
             and isinstance(call.previous_error, ResponseValidationError)
             and error.message == call.previous_error.message
-            and call.outcome.text == call.previous_outcome.text
+            and call.response_text
+            == (
+                call.previous_outcome.tool_calls[0].function.get("arguments", "")
+                if len(call.previous_outcome.tool_calls) == 1
+                and call.previous_outcome.tool_calls[0].function.get("name") == SUBMIT_RESULT
+                else call.previous_outcome.text
+            )
         ):
             explanation = error.message
         else:
@@ -358,7 +387,7 @@ class RetryPolicy(AgentExtension):
         ) from error
 
     def _add_feedback(self, call: AgentCall) -> None:
-        if call.outcome is None or call.outcome.tool_calls:
+        if call.outcome is None:
             return
         assert call.error is not None
         cause = call.error.__cause__
@@ -378,18 +407,25 @@ class RetryPolicy(AgentExtension):
             errors.append(call.error.feedback())
         else:
             errors.append({"msg": str(call.error)})
-        call.messages.append(
+        content = json.dumps(
             {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "validation_errors": errors,
-                        "response_suggestion": _response_suggestion(call.error),
-                    },
-                    ensure_ascii=False,
-                ),
-            }
+                "validation_errors": errors,
+                "response_suggestion": _response_suggestion(call.error),
+            },
+            ensure_ascii=False,
         )
+        if call.outcome.tool_calls:
+            for tool_call in call.outcome.tool_calls:
+                call.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_call.function.get("name", ""),
+                        "content": content,
+                    }
+                )
+        else:
+            call.messages.append({"role": "user", "content": content})
 
     async def retry(self, call: AgentCall) -> None:
         error = call.error

@@ -314,7 +314,7 @@ def test_factory_and_use_extensions_compose_without_accumulating(
     ]
 
 
-def test_retry_refreshes_variables_and_file_snapshots(
+def test_retry_preserves_initial_prompt_and_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source.md"
@@ -344,10 +344,47 @@ def test_retry_refreshes_variables_and_file_snapshots(
     )
     result = asyncio.run(agent.invoke(StructuredInput()))
     assert result.output == Output(summary="done")
-    assert previous == [None, "invalid"]
+    assert previous == [None]
     assert calls[0][0]["content"] == "1:source.md:first:\n"
-    assert calls[1][0]["content"].startswith("2:source.md:second:invalid structured output")
-    assert calls[1][1]["content"].startswith("2:source.md:second:invalid structured output")
+    assert calls[1][:2] == calls[0][:2]
+    assert calls[1][-2]["content"] == "invalid"
+    assert "invalid structured output" in calls[1][-1]["content"]
+
+
+def test_initial_prompt_preparation_can_retry_without_running_with_incomplete_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = 0
+    requests: list[list[dict[str, Any]]] = []
+
+    def variables(call: AgentCall) -> dict[str, object]:
+        nonlocal prepared
+        prepared += 1
+        if prepared == 1:
+            raise OSError("snapshot temporarily unavailable")
+        return {"topic": "records"}
+
+    async def llm_call(**kwargs: Any) -> LlmChatOutcome:
+        requests.append(kwargs["messages"])
+        return _outcome('{"summary":"done"}')
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm_call)
+    template = Environment().from_string("Inspect {{ topic }}.")
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=Output,
+        max_attempts=2,
+        extensions=(JinjaPrompt(template, template, variables),),
+    )
+    result = asyncio.run(agent.invoke(StructuredInput(prompt="initial request")))
+    assert result.model(Output) == Output(summary="done")
+    assert prepared == 2
+    assert requests == [
+        [
+            {"role": "system", "content": "Inspect records.\n"},
+            {"role": "user", "content": "Inspect records.\n"},
+        ]
+    ]
 
 
 @pytest.mark.parametrize("failure", ["network", "stream", "validation", "accept"])
@@ -516,7 +553,7 @@ def test_validation_retry_sends_rejected_response_and_feedback(
         assert "完整" in feedback["response_suggestion"]
         assert "JSON" in feedback["response_suggestion"]
         assert "原样重复" in feedback["response_suggestion"]
-        assert messages[1]["content"] == ("attempt 2\n" if templated else "prompt")
+        assert messages[1]["content"] == ("attempt 1\n" if templated else "prompt")
         return _outcome('{"content":"valid"}')
 
     extensions: list[AgentExtension] = [RetryPolicy(3)] if retry_first else []
@@ -571,7 +608,7 @@ def test_response_advice_reaches_templates_messages_and_final_errors(
         messages = kwargs["messages"]
         feedback = json.loads(messages[-1]["content"])
         advice = feedback["response_suggestion"]
-        assert advice in messages[1]["content"]
+        assert messages[1]["content"] == "\n"
         assert "完整" in advice
         assert "input_value" not in messages[1]["content"]
         assert "errors.pydantic.dev" not in messages[1]["content"]
@@ -788,7 +825,8 @@ def test_concurrent_invocations_isolate_context_feedback_and_streams(
             assert kwargs["messages"][1]["content"] == "\n"
         elif attempts[name] == 2:
             assert kwargs["llm_cfg"].temperature == 0.2
-            assert "invalid structured output" in kwargs["messages"][1]["content"]
+            assert kwargs["messages"][1]["content"] == "\n"
+            assert "invalid structured output" in kwargs["messages"][-1]["content"]
         return _outcome('{"summary":"' + name + '"}')
 
     monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm_call)

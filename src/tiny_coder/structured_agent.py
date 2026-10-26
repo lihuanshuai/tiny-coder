@@ -1,11 +1,13 @@
-"""A ready-to-run agent that returns one structured response, optionally with tools."""
+"""A bounded conversation loop with tools, structured acceptance and reusable sessions."""
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -19,6 +21,7 @@ from tiny_coder.llm import (
     LlmChatOutcome,
     LlmConfig,
     LlmExchange,
+    ToolCall,
     parse_structured,
     schema_response_format,
     stream_llm_chat,
@@ -36,6 +39,7 @@ _ATTEMPT_KEY = "_attempt"
 _RETRY_KEY = "_retry"
 _RESPONSE_FORMAT_KEY = "_response_format"
 _SYSTEM_PROMPT_KEY = "_system_prompt"
+SUBMIT_RESULT = "submit_result"
 
 
 @dataclass
@@ -66,10 +70,33 @@ class AgentCall:
     chunk: str = ""
     steering: tuple[str, ...] = ()
     resources: ExitStack = field(default_factory=ExitStack, repr=False)
+    tools: list[Tool] = field(default_factory=list)
+    turn: int = 1
+    prepared_extensions: set[int] = field(default_factory=set, repr=False)
+    submission_enabled: bool = True
+
+    @property
+    def submission(self) -> ToolCall | None:
+        if self.outcome is not None and self.response_model is not None and self.tools:
+            return next(
+                (tc for tc in self.outcome.tool_calls if tc.function.get("name") == SUBMIT_RESULT),
+                None,
+            )
+        return None
+
+    @property
+    def response_text(self) -> str:
+        """The final JSON, whether returned as text or submit_result arguments."""
+        submission = self.submission
+        if submission is not None:
+            return submission.function.get("arguments", "")
+        return self.outcome.text if self.outcome is not None else ""
 
 
 CALL_STARTED = Event[AgentCall]("llm.call_started")
 BEFORE_CALL = Event[AgentCall]("llm.before_call")
+RESPONSE_RECEIVED = Event[AgentCall]("llm.response_received")
+BEFORE_OUTPUT = Event[AgentCall]("llm.before_output")
 AFTER_CALL = Event[AgentCall]("llm.after_call")
 CALL_FAILED = Event[AgentCall]("llm.call_failed")
 CHUNK_RECEIVED = Event[AgentCall]("llm.chunk_received")
@@ -92,6 +119,8 @@ class StructuredResult:
     @property
     def text(self) -> str:
         """Content of the last non-empty assistant message."""
+        if self.output is not None and self.outcome is not None and self.outcome.tool_calls:
+            return self.output.model_dump_json()
         for message in reversed(self.messages):
             if message.get("role") != "assistant":
                 continue
@@ -126,6 +155,8 @@ class StructuredInput:
     response_model: type[BaseModel] | None = None
     system_prompt: str | None = None
     context: object | None = None
+    tools: Sequence[Tool] | None = None
+    state: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -134,11 +165,13 @@ class _Invocation:
     context: object | None
     feedback: list[str] = field(default_factory=list)
     call: AgentCall | None = None
+    tools: Sequence[Tool] = ()
+    prepared_extensions: set[int] = field(default_factory=set)
 
 
 @dataclass
 class StructuredAgent(Agent[StructuredInput, StructuredResult]):
-    """An agent that returns one structured model response, using tools when configured."""
+    """Run a task through tool calls and validation until a final response is accepted."""
 
     graph: Graph
     llm_config: LlmConfig
@@ -146,6 +179,7 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     tools: list[Tool] = field(default_factory=list)
     checkpointer: Checkpointer | None = None
+    accept: Callable[[AgentCall, BaseModel], Awaitable[None]] | None = None
     _invocation: ContextVar[_Invocation | None] = field(
         default_factory=lambda: ContextVar("structured_agent_invocation", default=None),
         init=False,
@@ -154,11 +188,21 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
 
     def use(self, *extensions: AgentExtension) -> StructuredAgent:
         """Compose capabilities for all future invocations."""
+        if self.accept is not None:
+            # Output extensions depend on this module's lifecycle types.
+            from tiny_coder.agent_extensions import StructuredOutput
+
+            if any(isinstance(extension, StructuredOutput) for extension in extensions):
+                raise ValueError("configure either accept or a StructuredOutput extension")
         for extension in extensions:
             if not isinstance(extension, AgentExtension):
                 raise TypeError("extensions must be AgentExtension instances")
             extension.register(self.events)
         return self
+
+    def conversation(self) -> AgentConversation:
+        """Open an isolated, serial conversation using this agent's loop."""
+        return AgentConversation(self)
 
     async def _emit_chunk(self, chunk: str) -> None:
         invocation = self._invocation.get()
@@ -178,7 +222,11 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
         """
         model = input.response_model or self.response_model
         initial = self._initial_state(input, model)
-        invocation = _Invocation(response_model=model, context=input.context)
+        invocation = _Invocation(
+            response_model=model,
+            context=input.context,
+            tools=self.tools if input.tools is None else input.tools,
+        )
         token = self._invocation.set(invocation)
         try:
             state = await self.graph.run(
@@ -195,14 +243,17 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
             self._invocation.reset(token)
 
     def _initial_state(self, input: StructuredInput, model: type[BaseModel] | None) -> State:
-        history = [dict(message) for message in input.messages]
+        history = deepcopy([dict(message) for message in input.messages])
         if input.prompt:
             history.append({"role": "user", "content": input.prompt})
         if not history and not self.events.has_subscribers(BEFORE_CALL):
             raise ValueError("prompt or messages is required")
         config = input.llm_config or self.llm_config
         return {
+            **deepcopy(dict(input.state)),
             "messages": history,
+            _ATTEMPT_KEY: 0,
+            _RETRY_KEY: False,
             _LLM_CONFIG_KEY: config.model_dump(),
             _RESPONSE_FORMAT_KEY: schema_response_format(model) if model is not None else None,
             _SYSTEM_PROMPT_KEY: self.system_prompt
@@ -241,24 +292,67 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
             previous_outcome=previous_outcome,
             previous_error=previous_error,
             feedback=invocation.feedback,
+            tools=list(invocation.tools),
+            turn=invocation.call.turn + 1 if invocation.call is not None else 1,
+            prepared_extensions=invocation.prepared_extensions,
         )
+        if (
+            invocation.call is not None
+            and invocation.call.outcome is not None
+            and invocation.call.outcome.tool_calls
+            and not invocation.call.retry
+        ):
+            call.attempt = invocation.call.attempt
         invocation.call = call
         return call
 
     async def _run_call(self, call: AgentCall) -> None:
         """Run the ordered lifecycle; release resources before dispatching failures."""
+        # Extensions import the event types above; load the default parser after module setup.
+        from tiny_coder.agent_extensions import ResponseValidationError, StructuredOutput
+
         try:
             with call.resources:
                 await self.events.emit(CALL_STARTED, call)
                 await self.events.emit(BEFORE_CALL, call)
                 call.outcome = await self._complete(call)
                 call.messages.append(call.outcome.message)
+                await self.events.emit(RESPONSE_RECEIVED, call)
+                if call.submission is not None and len(call.outcome.tool_calls) != 1:
+                    raise ResponseValidationError(
+                        "submit_result must be the only tool call in its turn",
+                        suggestion="Complete context tool calls first, then call submit_result once in a separate turn.",
+                    )
+                if not call.outcome.tool_calls or call.submission is not None:
+                    await self.events.emit(BEFORE_OUTPUT, call)
                 await self.events.emit(AFTER_CALL, call)
+                if call.response_model is not None and call.output is None:
+                    await StructuredOutput(self.accept).parse(call)
+                if call.submission is not None:
+                    self._submission_reply(call, '{"accepted":true}')
         except Exception as error:
             call.error = error
             await self.events.emit(CALL_FAILED, call)
             if not call.retry:
                 raise
+
+    @staticmethod
+    def _submission_reply(call: AgentCall, content: str) -> None:
+        assert call.outcome is not None
+        for tool_call in call.outcome.tool_calls:
+            call.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_call.function.get("name", ""),
+                    "content": content,
+                }
+            )
+
+    async def _tools(self, state: State) -> dict[str, Any]:
+        invocation = self._invocation.get()
+        assert invocation is not None and invocation.call is not None
+        return dict(await ToolNode(invocation.call.tools)(state))
 
     async def _complete(self, call: AgentCall) -> LlmChatOutcome:
         """Translate a prepared call to the LLM transport and publish streamed data."""
@@ -267,6 +361,28 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
         # Apply after prompt extensions render. Keep supplementary instructions
         # out of graph history so retries and tool loops cannot duplicate them.
         call.steering = current_instructions()
+        tools = list(call.tools)
+        if tools and call.response_model is not None:
+            if any(tool.name == SUBMIT_RESULT for tool in tools):
+                raise ValueError(f"reserved tool name: {SUBMIT_RESULT}")
+
+        if tools and call.response_model is not None and call.submission_enabled:
+
+            async def submit(state: State, **kwargs: Any) -> str:
+                raise RuntimeError("submit_result is handled by the agent loop")
+
+            tools.append(
+                Tool(
+                    name=SUBMIT_RESULT,
+                    description="Submit the complete final result after reading context and completing the task. Call this alone. Validation errors are returned for correction; a rejected submission is not accepted.",
+                    model=call.response_model,
+                    handler=submit,
+                    parameters_schema=call.response_format["json_schema"]["schema"]
+                    if call.response_format is not None
+                    else None,
+                )
+            )
+        ToolNode(tools)  # Reject duplicate names before sending any request.
         return await stream_llm_chat(
             llm_cfg=call.llm_config,
             messages=[
@@ -274,8 +390,8 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
                 *call.messages,
                 *({"role": "user", "content": text} for text in call.steering),
             ],
-            tools=self.tools or None,
-            response_format=call.response_format,
+            tools=tools or None,
+            response_format=None if tools else call.response_format,
             on_chunk=self._emit_chunk if self.events.has_subscribers(CHUNK_RECEIVED) else None,
             on_exchange=self._emit_exchange
             if self.events.has_subscribers(EXCHANGE_RECEIVED)
@@ -285,7 +401,40 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
     def _route(self, state: State) -> str:
         if state.get(_RETRY_KEY):
             return "llm"
-        return "tools" if self.tools and has_tool_calls(state) else END
+        return "tools" if has_tool_calls(state) else END
+
+
+@dataclass
+class AgentConversation:
+    """A transcript shared across successful turns, isolated from other conversations.
+
+    Failed invocations do not replace the last successful transcript. Tool side effects
+    remain the caller's responsibility; this object is not a filesystem transaction.
+    """
+
+    agent: StructuredAgent
+    _state: State = field(default_factory=dict, init=False, repr=False)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        return deepcopy(self._state.get("messages", []))
+
+    async def send(self, input: StructuredInput) -> StructuredResult:
+        async with self._lock:
+            request = StructuredInput(
+                prompt=input.prompt,
+                messages=[*self.messages, *input.messages],
+                llm_config=input.llm_config,
+                response_model=input.response_model,
+                system_prompt=input.system_prompt,
+                context=input.context,
+                tools=input.tools,
+                state={**deepcopy(self._state), **input.state},
+            )
+            result = await self.agent.send(request)
+            self._state = deepcopy(result.state)
+            return result
 
 
 def create_structured_agent(
@@ -297,18 +446,22 @@ def create_structured_agent(
     checkpointer: Checkpointer | None = None,
     max_steps: int = 100,
     extensions: Sequence[AgentExtension] = (),
+    max_attempts: int | None = None,
+    accept: Callable[[AgentCall, BaseModel], Awaitable[None]] | None = None,
 ) -> StructuredAgent:
-    """Build an agent that returns one structured response, or routes tool calls when tools are given.
+    """Build a bounded task loop; no prompt or output extension is required.
 
-    Set ``response_model`` to force JSON schema output. When tools are configured and no
-    response model is set, the run is a pure tool loop whose results arrive through the
-    tool handlers, so the server is not forced into structured output on every turn.
-    Subscribe through ``agent.events``. A subscriber's ``call.retry`` requests another
-    LLM call; ``max_steps`` bounds both these calls and tool-node executions.
+    With tools and a response model, expose submit_result with that model's schema
+    and validate its arguments locally; exploration is not constrained to JSON output.
+    Without tools, request JSON schema output directly. ``accept`` may reject a result
+    before it is returned. ``max_attempts`` enables failure feedback and retries;
+    successful tool rounds do not consume that budget. ``max_steps`` bounds all LLM
+    and tool-node executions, including loops without a final submission.
     """
     if max_steps < 1:
         raise ValueError("max_steps must be at least 1")
     resolved_tools = list(tools) if tools is not None else []
+    ToolNode(resolved_tools)
     graph = Graph(max_steps=max_steps)
     agent = StructuredAgent(
         graph=graph,
@@ -317,16 +470,23 @@ def create_structured_agent(
         system_prompt=system_prompt,
         tools=resolved_tools,
         checkpointer=checkpointer,
+        accept=accept,
     )
     graph.add_node("llm", agent._call)
-    if resolved_tools:
-        graph.add_node("tools", ToolNode(resolved_tools))
-        graph.add_edge("tools", "llm")
+    graph.add_node("tools", agent._tools)
+    graph.add_edge("tools", "llm")
     graph.add_conditional_edges(
         "llm",
         agent._route,
-        {"llm": "llm", END: END, **({"tools": "tools"} if resolved_tools else {})},
+        {"llm": "llm", END: END, "tools": "tools"},
     )
+    if max_attempts is not None:
+        # RetryPolicy depends on the lifecycle types defined in this module.
+        from tiny_coder.agent_extensions import RetryPolicy
+
+        if any(isinstance(extension, RetryPolicy) for extension in extensions):
+            raise ValueError("configure either max_attempts or a RetryPolicy extension")
+        agent.use(RetryPolicy(max_attempts))
     return agent.use(*extensions)
 
 
@@ -352,11 +512,14 @@ __all__ = [
     "AgentExtension",
     "CALL_STARTED",
     "BEFORE_CALL",
+    "RESPONSE_RECEIVED",
+    "BEFORE_OUTPUT",
     "AFTER_CALL",
     "CALL_FAILED",
     "CHUNK_RECEIVED",
     "EXCHANGE_RECEIVED",
     "StructuredAgent",
+    "AgentConversation",
     "StructuredInput",
     "StructuredResult",
     "create_structured_agent",

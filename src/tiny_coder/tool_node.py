@@ -36,6 +36,7 @@ class Tool:
     description: str
     model: type[BaseModel]
     handler: ToolHandler
+    parameters_schema: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.name or not self.name.strip():
@@ -47,7 +48,11 @@ class Tool:
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return self.model.model_json_schema()
+        return (
+            self.parameters_schema
+            if self.parameters_schema is not None
+            else self.model.model_json_schema()
+        )
 
     @classmethod
     def from_model(
