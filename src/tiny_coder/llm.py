@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -128,11 +129,16 @@ def _positive_float_from_llm_field(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     number = float(value)
-    return number if number > 0 else None
+    return number if math.isfinite(number) and number > 0 else None
 
 
 def _tokens_per_second(token_count: int, duration_seconds: float | None) -> float | None:
-    if duration_seconds is None or duration_seconds <= 0:
+    if (
+        token_count <= 0
+        or duration_seconds is None
+        or not math.isfinite(duration_seconds)
+        or duration_seconds <= 0
+    ):
         return None
     return token_count / duration_seconds
 
@@ -246,8 +252,8 @@ def _llm_tail_metrics_dict(
     reasoning_chars: int,
     prompt_eval_count: int,
     eval_count: int,
-    observed_prompt_seconds: float,
-    observed_eval_seconds: float,
+    server_timings: Mapping[str, float],
+    request_seconds: float,
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {}
     usage = packet.usage
@@ -264,24 +270,22 @@ def _llm_tail_metrics_dict(
         metrics["done_reason"] = done_reason
     if reasoning_chars:
         metrics["reasoning_chars"] = reasoning_chars
-    prompt_duration_ns = _positive_float_from_llm_field(
-        getattr(packet, "prompt_eval_duration", None)
-    )
-    eval_duration_ns = _positive_float_from_llm_field(getattr(packet, "eval_duration", None))
-    prompt_speed = _tokens_per_second(
+    prompt_duration_ns = server_timings.get("prompt_eval_duration")
+    eval_duration_ns = server_timings.get("eval_duration")
+    prompt_speed = server_timings.get("prompt_per_second") or _tokens_per_second(
         prompt_eval_count,
-        prompt_duration_ns / 1_000_000_000
-        if prompt_duration_ns is not None
-        else observed_prompt_seconds,
+        prompt_duration_ns / 1_000_000_000 if prompt_duration_ns is not None else None,
     )
-    eval_speed = _tokens_per_second(
+    eval_speed = server_timings.get("predicted_per_second") or _tokens_per_second(
         eval_count,
-        eval_duration_ns / 1_000_000_000 if eval_duration_ns is not None else observed_eval_seconds,
+        eval_duration_ns / 1_000_000_000 if eval_duration_ns is not None else None,
     )
     if prompt_speed is not None:
         metrics["prompt_tokens_per_second"] = prompt_speed
     if eval_speed is not None:
         metrics["eval_tokens_per_second"] = eval_speed
+    elif (average := _tokens_per_second(eval_count, request_seconds)) is not None:
+        metrics["request_tokens_per_second"] = average
     metrics["provider"] = "openai-compatible"
     return metrics
 
@@ -351,7 +355,7 @@ async def stream_llm_chat(
     last_packet: ChatCompletionChunk | None = None
     done_reason: str | None = None
     reasoning_chars = 0
-    first_model_token_at: float | None = None
+    server_timings: dict[str, float] = {}
     collected: list[str] = []
     tool_call_slots: dict[int, dict[str, Any]] = {}
 
@@ -411,12 +415,21 @@ async def stream_llm_chat(
                 eval_count = completion_count
                 had_eval_metric = True
 
+            timing_values = {
+                key: getattr(packet, key, None) for key in ("prompt_eval_duration", "eval_duration")
+            }
+            timings = getattr(packet, "timings", None)
+            if isinstance(timings, dict):
+                timing_values.update(
+                    (key, timings.get(key)) for key in ("prompt_per_second", "predicted_per_second")
+                )
+            for key, value in timing_values.items():
+                if (duration_or_speed := _positive_float_from_llm_field(value)) is not None:
+                    server_timings[key] = duration_or_speed
+
             deltas = _chunk_tool_call_deltas(packet)
             if deltas:
                 _merge_tool_call_deltas(tool_call_slots, deltas)
-            has_output = bool(content) or bool(reasoning) or bool(deltas)
-            if first_model_token_at is None and has_output:
-                first_model_token_at = time.perf_counter()
             reasoning_chars += len(reasoning)
             if finish_reason is not None:
                 done_reason = finish_reason
@@ -447,7 +460,6 @@ async def stream_llm_chat(
             f"prompt_eval_count={prompt_eval_count}, eval_count={eval_count}, "
             f"reasoning_chars={reasoning_chars})"
         )
-    assert first_model_token_at is not None
     assert last_packet is not None
     completed = time.perf_counter()
     completed_at = datetime.now(timezone.utc).isoformat()
@@ -465,8 +477,8 @@ async def stream_llm_chat(
             reasoning_chars=reasoning_chars,
             prompt_eval_count=prompt_eval_count,
             eval_count=eval_count,
-            observed_prompt_seconds=first_model_token_at - started,
-            observed_eval_seconds=completed - first_model_token_at,
+            server_timings=server_timings,
+            request_seconds=completed - started,
         ),
     )
     if on_exchange is not None:

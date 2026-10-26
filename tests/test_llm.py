@@ -287,6 +287,8 @@ def test_stream_llm_chat_forwards_messages_and_metrics(
     assert outcome.prompt_eval_count == 3
     assert outcome.eval_count == 4
     assert outcome.llm["provider"] == "openai-compatible"
+    assert outcome.llm['prompt_tokens_per_second'] == 2.0
+    assert outcome.llm['eval_tokens_per_second'] == 2.0
     assert FakeCompletions.kwargs["messages"] == [{"role": "user", "content": "say hello"}]
     assert "response_format" not in FakeCompletions.kwargs
     assert "tools" not in FakeCompletions.kwargs
@@ -312,6 +314,85 @@ def test_stream_llm_chat_records_exchange(
     assert len(seen) == 1
     assert seen[0].messages == [{"role": "user", "content": "say hello"}]
     assert seen[0].response is outcome
+
+
+def test_buffered_output_uses_request_average_instead_of_stream_drain_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch(
+        monkeypatch,
+        [
+            _chunk(delta=ChoiceDelta(content="complete response"), finish_reason="stop"),
+            _chunk(
+                usage=CompletionUsage(prompt_tokens=100, completion_tokens=1849, total_tokens=1949),
+                no_choices=True,
+            ),
+        ],
+    )
+    clock = iter([0.0, 50.0, 50.0011])
+    monkeypatch.setattr(llm_module.time, 'perf_counter', lambda: next(clock, 50.0011))
+    result = asyncio.run(
+        stream_llm_chat(llm_cfg=SampleOpenAIConfig(), messages=[{'role': 'user', 'content': 'hi'}])
+    )
+    assert result.eval_count == 1849
+    assert 'eval_tokens_per_second' not in result.llm
+    assert 'prompt_tokens_per_second' not in result.llm
+    assert result.llm['request_tokens_per_second'] == pytest.approx(
+        1849 / (result.client_wall_time_ms / 1000)
+    )
+    assert result.llm['request_tokens_per_second'] < 38
+
+
+@pytest.mark.parametrize('timings_on_usage_packet', [True, False])
+def test_stream_preserves_server_speeds_even_before_usage_tail(
+    monkeypatch: pytest.MonkeyPatch, timings_on_usage_packet: bool
+) -> None:
+    timings = {'prompt_per_second': 1200.0, 'predicted_per_second': 42.5}
+    _patch(
+        monkeypatch,
+        [
+            _chunk(
+                delta=ChoiceDelta(content='response'),
+                finish_reason='stop',
+                timings=None if timings_on_usage_packet else timings,
+            ),
+            _chunk(
+                usage=CompletionUsage(prompt_tokens=100, completion_tokens=10, total_tokens=110),
+                no_choices=True,
+                timings=timings if timings_on_usage_packet else None,
+            ),
+        ],
+    )
+    result = asyncio.run(
+        stream_llm_chat(llm_cfg=SampleOpenAIConfig(), messages=[{'role': 'user', 'content': 'hi'}])
+    )
+    assert result.llm['prompt_tokens_per_second'] == 1200.0
+    assert result.llm['eval_tokens_per_second'] == 42.5
+    assert 'request_tokens_per_second' not in result.llm
+
+
+@pytest.mark.parametrize('invalid', [float('inf'), float('nan'), -1.0, True])
+def test_invalid_server_timings_fall_back_to_request_average(
+    monkeypatch: pytest.MonkeyPatch, invalid: float | bool
+) -> None:
+    _patch(
+        monkeypatch,
+        [
+            _chunk(
+                delta=ChoiceDelta(content='response'),
+                usage=CompletionUsage(prompt_tokens=100, completion_tokens=10, total_tokens=110),
+                prompt_eval_duration=invalid,
+                eval_duration=invalid,
+                timings={'prompt_per_second': invalid, 'predicted_per_second': invalid},
+            )
+        ],
+    )
+    result = asyncio.run(
+        stream_llm_chat(llm_cfg=SampleOpenAIConfig(), messages=[{'role': 'user', 'content': 'hi'}])
+    )
+    assert 'prompt_tokens_per_second' not in result.llm
+    assert 'eval_tokens_per_second' not in result.llm
+    assert result.llm['request_tokens_per_second'] > 0
 
 
 def test_stream_llm_chat_reuses_caller_owned_client(monkeypatch: pytest.MonkeyPatch) -> None:

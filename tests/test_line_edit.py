@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from tiny_coder.line_edit import (
     LineReplacement,
+    LineReplacementConflictError,
     apply_line_replacements,
     grep_lines,
     numbered_text,
@@ -53,6 +54,26 @@ def test_exact_fragment_crossing_partial_lines_preserves_both_boundaries() -> No
         )
         == "prefix: updated detail: suffix\n"
     )
+
+
+@pytest.mark.parametrize("leading", ["", "\n", "\n\n"])
+@pytest.mark.parametrize("trailing", ["\n", "\n\n", "\n\n\n"])
+def test_exact_fragment_preserves_boundary_blank_lines(leading: str, trailing: str) -> None:
+    old = leading + "## Summary" + trailing
+    source = "prefix\n" + old + "## Notes\n\nKeep these notes.\n"
+    new = leading + "## Summary\n\nThe investigator checked the records.\n"
+    assert apply_line_replacements(source, [_adaptive(old, new)]) == source.replace(old, new)
+
+
+def test_boundary_blank_lines_disambiguate_only_with_matching_full_line_coordinates() -> None:
+    source = "## Summary\n\n\n## Summary\n\n\n"
+    old = "## Summary\n\n\n"
+    new = "## Summary\n\nThe records were checked.\n"
+    edit = LineReplacement(old_start=4, old_count=3, old_text=old, new_text=new)
+    assert apply_line_replacements(source, [edit]) == old + new
+    edit.old_count = 1
+    with pytest.raises(ValueError, match="multiple locations"):
+        apply_line_replacements(source, [edit])
 
 
 def test_inline_delete_and_insert_preserve_other_text() -> None:
@@ -165,6 +186,39 @@ def test_adaptive_unique_close_match_allows_more_than_two_missing_characters() -
     assert apply_line_replacements(source, [_adaptive(old, new)]) == source.replace(
         "before leaving", "and recorded the result"
     )
+
+
+def test_exact_changed_line_preserves_source_history_omitted_from_shared_context() -> None:
+    old = "- Start: ready.\n- Development: checked the archive.\n- End: filed the report."
+    future = " Later reviewed the evidence, completed training and joined another investigation."
+    source = old.replace("checked the archive.", "checked the archive." + future) + "\n"
+    new = old.replace("checked the archive", "verified the archive")
+    request = _adaptive(old, new, hint=1)
+    request.old_count = 3
+    assert apply_line_replacements(source, [request]) == source.replace(
+        "checked the archive", "verified the archive"
+    )
+
+
+@pytest.mark.parametrize('fault', ['repeated', 'wrong_prefix', 'wrong_suffix', 'inexact'])
+def test_changed_line_recovery_requires_unique_exact_source_and_intact_outer_context(
+    fault: str,
+) -> None:
+    old = "- Start: ready.\n- Development: checked the archive.\n- End: filed the report."
+    source = old.replace(
+        "checked the archive.",
+        "checked the archive. Later studied additional evidence and completed another assignment.",
+    )
+    if fault == 'repeated':
+        source += "\n" + source
+    elif fault == 'wrong_prefix':
+        source = source.replace('- Start: ready.', '- Start: an entirely different state.')
+    elif fault == 'wrong_suffix':
+        source = source.replace('- End: filed the report.', '- End: an unrelated outcome.')
+    else:
+        source = source.replace('checked the archive', 'inspected the archive')
+    with pytest.raises(ValueError):
+        apply_line_replacements(source, [_adaptive(old, old.replace('checked', 'verified'))])
 
 
 def test_long_section_typo_is_not_ambiguous_with_shifted_overlapping_windows() -> None:
@@ -320,6 +374,64 @@ def test_adaptive_edits_with_shared_context_resolve_to_disjoint_minimal_ranges()
     assert apply_line_replacements(source, edits) == "A\n\nB\n"
     with pytest.raises(ValueError, match="overlapping"):
         apply_line_replacements(source, [edits[0], _adaptive("first", "other")])
+
+
+@pytest.mark.parametrize(
+    "fragments",
+    [
+        ["alpha\nbravo\ncharlie", "charlie\ndelta"],
+        ["alpha\nbravo\ncharlie\ndelta", "bravo\ncharlie"],
+        ["alpha\nbravo", "bravo\ncharlie", "charlie\ndelta"],
+        ["alpha\nbravo\ncharlie\ndelta", "alpha\nbravo\ncharlie\ndelta"],
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_overlapping_adaptive_deletions_remove_the_union_once(
+    fragments: list[str], reverse: bool
+) -> None:
+    source = "prefix\nalpha\nbravo\ncharlie\ndelta\necho\nsuffix\n"
+    edits = [_adaptive(fragment, "") for fragment in fragments]
+    if reverse:
+        edits.reverse()
+    edits.extend([_adaptive("prefix", "new prefix"), _adaptive("echo", "reviewed")])
+    assert apply_line_replacements(source, edits) == "new prefix\nreviewed\nsuffix\n"
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        _adaptive("bravo", "checked"),
+        _adaptive("alpha\nbravo", "bravo\nnew"),
+        _adaptive("bravo", "bra added vo"),
+    ],
+)
+def test_deletions_still_conflict_with_overlapping_nonempty_edits(
+    replacement: LineReplacement, reverse: bool
+) -> None:
+    source = "prefix\nalpha\nbravo\ncharlie\ndelta\nsuffix\n"
+    edits = [
+        _adaptive("alpha\nbravo\ncharlie", ""),
+        _adaptive("charlie\ndelta", ""),
+        replacement,
+    ]
+    if reverse:
+        edits.reverse()
+    with pytest.raises(LineReplacementConflictError, match="overlapping") as error:
+        apply_line_replacements(source, edits)
+    first, second = error.value.replacement_indices
+    assert bool(edits[first - 1].new_text) != bool(edits[second - 1].new_text)
+
+
+def test_conflict_identifies_original_replacement_indices_including_unchanged_items() -> None:
+    edits = [
+        _adaptive("prefix", "prefix"),
+        _adaptive("alpha", "checked"),
+        _adaptive("alpha", "confirmed"),
+    ]
+    with pytest.raises(LineReplacementConflictError) as error:
+        resolve_line_replacements("prefix\nalpha\nsuffix\n", edits)
+    assert error.value.replacement_indices == (2, 3)
 
 
 def test_edits_use_original_lines_despite_length_changes_and_duplicate_text() -> None:

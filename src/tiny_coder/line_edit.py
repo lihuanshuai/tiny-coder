@@ -15,6 +15,17 @@ class _SourceNotFoundError(ValueError):
     """No sufficiently close source exists; an exact result may already be present."""
 
 
+class LineReplacementConflictError(ValueError):
+    """Adaptive replacements request incompatible changes to the same source."""
+
+    def __init__(self, first_index: int, second_index: int) -> None:
+        self.replacement_indices = (first_index, second_index)
+        super().__init__(
+            f"replacement {second_index}: duplicate or overlapping source changes "
+            f"with replacement {first_index}"
+        )
+
+
 class LineReplacement(BaseModel):
     """Replace old_count original lines at old_start; zero inserts before that line."""
 
@@ -240,6 +251,40 @@ def _adapt_content(old: str, actual: str, content: str) -> str:
     return source
 
 
+def _exact_changed_lines(source: str, old: str, new: str) -> tuple[int, int, str] | None:
+    """Recover one exact changed block without trusting omitted unchanged text."""
+    old_lines, new_lines = text_lines(old), text_lines(new)
+    changes = [
+        item
+        for item in SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes()
+        if item[0] != "equal"
+    ]
+    if len(changes) != 1 or changes[0][0] != "replace":
+        return None
+    _, left, right, new_left, new_right = changes[0]
+    prefix, suffix = "".join(old_lines[:left]), "".join(old_lines[right:])
+    old_block, new_block = "".join(old_lines[left:right]), "".join(new_lines[new_left:new_right])
+    fragment = old_block.removesuffix("\n")
+    if not (prefix or suffix) or not fragment.strip() or not new_block.strip():
+        return None
+    start = source.find(fragment)
+    if (
+        start < 0
+        or source.find(fragment, start + 1) >= 0
+        or (start > 0 and source[start - 1] != "\n")
+        or not source[:start].endswith(prefix)
+    ):
+        return None
+    end = start + len(fragment)
+    line_end = source.find("\n", end)
+    following = len(source) if line_end < 0 else line_end + 1
+    if not source[following:].startswith(suffix):
+        return None
+    if end < len(source) and source[end] == "\n":
+        end += 1
+    return start, end, _adapt_content(old_block, source[start:end], new_block)
+
+
 def resolve_line_replacements(
     original: str, replacements: Sequence[LineReplacement]
 ) -> list[LineReplacement]:
@@ -250,7 +295,7 @@ def resolve_line_replacements(
     for line in lines:
         offsets.append(offsets[-1] + len(line))
     resolved: list[LineReplacement] = []
-    edits: list[tuple[int, int, str]] = []
+    edits: list[tuple[int, int, str, int]] = []
     for index, item in enumerate(replacements, 1):
         if item.old_text == item.new_text:
             continue
@@ -263,7 +308,7 @@ def resolve_line_replacements(
             fragment = old.strip("\n")
             start = source.find(fragment) if fragment.strip() else -1
             if start >= 0 and source.find(fragment, start + 1) >= 0:
-                hinted = _matching_line_hint(lines, fragment, item.old_start, item.old_count)
+                hinted = _matching_line_hint(lines, old, item.old_start, item.old_count)
                 if hinted is None:
                     raise ValueError(
                         "old_text matches multiple locations; provide a matching full-line range "
@@ -273,23 +318,32 @@ def resolve_line_replacements(
                 updated = _adapt_content(old, source[start:end], content)
             elif start >= 0:
                 end = start + len(fragment)
-                whole_lines = (start == 0 or source[start - 1] == "\n") and (
-                    end == len(source) or source[end] == "\n"
-                )
-                if whole_lines:
-                    end += int(end < len(source))
+                exact_start = start - (len(old) - len(old.lstrip("\n")))
+                if old != fragment and exact_start >= 0 and source.startswith(old, exact_start):
+                    # Matching boundary blank lines belong to the source fragment too.
+                    start, end = exact_start, exact_start + len(old)
                     updated = _adapt_content(old, source[start:end], content)
                 else:
-                    # A mirrored terminal LF describes the fragment, not the untouched suffix.
-                    updated = content.removesuffix("\n") if old.endswith("\n") else content
+                    whole_lines = (start == 0 or source[start - 1] == "\n") and (
+                        end == len(source) or source[end] == "\n"
+                    )
+                    if whole_lines:
+                        end += int(end < len(source))
+                        updated = _adapt_content(old, source[start:end], content)
+                    else:
+                        # A mirrored terminal LF describes the fragment, not the untouched suffix.
+                        updated = content.removesuffix("\n") if old.endswith("\n") else content
             else:
                 try:
                     first, last = _find_fragment(lines, fragment, item.old_start, item.old_count)
                 except _SourceNotFoundError:
+                    recovered = _exact_changed_lines(source, old, content)
                     first = item.old_start - 1
                     last = first + item.old_count
                     result = content.removesuffix("\n")
-                    if (
+                    if recovered is not None:
+                        start, end, updated = recovered
+                    elif (
                         result.strip()
                         and item.old_count > 0
                         and last <= len(lines)
@@ -297,26 +351,41 @@ def resolve_line_replacements(
                         and source.count(result) == 1
                     ):
                         continue
-                    raise
-                start, end = offsets[first], offsets[last]
-                updated = _adapt_content(old, source[start:end], content)
+                    else:
+                        raise
+                else:
+                    start, end = offsets[first], offsets[last]
+                    updated = _adapt_content(old, source[start:end], content)
             for tag, left, right, new_left, new_right in SequenceMatcher(
                 None, source[start:end], updated, autojunk=False
             ).get_opcodes():
                 if tag == "equal":
                     continue
                 edit_start, edit_end = start + left, start + right
-                for other_start, other_end, _ in edits:
+                edit_content = updated[new_left:new_right]
+                for other_start, other_end, _, other_index in edits:
                     if (edit_start, edit_end) == (other_start, other_end) or (
                         edit_start < other_end and other_start < edit_end
                     ):
-                        raise ValueError("duplicate or overlapping source changes")
-                edits.append((edit_start, edit_end, updated[new_left:new_right]))
+                        # Only whole deletion requests may share source characters.
+                        if not content and not replacements[other_index - 1].new_text:
+                            continue
+                        raise LineReplacementConflictError(other_index, index)
+                edits.append((edit_start, edit_end, edit_content, index))
+        except LineReplacementConflictError:
+            raise
         except ValueError as error:
             raise ValueError(f"replacement {index}: {error}") from error
 
+    merged_edits: list[tuple[int, int, str]] = []
+    for start, end, content, _ in sorted(edits):
+        if merged_edits and not content and not merged_edits[-1][2] and start < merged_edits[-1][1]:
+            previous_start, previous_end, _ = merged_edits[-1]
+            merged_edits[-1] = (previous_start, max(previous_end, end), "")
+        else:
+            merged_edits.append((start, end, content))
     updated_source = source
-    for start, end, content in sorted(edits, reverse=True):
+    for start, end, content in reversed(merged_edits):
         updated_source = updated_source[:start] + content + updated_source[end:]
     replacement_lines = text_lines(updated_source)
     for tag, left, right, new_left, new_right in SequenceMatcher(
