@@ -35,6 +35,101 @@ def tool_call(name: str, **arguments: Any) -> ToolCall:
     )
 
 
+def test_structured_context_loop_requires_tool_protocol_and_rejects_plain_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turns = 0
+    accepted: list[BaseModel] = []
+
+    async def llm(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal turns
+        turns += 1
+        expected_choice = (
+            {"type": "function", "function": {"name": "read_required"}}
+            if turns == 1
+            else {"type": "function", "function": {"name": "submit_result"}}
+            if turns == 4
+            else None
+        )
+        assert kwargs["tool_choice"] == expected_choice
+        assert kwargs["response_format"] is None
+        tools = {tool.name: tool for tool in kwargs["tools"]}
+        if turns == 1:
+            assert "submit_result" not in tools
+            return _outcome(tool_calls=(tool_call("read_required"),))
+        assert tools["submit_result"].parameters["properties"]["answer"]["type"] == "string"
+        if turns == 2:
+            # Optional sources remain available after reading the required snapshots.
+            return _outcome(tool_calls=(tool_call("read_file", path="extra.md"),))
+        if turns == 3:
+            assert json.loads(kwargs["messages"][-1]["content"])["path"] == "extra.md"
+            return _outcome('{"answer":"must not be accepted"}')
+        feedback = json.loads(kwargs["messages"][-1]["content"])
+        assert feedback["validation_errors"][0]["type"] == "submission_required"
+        assert not accepted
+        return _outcome(tool_calls=(tool_call("submit_result", answer="submitted"),))
+
+    async def accept(call: AgentCall, output: BaseModel) -> None:
+        accepted.append(output)
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=Answer,
+        max_attempts=2,
+        accept=accept,
+        extensions=(
+            ContextTools(
+                [
+                    ContextFile(path="required.md", content="required", required=True),
+                    ContextFile(path="extra.md", content="extra"),
+                ]
+            ),
+        ),
+    )
+    result = asyncio.run(agent.invoke(StructuredInput(prompt="Read then submit")))
+    assert result.model(Answer) == Answer(answer="submitted")
+    assert accepted == [Answer(answer="submitted")]
+    assert turns == 4
+
+
+def test_textual_tool_call_stops_stream_and_retries_with_named_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turns = 0
+
+    async def llm(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal turns
+        turns += 1
+        if turns == 1:
+            assert kwargs["tool_choice"] == {
+                "type": "function",
+                "function": {"name": "read_required"},
+            }
+            return _outcome(tool_calls=(tool_call("read_required"),))
+        if turns == 2:
+            assert kwargs["tool_choice"] is None
+            assert json.loads(kwargs["messages"][-1]["content"])["files"][0]["path"] == "task.md"
+            await kwargs["on_chunk"]("<tool_call>")
+            pytest.fail("textual tool output must abort on its first content chunk")
+        assert kwargs["tool_choice"] == {"type": "function", "function": {"name": "submit_result"}}
+        feedback = json.loads(kwargs["messages"][-1]["content"])
+        assert feedback["validation_errors"][0]["type"] == "submission_required"
+        assert "API tool_calls" in feedback["response_suggestion"]
+        return _outcome(tool_calls=(tool_call("submit_result", answer="done"),))
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=Answer,
+        max_attempts=2,
+        extensions=(ContextTools([ContextFile(path="task.md", content="task", required=True)]),),
+    )
+    result = asyncio.run(agent.invoke(StructuredInput(prompt="Read then submit")))
+    assert result.model(Answer) == Answer(answer="done")
+    assert turns == 3
+
+
 def test_task_loop_reads_context_and_repairs_rejected_submission_without_templates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

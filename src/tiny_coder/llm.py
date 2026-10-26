@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, TypeAlias, TypeVar, cast
 
 from openai import AsyncOpenAI, AsyncStream
-from openai.types.chat import ChatCompletionChunk
+from openai.types.chat import ChatCompletionChunk, ChatCompletionToolChoiceOptionParam
 from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -372,6 +372,7 @@ async def stream_llm_chat(
     llm_cfg: LlmConfig,
     messages: Sequence[Mapping[str, Any]],
     tools: Sequence[object] | None = None,
+    tool_choice: ChatCompletionToolChoiceOptionParam | None = None,
     response_format: dict[str, Any] | None = None,
     on_chunk: Callable[[str], Awaitable[None]] | None = None,
     on_exchange: Callable[[LlmExchange], Awaitable[None]] | None = None,
@@ -382,6 +383,8 @@ async def stream_llm_chat(
         raise TypeError("llm_cfg must inherit LlmConfig")
     if not messages:
         raise ValueError("messages must not be empty")
+    if tool_choice is not None and not tools:
+        raise ValueError("tool_choice requires tools")
     config = llm_cfg
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
@@ -436,6 +439,8 @@ async def stream_llm_chat(
             }
             if tools is not None:
                 kwargs["tools"] = [tool_openai_spec(t) for t in tools]
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
             if response_format is not None:
                 kwargs["response_format"] = response_format
             stream_response = await create_completion(**kwargs)

@@ -517,8 +517,12 @@ def test_stream_llm_chat_with_response_format(
     assert FakeAsyncOpenAI.closed
 
 
+@pytest.mark.parametrize(
+    "tool_choice", ["required", {"type": "function", "function": {"name": "add"}}]
+)
 def test_stream_llm_chat_with_tools(
     monkeypatch: pytest.MonkeyPatch,
+    tool_choice: Any,
 ) -> None:
     _patch(monkeypatch, PACKETS_TEXT)
 
@@ -532,11 +536,24 @@ def test_stream_llm_chat_with_tools(
             llm_cfg=SampleOpenAIConfig(),
             messages=[{"role": "user", "content": "add"}],
             tools=[FakeTool()],
+            tool_choice=tool_choice,
         )
     )
 
     assert "tools" in FakeCompletions.kwargs
     assert FakeCompletions.kwargs["tools"][0]["function"]["name"] == "add"
+    assert FakeCompletions.kwargs["tool_choice"] == tool_choice
+
+
+def test_stream_llm_chat_rejects_tool_choice_without_tools() -> None:
+    with pytest.raises(ValueError, match="tool_choice requires tools"):
+        asyncio.run(
+            stream_llm_chat(
+                llm_cfg=SampleOpenAIConfig(),
+                messages=[{"role": "user", "content": "go"}],
+                tool_choice="required",
+            )
+        )
 
 
 def test_stream_llm_chat_omits_max_tokens_when_none(

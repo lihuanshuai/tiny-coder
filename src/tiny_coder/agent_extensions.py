@@ -255,6 +255,17 @@ class StructuredOutput(AgentExtension):
             return
         if call.response_model is None:
             raise ValueError("structured output requires a response_model")
+        if call.tools and call.submission is None:
+            raise ResponseValidationError(
+                "structured tool output requires a submit_result call; plain text is not accepted",
+                code="submission_required",
+                suggestion=(
+                    "Call submit_result with the complete result as arguments matching its Schema. "
+                    "Do not return analysis or a JSON object as assistant text. "
+                    "Use context tools first if more source information is needed. "
+                    "No submission has been accepted."
+                ),
+            )
         try:
             output = parse_structured(call.response_text, call.response_model)
         except ValidationError as error:
@@ -387,7 +398,7 @@ class RetryPolicy(AgentExtension):
         ) from error
 
     def _add_feedback(self, call: AgentCall) -> None:
-        if call.outcome is None:
+        if call.outcome is None and not isinstance(call.error, ResponseValidationError):
             return
         assert call.error is not None
         cause = call.error.__cause__
@@ -414,7 +425,7 @@ class RetryPolicy(AgentExtension):
             },
             ensure_ascii=False,
         )
-        if call.outcome.tool_calls:
+        if call.outcome is not None and call.outcome.tool_calls:
             for tool_call in call.outcome.tool_calls:
                 call.messages.append(
                     {

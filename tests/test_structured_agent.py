@@ -217,6 +217,17 @@ def _echo_call(text: str) -> ToolCall:
     )
 
 
+def _submit_call(name: str, count: int) -> ToolCall:
+    return ToolCall(
+        id=f"submit-{name}",
+        type="function",
+        function={
+            "name": "submit_result",
+            "arguments": SampleStructured(name=name, count=count).model_dump_json(),
+        },
+    )
+
+
 def _fake_llm(
     fake_calls: list[list[dict[str, Any]]],
     queue: list[LlmChatOutcome],
@@ -361,7 +372,7 @@ def test_create_structured_agent_routes_tool_calls_then_returns_model(
     fake_calls: list[list[dict[str, Any]]] = []
     queue = [
         _outcome(tool_calls=(_echo_call("hello"),)),
-        _outcome(text='{"name": "done", "count": 1}'),
+        _outcome(tool_calls=(_submit_call("done", 1),)),
     ]
     monkeypatch.setattr(
         "tiny_coder.structured_agent.stream_llm_chat",
@@ -378,7 +389,13 @@ def test_create_structured_agent_routes_tool_calls_then_returns_model(
 
     assert [tool.name for tool in agent.tools] == ["echo"]
     assert result.model(SampleStructured) == SampleStructured(name="done", count=1)
-    assert [m["role"] for m in result.messages] == ["user", "assistant", "tool", "assistant"]
+    assert [m["role"] for m in result.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+    ]
     tool_message = next(m for m in result.messages if m["role"] == "tool")
     assert tool_message["content"] == "echo:hello"
     assert len(fake_calls) == 2
@@ -526,8 +543,8 @@ def test_hook_loop_preserves_tool_results_and_json_checkpoint(
     requests: list[list[dict[str, Any]]] = []
     queue = [
         _outcome(tool_calls=(_echo_call("hello"),)),
-        _outcome('{"name":"interim","count":1}'),
-        _outcome('{"name":"done","count":2}'),
+        _outcome(tool_calls=(_submit_call("interim", 1),)),
+        _outcome(tool_calls=(_submit_call("done", 2),)),
     ]
     checkpointer = JsonCheckpointer(tmp_path / "hooks.json")
     monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", _fake_llm(requests, queue))
@@ -541,7 +558,7 @@ def test_hook_loop_preserves_tool_results_and_json_checkpoint(
 
     async def continue_after_interim(call: AgentCall) -> None:
         assert call.outcome is not None
-        call.retry = "interim" in call.outcome.text
+        call.retry = "interim" in call.response_text
 
     agent.events.subscribe(AFTER_CALL, continue_after_interim)
     result = asyncio.run(agent.invoke(StructuredInput(prompt="go")))
@@ -549,7 +566,8 @@ def test_hook_loop_preserves_tool_results_and_json_checkpoint(
 
     assert result.model(SampleStructured) == SampleStructured(name="done", count=2)
     assert requests[1][-1]["content"] == "echo:hello"
-    assert requests[2][-2]["content"] == "echo:hello"
+    assert any(m["content"] == "echo:hello" for m in requests[2])
+    assert requests[2][-1]["name"] == "submit_result"
     assert checkpoint is not None and checkpoint.step == 4
     assert set(result.state) == {"messages"}
 

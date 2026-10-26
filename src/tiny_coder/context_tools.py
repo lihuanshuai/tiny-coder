@@ -13,7 +13,13 @@ from tiny_coder.agent_extensions import ResponseValidationError
 from tiny_coder.eventbus import EventBus
 from tiny_coder.line_edit import grep_lines, numbered_text, text_lines, text_revision
 from tiny_coder.state import State
-from tiny_coder.structured_agent import BEFORE_CALL, BEFORE_OUTPUT, AgentCall, AgentExtension
+from tiny_coder.structured_agent import (
+    BEFORE_CALL,
+    BEFORE_OUTPUT,
+    SUBMIT_RESULT,
+    AgentCall,
+    AgentExtension,
+)
 from tiny_coder.tool_node import Tool
 
 
@@ -124,6 +130,14 @@ class ContextTools(AgentExtension):
     async def prepare(self, call: AgentCall) -> None:
         # Validate the allowlist before the first request as well as on each read.
         call.submission_enabled = not self._missing(call)
+        if not call.submission_enabled:
+            call.tool_choice = {"type": "function", "function": {"name": "read_required"}}
+        elif (
+            call.response_model is not None
+            and isinstance(call.previous_error, ResponseValidationError)
+            and call.previous_error.code == "submission_required"
+        ):
+            call.tool_choice = {"type": "function", "function": {"name": SUBMIT_RESULT}}
 
         async def list_files(state: State) -> str:
             reads: dict[str, _ReadRecord] = state.get("context_reads", {})

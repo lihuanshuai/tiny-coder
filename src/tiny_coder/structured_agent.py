@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
+from openai.types.chat import ChatCompletionToolChoiceOptionParam
 from pydantic import BaseModel
 
 from tiny_coder.agent import Agent
@@ -74,6 +75,7 @@ class AgentCall:
     turn: int = 1
     prepared_extensions: set[int] = field(default_factory=set, repr=False)
     submission_enabled: bool = True
+    tool_choice: ChatCompletionToolChoiceOptionParam | None = None
 
     @property
     def submission(self) -> ToolCall | None:
@@ -208,6 +210,18 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
         invocation = self._invocation.get()
         assert invocation is not None and invocation.call is not None
         call = invocation.call
+        if call.tools and call.response_model is not None and chunk.strip():
+            from tiny_coder.agent_extensions import ResponseValidationError
+
+            raise ResponseValidationError(
+                "structured tool response emitted assistant text; stream stopped before completion",
+                code="submission_required",
+                suggestion=(
+                    "Use the API tool_calls field, not assistant text or textual tool-call tags. "
+                    "Read missing context with the context tools, then call submit_result "
+                    "with the complete result as arguments. No submission has been accepted."
+                ),
+            )
         call.chunk = chunk
         await self.events.emit(CHUNK_RECEIVED, call)
 
@@ -391,8 +405,12 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
                 *({"role": "user", "content": text} for text in call.steering),
             ],
             tools=tools or None,
+            tool_choice=call.tool_choice,
             response_format=None if tools else call.response_format,
-            on_chunk=self._emit_chunk if self.events.has_subscribers(CHUNK_RECEIVED) else None,
+            on_chunk=self._emit_chunk
+            if self.events.has_subscribers(CHUNK_RECEIVED)
+            or (tools and call.response_model is not None)
+            else None,
             on_exchange=self._emit_exchange
             if self.events.has_subscribers(EXCHANGE_RECEIVED)
             else None,

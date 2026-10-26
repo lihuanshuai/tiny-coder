@@ -29,7 +29,7 @@ from tiny_coder.agent_extensions import (
 )
 from tiny_coder.checkpoint import JsonCheckpointer
 from tiny_coder.eventbus import EventBus
-from tiny_coder.llm import LlmChatOutcome
+from tiny_coder.llm import LlmChatOutcome, ToolCall
 from tiny_coder.structured_agent import (
     AFTER_CALL,
     BEFORE_CALL,
@@ -963,7 +963,15 @@ def test_prompt_and_output_extensions_preserve_tool_rounds_and_checkpoints(
         calls.append(kwargs["messages"])
         if len(calls) == 1:
             return _outcome(tool_calls=(_echo_call("hello"),))
-        return _outcome('{"summary":"done"}')
+        return _outcome(
+            tool_calls=(
+                ToolCall(
+                    id="submit",
+                    type="function",
+                    function={"name": "submit_result", "arguments": '{"summary":"done"}'},
+                ),
+            )
+        )
 
     monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm_call)
     agent = create_structured_agent(
