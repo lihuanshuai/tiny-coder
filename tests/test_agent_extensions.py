@@ -88,6 +88,74 @@ def test_call_recording_preserves_rejected_output_and_resolves_each_input(
     assert records[0]["stats"] == {"prompt_eval_count": 1, "eval_count": 1}
 
 
+@pytest.mark.parametrize("value", ['[{"summary":"done"}', '[{"summary": "unterminated}'])
+def test_malformed_container_retry_reports_syntax_and_omits_bad_history_argument(
+    value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ContainerOutput(BaseModel):
+        summary: str
+        entries: list[Output]
+
+    rejected = json.dumps({"summary": "keep this", "entries": value})
+    calls = 0
+    accepted: list[BaseModel] = []
+
+    async def accept(call: AgentCall, output: BaseModel) -> None:
+        accepted.append(output)
+
+    async def llm_call(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            arguments = rejected
+        else:
+            messages = kwargs["messages"]
+            arguments_in_history = json.loads(
+                messages[-2]["tool_calls"][0]["function"]["arguments"]
+            )
+            assert arguments_in_history == {"summary": "keep this"}
+            feedback = json.loads(messages[-1]["content"])
+            detail = feedback["validation_errors"][0]
+            assert detail["loc"] == ["entries"]
+            diagnostic = detail["ctx"]["container_json_error"]
+            assert diagnostic["field"] == "entries"
+            assert diagnostic["expected"] == "array"
+            assert len(diagnostic["excerpt"]) <= 120
+            suggestion = feedback["response_suggestion"]
+            assert "Field `entries`" in suggestion
+            assert f"column {diagnostic['column']}" in suggestion
+            assert "closing ]" in suggestion
+            assert "escape string contents only once" in suggestion
+            assert accepted == []
+            arguments = '{"summary":"keep this","entries":[{"summary":"done"}]}'
+        return _outcome(
+            tool_calls=(
+                ToolCall(
+                    id=f"submit-{calls}",
+                    type="function",
+                    function={"name": "submit_result", "arguments": arguments},
+                ),
+            )
+        )
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm_call)
+    record = tmp_path / "calls.jsonl"
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=ContainerOutput,
+        tools=[echo_tool],
+        extensions=(CallRecording(record), StructuredOutput(accept)),
+        max_attempts=2,
+    )
+    result = asyncio.run(agent.invoke(StructuredInput(prompt="Complete the entries.")))
+    assert result.output == ContainerOutput(summary="keep this", entries=[Output(summary="done")])
+    assert calls == 2 and accepted == [result.output]
+    with record.open(encoding="utf-8", newline="\n") as source:
+        records = [json.loads(line) for line in source]
+    assert records[0]["output"] == rejected
+    assert records[0]["messages"][-1]["tool_calls"][0]["function"]["arguments"] == rejected
+
+
 def test_structured_output_works_with_plain_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     accepted: list[tuple[object, BaseModel]] = []
 

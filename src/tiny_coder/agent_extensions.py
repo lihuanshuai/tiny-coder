@@ -16,7 +16,7 @@ from pydantic_core import ErrorDetails
 
 from tiny_coder.apply_patch import resolve_agent_file_path, resolve_agent_root
 from tiny_coder.eventbus import EventBus
-from tiny_coder.json_utils import JsonStringFieldStreamer
+from tiny_coder.json_utils import JsonStringFieldStreamer, load_json_object
 from tiny_coder.llm import LlmConfig, parse_structured
 from tiny_coder.structured_agent import (
     AFTER_CALL,
@@ -91,10 +91,46 @@ def _validation_error_message(error: ValidationError) -> str:
     )
 
 
+class _ContainerJsonError(TypedDict):
+    field: str
+    expected: str
+    line: int
+    column: int
+    offset: int
+    at_end: bool
+    excerpt: str
+    message: str
+
+
+def _container_json_error(failure: ErrorDetails) -> _ContainerJsonError | None:
+    value = failure.get("input")
+    if failure["type"] not in {"list_type", "model_type", "dict_type"} or not isinstance(
+        value, str
+    ):
+        return None
+    if not value.lstrip().startswith(("[", "{")):
+        return None
+    try:
+        json.loads(value)
+    except json.JSONDecodeError as error:
+        return _ContainerJsonError(
+            field=".".join(map(str, failure["loc"])) or "$",
+            expected="array" if failure["type"] == "list_type" else "object",
+            line=error.lineno,
+            column=error.colno,
+            offset=error.pos,
+            at_end=error.pos == len(value),
+            excerpt=value[max(0, error.pos - 60) : error.pos + 60],
+            message=error.msg,
+        )
+    return None
+
+
 def _reraise_response_validation_error(error: ValidationError) -> NoReturn:
     """Preserve validator-owned errors and advice across Pydantic's wrapper."""
     failures = error.errors(include_url=False)
     suggestions: list[str] = []
+    container_errors: list[_ContainerJsonError] = []
     for failure in failures:
         original = failure.get("ctx", {}).get("error")
         if isinstance(original, ResponseValidationError):
@@ -102,7 +138,30 @@ def _reraise_response_validation_error(error: ValidationError) -> NoReturn:
                 raise original from error
             location = ".".join(map(str, failure["loc"])) or "$"
             suggestions.append(f"{location}: {original.suggestion}")
+        diagnostic = _container_json_error(failure)
+        if diagnostic is not None:
+            container_errors.append(diagnostic)
+            suggestions.append(
+                f"Field `{diagnostic['field']}` must be a JSON {diagnostic['expected']}, "
+                f"but arrived as a string containing invalid JSON: {diagnostic['message']} "
+                f"at line {diagnostic['line']}, column {diagnostic['column']} "
+                f"(offset {diagnostic['offset']}{', end of value' if diagnostic['at_end'] else ''}). "
+                f"Nearby raw text (JSON-quoted for display only): "
+                f"{json.dumps(diagnostic['excerpt'], ensure_ascii=False)}. "
+                "Rebuild this field as a native JSON value from the current source. "
+                "Check every array's closing ] and object's closing }, including the outer array; "
+                "do not quote the container or copy the displayed escapes. "
+                "Keep each key once, include every required field, and escape string contents only once."
+            )
     message = f"invalid structured output: {_validation_error_message(error)}"
+    if container_errors:
+        raise ResponseValidationError(
+            message,
+            code="invalid_container_json",
+            context={"container_errors": container_errors},
+            suggestion="\n".join(suggestions)
+            + "\nResubmit the complete result in the required format; nothing was accepted or written.",
+        ) from error
     if suggestions:
         raise ResponseValidationError(message, suggestion="\n".join(suggestions)) from error
     raise ResponseValidationError(message) from error
@@ -403,8 +462,16 @@ class RetryPolicy(AgentExtension):
         assert call.error is not None
         cause = call.error.__cause__
         errors: list[dict[str, object]] = []
+        invalid_fields: set[str] = set()
         if isinstance(cause, ValidationError):
             for failure in cause.errors(include_url=False):
+                diagnostic = _container_json_error(failure)
+                if (
+                    len(failure["loc"]) == 1
+                    and isinstance(failure["loc"][0], str)
+                    and diagnostic is not None
+                ):
+                    invalid_fields.add(failure["loc"][0])
                 detail: dict[str, object] = {
                     "loc": failure["loc"],
                     "type": failure["type"],
@@ -413,6 +480,8 @@ class RetryPolicy(AgentExtension):
                 original = failure.get("ctx", {}).get("error")
                 if isinstance(original, ResponseValidationError):
                     detail.update(original.feedback())
+                if diagnostic is not None:
+                    detail["ctx"] = {"container_json_error": diagnostic}
                 errors.append(detail)
         elif isinstance(call.error, ResponseValidationError):
             errors.append(call.error.feedback())
@@ -426,6 +495,25 @@ class RetryPolicy(AgentExtension):
             ensure_ascii=False,
         )
         if call.outcome is not None and call.outcome.tool_calls:
+            # Keep the raw outcome for recording. Do not teach retries to copy
+            # malformed container strings from a rejected submission's history.
+            if invalid_fields and (submission := call.submission) is not None:
+                history_call = next(
+                    (
+                        item
+                        for message in reversed(call.messages)
+                        for item in message.get("tool_calls", [])
+                        if item["id"] == submission.id
+                    ),
+                    None,
+                )
+                if history_call is not None:
+                    arguments = load_json_object(call.response_text)
+                    for field in invalid_fields:
+                        arguments.pop(field, None)
+                    history_call["function"]["arguments"] = json.dumps(
+                        arguments, ensure_ascii=False
+                    )
             for tool_call in call.outcome.tool_calls:
                 call.messages.append(
                     {
