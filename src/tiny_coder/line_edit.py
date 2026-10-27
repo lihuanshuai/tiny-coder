@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from bisect import bisect_right
 from collections.abc import Iterator, Sequence
 from difflib import SequenceMatcher
 from hashlib import sha256
@@ -100,11 +101,22 @@ def numbered_text(content: str, *, start_line: int = 1, end_line: int | None = N
 
 
 def grep_lines(content: str, pattern: str | re.Pattern[str]) -> Iterator[tuple[int, str]]:
-    """Yield regex-matching lines with the same 1-based numbers as numbered_text."""
+    """Yield lines touched by regex matches, including matches spanning multiple lines."""
     query = re.compile(pattern)
-    for number, line in enumerate(text_lines(content), 1):
-        if query.search(line):
-            yield number, line.removesuffix("\n")
+    query = re.compile(query.pattern, query.flags | re.MULTILINE)
+    lines = text_lines(content)
+    if not lines:
+        return
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    reported = 0
+    for match in query.finditer("".join(lines)):
+        first = min(bisect_right(offsets, match.start()), len(lines))
+        last = min(bisect_right(offsets, max(match.start(), match.end() - 1)), len(lines))
+        for number in range(max(first, reported + 1), last + 1):
+            yield number, lines[number - 1].removesuffix("\n")
+            reported = number
 
 
 def _comparable(text: str) -> str:

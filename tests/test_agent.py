@@ -342,7 +342,7 @@ def test_invoke_and_send_accept_the_same_input_for_all_agents(
             {"role": "user", "content": "prompt"},
         ]
         assert kwargs["llm_cfg"].temperature == 0.7
-        assert kwargs["response_format"]["json_schema"]["schema"]["title"] == "SampleStructured"
+        assert kwargs["response_format"]["schema"]["title"] == "SampleStructured"
         return _outcome('{"name":"sample","count":1}')
 
     monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm_call)

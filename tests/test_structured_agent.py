@@ -28,6 +28,53 @@ from tiny_coder.structured_agent import (
 from tiny_coder.tool_node import Tool
 
 
+@pytest.mark.parametrize(
+    "invalid", [{"name": "done", "count": "2"}, {"name": "done", "count": 2, "stray": True}]
+)
+def test_submission_arguments_are_rejected_before_acceptance_with_specific_feedback(
+    invalid: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turns = 0
+    accepted: list[BaseModel] = []
+
+    async def llm(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal turns
+        turns += 1
+        if turns == 1:
+            return _outcome(
+                tool_calls=(
+                    ToolCall(
+                        id="bad",
+                        type="function",
+                        function={"name": "submit_result", "arguments": json.dumps(invalid)},
+                    ),
+                )
+            )
+        feedback = json.loads(kwargs["messages"][-1]["content"])
+        assert feedback["validation_errors"][0]["type"] == "invalid_tool_arguments"
+        assert "submit_result:" in feedback["response_suggestion"]
+        expected = "Remove `stray`" if "stray" in invalid else "JSON type integer"
+        assert expected in feedback["response_suggestion"]
+        assert not accepted
+        return _outcome(tool_calls=(_submit_call("done", 2),))
+
+    async def accept(call: AgentCall, output: BaseModel) -> None:
+        accepted.append(output)
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=SampleStructured,
+        tools=[echo_tool],
+        accept=accept,
+        max_attempts=2,
+    )
+    result = asyncio.run(agent.invoke(StructuredInput(prompt="Submit the result")))
+    assert accepted == [SampleStructured(name="done", count=2)]
+    assert result.output == accepted[0]
+
+
 class SampleLlmConfig(LlmConfig):
     base_url: str = "http://localhost:11434/v1"
     llm_model: str = "test"
@@ -663,7 +710,7 @@ def test_repeated_invocations_reset_overrides_and_attempts(monkeypatch: pytest.M
             (
                 kwargs["llm_cfg"].temperature,
                 kwargs["messages"][0]["content"],
-                kwargs["response_format"]["json_schema"]["schema"]["title"],
+                kwargs["response_format"]["schema"]["title"],
                 len(kwargs["messages"]),
             )
         )
@@ -739,7 +786,7 @@ def test_concurrent_runs_keep_schemas_separate_with_a_shared_budget(
 ) -> None:
     async def llm_call(**kwargs: Any) -> LlmChatOutcome:
         await asyncio.sleep(0)
-        title = kwargs["response_format"]["json_schema"]["schema"]["title"]
+        title = kwargs["response_format"]["schema"]["title"]
         return _outcome(
             '{"name":"sample","count":1}' if title == "SampleStructured" else '{"text":"echo"}'
         )

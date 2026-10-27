@@ -29,6 +29,7 @@ from tiny_coder.structured_agent import (
     AgentCall,
     AgentExtension,
 )
+from tiny_coder.tool_arguments import ToolArgumentsError, validate_tool_payload
 
 _T = TypeVar("_T")
 
@@ -308,6 +309,24 @@ class StructuredOutput(AgentExtension):
     def register(self, events: EventBus) -> None:
         events.subscribe(AFTER_CALL, self.parse)
 
+    def validate_arguments(self, call: AgentCall, output: BaseModel) -> None:
+        if call.submission is None or call.response_format is None:
+            return
+        try:
+            validate_tool_payload(
+                SUBMIT_RESULT,
+                call.response_format["schema"],
+                call.response_text,
+                defaults=output.model_dump(mode="json", by_alias=True),
+            )
+        except ToolArgumentsError as error:
+            raise ResponseValidationError(
+                str(error),
+                code="invalid_tool_arguments",
+                context=error.feedback,
+                suggestion=error.suggestion,
+            ) from error
+
     async def parse(self, call: AgentCall) -> None:
         assert call.outcome is not None
         if call.outcome.tool_calls and call.submission is None:
@@ -353,6 +372,7 @@ class StructuredOutput(AgentExtension):
                     "检查引号、转义和括号，不要添加代码块、解释文字或额外对象。"
                 ),
             )
+        self.validate_arguments(call, output)
         if self.accept is not None:
             await self.accept(call, output)
         call.output = output

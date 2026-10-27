@@ -11,7 +11,6 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
-from openai.types.chat import ChatCompletionToolChoiceOptionParam
 from pydantic import BaseModel
 
 from tiny_coder.agent import Agent
@@ -23,6 +22,7 @@ from tiny_coder.llm import (
     LlmConfig,
     LlmExchange,
     ToolCall,
+    ToolChoice,
     parse_structured,
     schema_response_format,
     stream_llm_chat,
@@ -75,7 +75,7 @@ class AgentCall:
     turn: int = 1
     prepared_extensions: set[int] = field(default_factory=set, repr=False)
     submission_enabled: bool = True
-    tool_choice: ChatCompletionToolChoiceOptionParam | None = None
+    tool_choice: ToolChoice | None = None
 
     @property
     def submission(self) -> ToolCall | None:
@@ -210,18 +210,6 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
         invocation = self._invocation.get()
         assert invocation is not None and invocation.call is not None
         call = invocation.call
-        if call.tools and call.response_model is not None and chunk.strip():
-            from tiny_coder.agent_extensions import ResponseValidationError
-
-            raise ResponseValidationError(
-                "structured tool response emitted assistant text; stream stopped before completion",
-                code="submission_required",
-                suggestion=(
-                    "Use the API tool_calls field, not assistant text or textual tool-call tags. "
-                    "Read missing context with the context tools, then call submit_result "
-                    "with the complete result as arguments. No submission has been accepted."
-                ),
-            )
         call.chunk = chunk
         await self.events.emit(CHUNK_RECEIVED, call)
 
@@ -391,12 +379,15 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
                     description="Submit the complete final result after reading context and completing the task. Call this alone. Validation errors are returned for correction; a rejected submission is not accepted.",
                     model=call.response_model,
                     handler=submit,
-                    parameters_schema=call.response_format["json_schema"]["schema"]
+                    parameters_schema=call.response_format["schema"]
                     if call.response_format is not None
                     else None,
                 )
             )
         ToolNode(tools)  # Reject duplicate names before sending any request.
+        tool_choice = call.tool_choice
+        if tool_choice is None and tools and call.response_model is not None:
+            tool_choice = "required"
         return await stream_llm_chat(
             llm_cfg=call.llm_config,
             messages=[
@@ -405,12 +396,9 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
                 *({"role": "user", "content": text} for text in call.steering),
             ],
             tools=tools or None,
-            tool_choice=call.tool_choice,
+            tool_choice=tool_choice,
             response_format=None if tools else call.response_format,
-            on_chunk=self._emit_chunk
-            if self.events.has_subscribers(CHUNK_RECEIVED)
-            or (tools and call.response_model is not None)
-            else None,
+            on_chunk=self._emit_chunk if self.events.has_subscribers(CHUNK_RECEIVED) else None,
             on_exchange=self._emit_exchange
             if self.events.has_subscribers(EXCHANGE_RECEIVED)
             else None,

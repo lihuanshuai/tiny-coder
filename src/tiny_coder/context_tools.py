@@ -131,13 +131,13 @@ class ContextTools(AgentExtension):
         # Validate the allowlist before the first request as well as on each read.
         call.submission_enabled = not self._missing(call)
         if not call.submission_enabled:
-            call.tool_choice = {"type": "function", "function": {"name": "read_required"}}
+            call.tool_choice = {"type": "function", "name": "read_required"}
         elif (
             call.response_model is not None
             and isinstance(call.previous_error, ResponseValidationError)
             and call.previous_error.code == "submission_required"
         ):
-            call.tool_choice = {"type": "function", "function": {"name": SUBMIT_RESULT}}
+            call.tool_choice = {"type": "function", "name": SUBMIT_RESULT}
 
         async def list_files(state: State) -> str:
             reads: dict[str, _ReadRecord] = state.get("context_reads", {})
@@ -171,7 +171,9 @@ class ContextTools(AgentExtension):
             if end < start_line or start_line > len(lines) or end > len(lines):
                 if lines or start_line != 1 or end_line is not None:
                     raise ValueError(
-                        f"invalid line range {start_line}..{end}; {canonical} has {len(lines)} lines"
+                        f"invalid line range {start_line}..{end}; {canonical} has {len(lines)} lines. "
+                        f"Set start_line and end_line within 1..{len(lines)} with end_line >= "
+                        "start_line, or use end_line=null to read to the end."
                     )
             revision = text_revision(file.content)
             reads: dict[str, _ReadRecord] = state.setdefault("context_reads", {})

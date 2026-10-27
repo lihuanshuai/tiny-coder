@@ -1,34 +1,39 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
 from copy import deepcopy
 from types import SimpleNamespace
-from typing import Any, Literal, TypeVar
+from typing import Any
 
+import httpx
 import pytest
-from openai.types.chat import ChatCompletionChunk
-from openai.types.chat.chat_completion_chunk import (
-    Choice,
-    ChoiceDelta,
-    ChoiceDeltaToolCall,
-    ChoiceDeltaToolCallFunction,
-)
-from openai.types.completion_usage import CompletionUsage
-from pydantic import BaseModel, ValidationError
+from openai import AsyncOpenAI
+from openai.types.responses import Response, ResponseStreamEvent
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from tiny_coder import llm as llm_module
+from tiny_coder.agent_extensions import StructuredOutput
+from tiny_coder.json_utils import JsonProtocolError
 from tiny_coder.llm import (
     LlmChatOutcome,
     LlmConfig,
     LlmExchange,
     nonnegative_int_from_llm_field,
+    responses_input,
     schema_response_format,
     stream_llm_chat,
     tool_openai_spec,
 )
-
-_ModelT = TypeVar("_ModelT", bound=BaseModel)
+from tiny_coder.state import State
+from tiny_coder.structured_agent import (
+    CHUNK_RECEIVED,
+    AgentCall,
+    StructuredInput,
+    create_structured_agent,
+)
+from tiny_coder.tool_node import Tool
 
 
 def test_tool_wire_schema_exposes_nested_arrays_and_preserves_constraints() -> None:
@@ -58,9 +63,7 @@ def test_tool_wire_schema_exposes_nested_arrays_and_preserves_constraints() -> N
         },
     }
     original = deepcopy(schema)
-    wire = tool_openai_spec(SimpleNamespace(name="submit_result", parameters=schema))["function"][
-        "parameters"
-    ]
+    wire = tool_openai_spec(SimpleNamespace(name="submit_result", parameters=schema))["parameters"]
     file = wire["properties"]["files"]["items"]
     assert file["type"] == "object"
     assert file["properties"]["path"]["enum"] == ["note.md"]
@@ -75,14 +78,15 @@ def test_tool_wire_schema_exposes_nested_arrays_and_preserves_constraints() -> N
 
 
 def test_recursive_tool_schema_keeps_resolvable_definitions() -> None:
-    schema = {
+    schema: dict[str, Any] = {
         "$ref": "#/$defs/Node",
         "$defs": {"Node": {"type": "object", "properties": {"child": {"$ref": "#/$defs/Node"}}}},
     }
-    wire = tool_openai_spec(SimpleNamespace(name="tree", parameters=schema))["function"][
-        "parameters"
-    ]
-    assert wire == schema
+    wire = tool_openai_spec(SimpleNamespace(name="tree", parameters=schema))["parameters"]
+    assert wire['$ref'] == schema['$ref']
+    assert wire['$defs']['Node']['properties'] == schema['$defs']['Node']['properties']
+    assert wire['$defs']['Node']['additionalProperties'] is False
+    assert wire['$defs']['Node']['required'] == ['child']
     assert wire is not schema
 
 
@@ -93,9 +97,7 @@ def test_tool_ref_sibling_constraints_remain_intersected_and_examples_are_data()
         "$defs": {"Value": {"type": "string", "enum": ["a", "b"]}},
         "examples": [{"$ref": "#/$defs/Value"}],
     }
-    wire = tool_openai_spec(SimpleNamespace(name="choose", parameters=schema))["function"][
-        "parameters"
-    ]
+    wire = tool_openai_spec(SimpleNamespace(name="choose", parameters=schema))["parameters"]
     assert wire["properties"]["value"] == {
         "allOf": [{"type": "string", "enum": ["a", "b"]}, {"enum": ["b", "c"]}]
     }
@@ -103,7 +105,7 @@ def test_tool_ref_sibling_constraints_remain_intersected_and_examples_are_data()
 
 
 class SampleOpenAIConfig(LlmConfig):
-    base_url: str = "http://localhost:11434/v1"
+    base_url: str = "http://localhost:8080/v1"
     llm_model: str = "sample-model"
     num_ctx: int = 4096
     temperature: float = 0.5
@@ -118,31 +120,37 @@ class _SummaryOutput(BaseModel):
 
 
 class PlainPydanticConfig(BaseModel):
-    base_url: str = "http://localhost:11434/v1"
+    base_url: str = "http://localhost:8080/v1"
 
 
 class FakeStream:
-    def __init__(self, packets: list[ChatCompletionChunk]) -> None:
+    def __init__(self, packets: Sequence[ResponseStreamEvent]) -> None:
         self._packets = iter(packets)
+        self.closed = False
 
     def __aiter__(self) -> FakeStream:
         return self
 
-    async def __anext__(self) -> ChatCompletionChunk:
+    async def __anext__(self) -> ResponseStreamEvent:
         try:
             return next(self._packets)
         except StopIteration as error:
             raise StopAsyncIteration from error
 
+    async def close(self) -> None:
+        self.closed = True
 
-class FakeCompletions:
+
+class FakeResponses:
     kwargs: dict[str, Any] = {}
-    packets: list[ChatCompletionChunk] = []
+    packets: list[ResponseStreamEvent] = []
+    stream: FakeStream
 
     @classmethod
     async def create(cls, **kwargs: Any) -> FakeStream:
         cls.kwargs = kwargs
-        return FakeStream(list(cls.packets))
+        cls.stream = FakeStream(cls.packets)
+        return cls.stream
 
 
 class FakeAsyncOpenAI:
@@ -150,87 +158,80 @@ class FakeAsyncOpenAI:
     timeout = 0.0
 
     def __init__(self, **kwargs: Any) -> None:
-        self.base_url = kwargs.get("base_url", "")
-        type(self).timeout = kwargs.get("timeout", 0.0)
-        self.chat = SimpleNamespace(completions=FakeCompletions())
+        self.base_url = kwargs.get('base_url', '')
+        type(self).timeout = kwargs.get('timeout', 0.0)
+        self.responses = FakeResponses()
 
     async def close(self) -> None:
         type(self).closed = True
 
 
-_FinishReason = Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
+def _response(text: str = 'hello world', **overrides: Any) -> Response:
+    raw = {
+        'id': 'resp_1',
+        'created_at': 0,
+        'model': 'sample-model',
+        'object': 'response',
+        'status': 'completed',
+        'parallel_tool_calls': True,
+        'tool_choice': 'auto',
+        'tools': [],
+        'output': [
+            {
+                'id': 'msg_1',
+                'type': 'message',
+                'role': 'assistant',
+                'status': 'completed',
+                'content': [{'type': 'output_text', 'text': text, 'annotations': []}],
+            }
+        ],
+        'usage': {
+            'input_tokens': 3,
+            'output_tokens': 4,
+            'total_tokens': 7,
+            'input_tokens_details': {'cached_tokens': 0, 'cache_write_tokens': 0},
+            'output_tokens_details': {'reasoning_tokens': 0},
+        },
+        **overrides,
+    }
+    return Response.model_validate(raw)
 
 
-def _chunk(
-    *,
-    delta: ChoiceDelta | None = None,
-    finish_reason: _FinishReason | None = None,
-    usage: CompletionUsage | None = None,
-    no_choices: bool = False,
-    **extras: Any,
-) -> ChatCompletionChunk:
-    choices: list[Choice] = []
-    if not no_choices:
-        choices.append(Choice(index=0, delta=delta or ChoiceDelta(), finish_reason=finish_reason))
-    return ChatCompletionChunk(
-        id="chunk",
-        choices=choices,
-        created=0,
-        model="sample-model",
-        object="chat.completion.chunk",
-        usage=usage,
-        **extras,
+def _event(kind: str, **values: Any) -> ResponseStreamEvent:
+    return TypeAdapter(ResponseStreamEvent).validate_python(
+        {'type': kind, 'sequence_number': 0, **values}
     )
 
 
-PACKETS_TEXT = [
-    _chunk(delta=ChoiceDelta.model_validate({"content": "", "reasoning": "hidden"})),
-    _chunk(delta=ChoiceDelta(content="hello")),
-    _chunk(delta=ChoiceDelta(content=" world"), finish_reason="stop"),
-    _chunk(
-        usage=CompletionUsage(prompt_tokens=3, completion_tokens=4, total_tokens=7),
-        no_choices=True,
-        prompt_eval_duration=1_500_000_000,
-        eval_duration=2_000_000_000,
-    ),
-]
-
-TOOL_CALL_PACKETS = [
-    _chunk(
-        delta=ChoiceDelta(
-            tool_calls=[
-                ChoiceDeltaToolCall(
-                    index=0,
-                    id="call_1",
-                    type="function",
-                    function=ChoiceDeltaToolCallFunction(name="add", arguments='{"left"'),
-                )
-            ]
-        )
-    ),
-    _chunk(
-        delta=ChoiceDelta(
-            tool_calls=[
-                ChoiceDeltaToolCall(
-                    index=0,
-                    function=ChoiceDeltaToolCallFunction(arguments=':2,"right":3}'),
-                )
-            ]
-        ),
-        finish_reason="tool_calls",
-    ),
-    _chunk(
-        usage=CompletionUsage(prompt_tokens=5, completion_tokens=6, total_tokens=11),
-        no_choices=True,
-    ),
-]
+def _delta(text: str) -> ResponseStreamEvent:
+    return _event(
+        'response.output_text.delta',
+        delta=text,
+        content_index=0,
+        item_id='msg_1',
+        output_index=0,
+        logprobs=[],
+    )
 
 
-def _patch(monkeypatch: pytest.MonkeyPatch, packets: Sequence[ChatCompletionChunk]) -> None:
-    FakeCompletions.packets = list(packets)
-    FakeCompletions.kwargs = {}
+def _terminal(response: Response | None = None) -> ResponseStreamEvent:
+    response = response or _response()
+    return _event(f'response.{response.status}', response=response)
+
+
+def _patch(monkeypatch: pytest.MonkeyPatch, packets: Sequence[ResponseStreamEvent]) -> None:
+    FakeResponses.packets = list(packets)
+    FakeResponses.kwargs = {}
     FakeAsyncOpenAI.closed = False
-    monkeypatch.setattr(llm_module, "AsyncOpenAI", FakeAsyncOpenAI)
+    monkeypatch.setattr(llm_module, 'AsyncOpenAI', FakeAsyncOpenAI)
+
+
+def _run(**options: Any) -> LlmChatOutcome:
+    return asyncio.run(
+        stream_llm_chat(
+            llm_cfg=SampleOpenAIConfig(), messages=[{'role': 'user', 'content': 'hi'}], **options
+        )
+    )
 
 
 def test_llm_config_declares_required_fields() -> None:
@@ -338,374 +339,401 @@ def test_llm_chat_outcome_message_appends_tool_calls() -> None:
     assert msg["tool_calls"][0]["id"] == "c1"
 
 
-def test_stream_llm_chat_forwards_messages_and_metrics(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch(monkeypatch, PACKETS_TEXT)
+def test_responses_request_streaming_metrics_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(
+        monkeypatch,
+        [
+            _delta('hello'),
+            _delta(' world'),
+            _terminal(_response(prompt_eval_duration=1_500_000_000, eval_duration=2_000_000_000)),
+        ],
+    )
     streamed: list[str] = []
+    exchanges: list[LlmExchange] = []
 
-    async def record_chunk(chunk: str) -> None:
-        streamed.append(chunk)
+    async def chunk(text: str) -> None:
+        streamed.append(text)
 
-    outcome = asyncio.run(
-        stream_llm_chat(
-            llm_cfg=SampleOpenAIConfig(),
-            messages=[{"role": "user", "content": "say hello"}],
-            on_chunk=record_chunk,
-        )
+    async def exchange(value: LlmExchange) -> None:
+        exchanges.append(value)
+
+    result = _run(on_chunk=chunk, on_exchange=exchange)
+    assert streamed == ['hello', ' world']
+    assert result.text == 'hello world'
+    assert result.prompt_eval_count == 3 and result.eval_count == 4
+    assert result.llm['provider'] == 'openai-responses'
+    assert result.llm['response_id'] == 'resp_1'
+    assert result.llm['prompt_tokens_per_second'] == result.llm['eval_tokens_per_second'] == 2
+    assert FakeResponses.kwargs['input'] == [{'role': 'user', 'content': 'hi'}]
+    assert FakeResponses.kwargs['store'] is False
+    assert FakeResponses.kwargs['stream'] is True
+    assert FakeResponses.kwargs['max_output_tokens'] == 8192
+    assert FakeResponses.kwargs['reasoning'] == {'effort': 'none'}
+    assert 'think' not in FakeResponses.kwargs['extra_body']
+    assert result.llm['reasoning_tokens'] == 0
+    assert (
+        not {'messages', 'max_tokens', 'stream_options', 'response_format'}
+        & FakeResponses.kwargs.keys()
     )
-
-    assert streamed == ["hello", " world"]
-    assert outcome.text == "hello world"
-    assert outcome.prompt_eval_count == 3
-    assert outcome.eval_count == 4
-    assert outcome.llm["provider"] == "openai-compatible"
-    assert outcome.llm['prompt_tokens_per_second'] == 2.0
-    assert outcome.llm['eval_tokens_per_second'] == 2.0
-    assert FakeCompletions.kwargs["messages"] == [{"role": "user", "content": "say hello"}]
-    assert "response_format" not in FakeCompletions.kwargs
-    assert "tools" not in FakeCompletions.kwargs
+    assert FakeAsyncOpenAI.closed and FakeResponses.stream.closed
+    assert FakeAsyncOpenAI.timeout == 37
+    assert exchanges[0].response is result
 
 
-def test_stream_llm_chat_records_exchange(
+def test_text_format_and_native_named_tool_choice(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(monkeypatch, [_terminal()])
+    schema = schema_response_format(_SummaryOutput)
+    tool = SimpleNamespace(name='add', description='Add', parameters={'type': 'object'})
+    _run(response_format=schema, tools=[tool], tool_choice={'type': 'function', 'name': 'add'})
+    assert FakeResponses.kwargs['text'] == {'format': schema}
+    assert FakeResponses.kwargs['tool_choice'] == {'type': 'function', 'name': 'add'}
+    assert FakeResponses.kwargs['tools'] == [tool_openai_spec(tool)]
+    assert FakeResponses.kwargs['tools'][0]['name'] == 'add'
+    assert 'function' not in FakeResponses.kwargs['tools'][0]
+
+
+def test_native_tool_calls_use_call_id_and_preserve_parallel_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch(monkeypatch, PACKETS_TEXT)
-    seen: list[LlmExchange] = []
-
-    async def record_exchange(exchange: LlmExchange) -> None:
-        seen.append(exchange)
-
-    outcome = asyncio.run(
-        stream_llm_chat(
-            llm_cfg=SampleOpenAIConfig(),
-            messages=[{"role": "user", "content": "say hello"}],
-            on_exchange=record_exchange,
-        )
-    )
-
-    assert len(seen) == 1
-    assert seen[0].messages == [{"role": "user", "content": "say hello"}]
-    assert seen[0].response is outcome
-
-
-def test_buffered_output_uses_request_average_instead_of_stream_drain_time(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    calls = [
+        {
+            'type': 'function_call',
+            'id': 'fc_2',
+            'call_id': 'call_2',
+            'name': 'second',
+            'arguments': '{"text":"原文"}',
+        },
+        {
+            'type': 'function_call',
+            'id': 'fc_1',
+            'call_id': 'call_1',
+            'name': 'first',
+            'arguments': '{}',
+        },
+    ]
     _patch(
         monkeypatch,
         [
-            _chunk(delta=ChoiceDelta(content="complete response"), finish_reason="stop"),
-            _chunk(
-                usage=CompletionUsage(prompt_tokens=100, completion_tokens=1849, total_tokens=1949),
-                no_choices=True,
+            _event(
+                'response.function_call_arguments.delta',
+                item_id='fc_2',
+                output_index=0,
+                delta='{"text":',
             ),
+            _event(
+                'response.function_call_arguments.done',
+                item_id='fc_2',
+                output_index=0,
+                name='second',
+                arguments='{"text":"原文"}',
+            ),
+            _terminal(_response(output=calls)),
         ],
     )
-    clock = iter([0.0, 50.0, 50.0011])
-    monkeypatch.setattr(llm_module.time, 'perf_counter', lambda: next(clock, 50.0011))
-    result = asyncio.run(
-        stream_llm_chat(llm_cfg=SampleOpenAIConfig(), messages=[{'role': 'user', 'content': 'hi'}])
+    result = _run()
+    assert result.text == ''
+    assert [call.id for call in result.tool_calls] == ['call_2', 'call_1']
+    assert result.tool_calls[0].function == {'name': 'second', 'arguments': '{"text":"原文"}'}
+    assert result.llm['done_reason'] == 'tool_calls'
+    inputs = responses_input(
+        [
+            result.message,
+            {'role': 'tool', 'tool_call_id': 'call_2', 'name': 'second', 'content': 'done'},
+        ]
     )
-    assert result.eval_count == 1849
+    assert inputs[0] == {
+        'type': 'function_call',
+        'call_id': 'call_2',
+        'name': 'second',
+        'arguments': '{"text":"原文"}',
+    }
+    assert inputs[-1] == {'type': 'function_call_output', 'call_id': 'call_2', 'output': 'done'}
+
+
+def test_reasoning_replayed_but_rejected_arguments_follow_edited_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reasoning = {'type': 'reasoning', 'id': 'rs_1', 'summary': [], 'encrypted_content': 'opaque'}
+    function = {
+        'type': 'function_call',
+        'id': 'fc_1',
+        'call_id': 'call_1',
+        'name': 'submit_result',
+        'arguments': '{"files":"broken"}',
+    }
+    _patch(monkeypatch, [_terminal(_response(output=[reasoning, function]))])
+    outcome = _run()
+    message = outcome.message
+    message['tool_calls'][0]['function']['arguments'] = '{"summary":"fixed"}'
+    inputs = responses_input([message])
+    assert inputs[0] == reasoning
+    assert inputs[1]['arguments'] == '{"summary":"fixed"}'
+    assert 'broken' not in json.dumps(inputs)
+    assert outcome.tool_calls[0].function['arguments'] == '{"files":"broken"}'
+
+
+def test_buffered_response_uses_whole_request_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = _response(
+        usage={
+            'input_tokens': 100,
+            'output_tokens': 1849,
+            'total_tokens': 1949,
+            'input_tokens_details': {'cached_tokens': 0, 'cache_write_tokens': 0},
+            'output_tokens_details': {'reasoning_tokens': 0},
+        }
+    )
+    _patch(monkeypatch, [_terminal(response)])
+    clock = iter([0.0, 50.0011])
+    monkeypatch.setattr(llm_module.time, 'perf_counter', lambda: next(clock))
+    result = _run()
+    assert result.llm['request_tokens_per_second'] == pytest.approx(1849 / 50.0011)
     assert 'eval_tokens_per_second' not in result.llm
-    assert 'prompt_tokens_per_second' not in result.llm
-    assert result.llm['request_tokens_per_second'] == pytest.approx(
-        1849 / (result.client_wall_time_ms / 1000)
-    )
-    assert result.llm['request_tokens_per_second'] < 38
 
 
-@pytest.mark.parametrize('timings_on_usage_packet', [True, False])
-def test_stream_preserves_server_speeds_even_before_usage_tail(
-    monkeypatch: pytest.MonkeyPatch, timings_on_usage_packet: bool
+@pytest.mark.parametrize('on_terminal', [False, True])
+def test_server_timings_may_arrive_before_terminal(
+    monkeypatch: pytest.MonkeyPatch, on_terminal: bool
 ) -> None:
-    timings = {'prompt_per_second': 1200.0, 'predicted_per_second': 42.5}
+    values = {'prompt_per_second': 1200.0, 'predicted_per_second': 42.5}
     _patch(
         monkeypatch,
         [
-            _chunk(
-                delta=ChoiceDelta(content='response'),
-                finish_reason='stop',
-                timings=None if timings_on_usage_packet else timings,
+            _event(
+                'response.in_progress', response=_response(timings=None if on_terminal else values)
             ),
-            _chunk(
-                usage=CompletionUsage(prompt_tokens=100, completion_tokens=10, total_tokens=110),
-                no_choices=True,
-                timings=timings if timings_on_usage_packet else None,
-            ),
+            _terminal(_response(timings=values if on_terminal else None)),
         ],
     )
-    result = asyncio.run(
-        stream_llm_chat(llm_cfg=SampleOpenAIConfig(), messages=[{'role': 'user', 'content': 'hi'}])
-    )
-    assert result.llm['prompt_tokens_per_second'] == 1200.0
+    result = _run()
+    assert result.llm['prompt_tokens_per_second'] == 1200
     assert result.llm['eval_tokens_per_second'] == 42.5
-    assert 'request_tokens_per_second' not in result.llm
 
 
 @pytest.mark.parametrize('invalid', [float('inf'), float('nan'), -1.0, True])
-def test_invalid_server_timings_fall_back_to_request_average(
+def test_invalid_server_speeds_use_request_average(
     monkeypatch: pytest.MonkeyPatch, invalid: float | bool
 ) -> None:
-    _patch(
-        monkeypatch,
-        [
-            _chunk(
-                delta=ChoiceDelta(content='response'),
-                usage=CompletionUsage(prompt_tokens=100, completion_tokens=10, total_tokens=110),
-                prompt_eval_duration=invalid,
-                eval_duration=invalid,
-                timings={'prompt_per_second': invalid, 'predicted_per_second': invalid},
-            )
-        ],
-    )
-    result = asyncio.run(
-        stream_llm_chat(llm_cfg=SampleOpenAIConfig(), messages=[{'role': 'user', 'content': 'hi'}])
-    )
-    assert 'prompt_tokens_per_second' not in result.llm
+    _patch(monkeypatch, [_terminal(_response(timings={'predicted_per_second': invalid}))])
+    result = _run()
     assert 'eval_tokens_per_second' not in result.llm
     assert result.llm['request_tokens_per_second'] > 0
 
 
-def test_stream_llm_chat_reuses_caller_owned_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch(monkeypatch, PACKETS_TEXT)
+@pytest.mark.parametrize('failure', ['error', 'failed', 'incomplete', 'disconnected'])
+def test_failed_or_incomplete_stream_is_not_accepted(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    terminal = {
+        'error': _event('error', code='bad', message='stream failed', param=None),
+        'failed': _event(
+            'response.failed',
+            response=_response(
+                status='failed', error={'code': 'server_error', 'message': 'stream failed'}
+            ),
+        ),
+        'incomplete': _terminal(
+            _response(status='incomplete', incomplete_details={'reason': 'max_output_tokens'})
+        ),
+    }
+    packets = [_delta('partial')]
+    if failure != 'disconnected':
+        packets.append(terminal[failure])
+    _patch(monkeypatch, packets)
+    with pytest.raises((RuntimeError, JsonProtocolError)):
+        _run()
+    assert FakeAsyncOpenAI.closed and FakeResponses.stream.closed
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_caller_owned_client_is_never_closed(monkeypatch: pytest.MonkeyPatch, failed: bool) -> None:
+    _patch(monkeypatch, [] if failed else [_terminal()])
     client = FakeAsyncOpenAI()
-
-    async def twice() -> None:
-        for _ in range(2):
-            outcome = await stream_llm_chat(
-                llm_cfg=SampleOpenAIConfig(),
-                messages=[{"role": "user", "content": "hello"}],
-                client=client,  # type: ignore[arg-type]
-            )
-            assert outcome.text == "hello world"
-            assert not client.closed
-
-    asyncio.run(twice())
-
-
-def test_stream_error_does_not_close_caller_owned_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch(monkeypatch, [_chunk(error={"message": "stream failed"})])
-    client = FakeAsyncOpenAI()
-    with pytest.raises(RuntimeError, match="stream failed"):
-        asyncio.run(
-            stream_llm_chat(
-                llm_cfg=SampleOpenAIConfig(),
-                messages=[{"role": "user", "content": "hello"}],
-                client=client,  # type: ignore[arg-type]
-            )
-        )
+    if failed:
+        with pytest.raises(JsonProtocolError):
+            _run(client=client)
+    else:
+        assert _run(client=client).text == _run(client=client).text == 'hello world'
     assert not client.closed
+    assert FakeResponses.stream.closed
 
 
-def test_stream_llm_chat_with_response_format(
+def test_truncated_function_call_is_rejected_as_retryable_protocol_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch(monkeypatch, PACKETS_TEXT)
-    rf = schema_response_format(_SummaryOutput)
+    function = {
+        'type': 'function_call',
+        'id': 'fc_1',
+        'call_id': 'call_1',
+        'name': 'replace_lines',
+        'arguments': '{"path":',
+    }
+    _patch(
+        monkeypatch,
+        [
+            _terminal(
+                _response(
+                    status='incomplete',
+                    incomplete_details={'reason': 'max_output_tokens'},
+                    output=[function],
+                )
+            )
+        ],
+    )
+    with pytest.raises(JsonProtocolError, match='max_output_tokens.*tool calls rejected'):
+        _run()
 
+
+def test_missing_usage_remains_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(monkeypatch, [_terminal(_response(usage=None))])
+    result = _run()
+    assert result.prompt_eval_count == result.eval_count == 0
+
+
+def test_observed_reasoning_tokens_are_recorded_even_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _response()
+    assert response.usage is not None and response.usage.output_tokens_details is not None
+    response.usage.output_tokens_details.reasoning_tokens = 37
+    _patch(monkeypatch, [_terminal(response)])
+    result = _run()
+    assert FakeResponses.kwargs['reasoning'] == {'effort': 'none'}
+    assert result.llm['reasoning_tokens'] == 37
+
+
+def test_thinking_and_output_limit_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(monkeypatch, [_terminal()])
     asyncio.run(
         stream_llm_chat(
-            llm_cfg=SampleOpenAIConfig(),
-            messages=[{"role": "user", "content": "go"}],
-            response_format=rf,
+            llm_cfg=SampleOpenAIConfig(think=True, max_output_tokens=None),
+            messages=[{'role': 'user', 'content': 'hi'}],
         )
     )
-
-    assert FakeCompletions.kwargs["response_format"] == rf
-    assert FakeAsyncOpenAI.closed
-
-
-@pytest.mark.parametrize(
-    "tool_choice", ["required", {"type": "function", "function": {"name": "add"}}]
-)
-def test_stream_llm_chat_with_tools(
-    monkeypatch: pytest.MonkeyPatch,
-    tool_choice: Any,
-) -> None:
-    _patch(monkeypatch, PACKETS_TEXT)
-
-    class FakeTool:
-        name = "add"
-        description = "Add numbers"
-        parameters = {"type": "object", "properties": {"x": {"type": "integer"}}}
-
-    asyncio.run(
-        stream_llm_chat(
-            llm_cfg=SampleOpenAIConfig(),
-            messages=[{"role": "user", "content": "add"}],
-            tools=[FakeTool()],
-            tool_choice=tool_choice,
-        )
-    )
-
-    assert "tools" in FakeCompletions.kwargs
-    assert FakeCompletions.kwargs["tools"][0]["function"]["name"] == "add"
-    assert FakeCompletions.kwargs["tool_choice"] == tool_choice
+    assert FakeResponses.kwargs['reasoning'] == {'effort': 'medium'}
+    assert 'think' not in FakeResponses.kwargs['extra_body']
+    assert 'max_output_tokens' not in FakeResponses.kwargs
 
 
-def test_stream_llm_chat_rejects_tool_choice_without_tools() -> None:
-    with pytest.raises(ValueError, match="tool_choice requires tools"):
-        asyncio.run(
-            stream_llm_chat(
-                llm_cfg=SampleOpenAIConfig(),
-                messages=[{"role": "user", "content": "go"}],
-                tool_choice="required",
-            )
-        )
-
-
-def test_stream_llm_chat_omits_max_tokens_when_none(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch(monkeypatch, PACKETS_TEXT)
-
-    asyncio.run(
-        stream_llm_chat(
-            llm_cfg=SampleOpenAIConfig(max_output_tokens=None),
-            messages=[{"role": "user", "content": "hi"}],
-        )
-    )
-
-    assert "max_tokens" not in FakeCompletions.kwargs
-
-
-def test_stream_llm_chat_raises_server_stream_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch(monkeypatch, [_chunk(no_choices=True, error={"message": "rate limited"})])
-
-    with pytest.raises(RuntimeError, match="rate limited"):
-        asyncio.run(
-            stream_llm_chat(
-                llm_cfg=SampleOpenAIConfig(),
-                messages=[{"role": "user", "content": "hi"}],
-            )
-        )
-    assert FakeAsyncOpenAI.closed
-
-
-def test_stream_llm_chat_rejects_empty_messages() -> None:
-    with pytest.raises(ValueError, match="must not be empty"):
-        asyncio.run(
-            stream_llm_chat(
-                llm_cfg=SampleOpenAIConfig(),
-                messages=[],
-            )
-        )
-
-
-def test_stream_llm_chat_requires_llm_config_subclass() -> None:
-    with pytest.raises(TypeError, match="llm_cfg must inherit LlmConfig"):
+def test_request_validation() -> None:
+    with pytest.raises(ValueError, match='must not be empty'):
+        asyncio.run(stream_llm_chat(llm_cfg=SampleOpenAIConfig(), messages=[]))
+    with pytest.raises(ValueError, match='tool_choice requires tools'):
+        _run(tool_choice='required')
+    with pytest.raises(TypeError, match='LlmConfig'):
         asyncio.run(
             stream_llm_chat(
                 llm_cfg=PlainPydanticConfig(),  # type: ignore[arg-type]
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[{'role': 'user', 'content': 'hi'}],
             )
         )
-
-
-def test_stream_llm_chat_passes_tool_specs_correctly(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch(monkeypatch, PACKETS_TEXT)
-
-    class FakeTool:
-        name = "get_weather"
-        description = "Get current weather"
-        parameters = {"type": "object", "properties": {"city": {"type": "string"}}}
-
-    asyncio.run(
-        stream_llm_chat(
-            llm_cfg=SampleOpenAIConfig(),
-            messages=[{"role": "user", "content": "what's the weather"}],
-            tools=[FakeTool()],
-        )
-    )
-
-    tool_spec = FakeCompletions.kwargs["tools"][0]
-    assert tool_spec["type"] == "function"
-    assert tool_spec["function"]["name"] == "get_weather"
-
-
-def test_stream_llm_chat_collects_tool_calls_from_deltas(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch(monkeypatch, TOOL_CALL_PACKETS)
-
-    outcome = asyncio.run(
-        stream_llm_chat(
-            llm_cfg=SampleOpenAIConfig(),
-            messages=[{"role": "user", "content": "add 2 and 3"}],
-        )
-    )
-
-    assert len(outcome.tool_calls) == 1
-    tc = outcome.tool_calls[0]
-    assert tc.id == "call_1"
-    assert tc.function["name"] == "add"
-    assert tc.function["arguments"] == '{"left":2,"right":3}'
-    assert outcome.text == ""
-    # message dict should include tool_calls
-    msg = outcome.message
-    assert "tool_calls" in msg
-
-
-def test_stream_llm_chat_collects_tool_calls_from_sdk_objects(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The OpenAI SDK parses SSE chunks into ChatCompletionChunk objects.
-    tool_call = ChoiceDeltaToolCall(
-        index=0,
-        id="call_1",
-        type="function",
-        function=ChoiceDeltaToolCallFunction(name="add", arguments='{"left":2,"right":3}'),
-    )
-    packets: list[ChatCompletionChunk] = [
-        ChatCompletionChunk(
-            id="chunk-1",
-            choices=[
-                Choice(
-                    index=0,
-                    delta=ChoiceDelta(content="", tool_calls=[tool_call]),
-                    finish_reason=None,
-                )
-            ],
-            created=0,
-            model="sample-model",
-            object="chat.completion.chunk",
-        ),
-        ChatCompletionChunk(
-            id="chunk-2",
-            choices=[Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")],
-            created=0,
-            model="sample-model",
-            object="chat.completion.chunk",
-        ),
-    ]
-    _patch(monkeypatch, packets)
-
-    outcome = asyncio.run(
-        stream_llm_chat(
-            llm_cfg=SampleOpenAIConfig(),
-            messages=[{"role": "user", "content": "add 2 and 3"}],
-        )
-    )
-
-    assert len(outcome.tool_calls) == 1
-    tc = outcome.tool_calls[0]
-    assert tc.id == "call_1"
-    assert tc.function["name"] == "add"
-    assert tc.function["arguments"] == '{"left":2,"right":3}'
-
-
-def test_schema_response_format_validates_model(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    rf = schema_response_format(_SummaryOutput)
-    assert rf["type"] == "json_schema"
-    assert rf["json_schema"]["name"] == "structured_output"
-
-    with pytest.raises(TypeError, match="BaseModel"):
+    with pytest.raises(TypeError, match='BaseModel'):
         schema_response_format(object())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize('stream_preamble', [False, True])
+def test_agent_loop_uses_native_responses_over_sdk_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    stream_preamble: bool,
+) -> None:
+    class Inspect(BaseModel):
+        key: str
+
+    requests: list[dict[str, Any]] = []
+    chunks: list[str] = []
+    reasoning = {'type': 'reasoning', 'id': 'rs_1', 'summary': [], 'encrypted_content': 'opaque'}
+
+    async def inspect(state: State, key: str) -> str:
+        assert key == 'A-13'
+        return 'record-13'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == '/v1/responses'
+        body = json.loads(request.content)
+        requests.append(body)
+        assert body['store'] is False
+        assert body['tool_choice'] == 'required'
+        assert body['reasoning'] == {'effort': 'none'}
+        assert 'think' not in body
+        assert 'messages' not in body and 'response_format' not in body
+        assert {tool['name'] for tool in body['tools']} == {'inspect', 'submit_result'}
+        submit = next(tool for tool in body['tools'] if tool['name'] == 'submit_result')
+        assert submit['strict'] is True
+        assert submit['parameters']['additionalProperties'] is False
+        assert submit['parameters']['required'] == ['summary']
+        inspect_tool = next(tool for tool in body['tools'] if tool['name'] == 'inspect')
+        assert inspect_tool['strict'] is True
+        if len(requests) == 1:
+            items = [
+                reasoning,
+                {
+                    'type': 'function_call',
+                    'id': 'fc_1',
+                    'call_id': 'call_1',
+                    'name': 'inspect',
+                    'arguments': '{"key":"A-13"}',
+                },
+            ]
+        else:
+            assert len(requests) == 2
+            assert reasoning in body['input']
+            assert {
+                'type': 'function_call_output',
+                'call_id': 'call_1',
+                'output': 'record-13',
+            } in body['input']
+            items = [
+                {
+                    'type': 'function_call',
+                    'id': 'fc_2',
+                    'call_id': 'call_2',
+                    'name': 'submit_result',
+                    'arguments': '{"summary":"record-13"}',
+                }
+            ]
+        items.insert(0, _response('Calling the tool.').output[0].model_dump(mode='json'))
+        event = _terminal(_response(output=items)).model_dump(mode='json')
+        delta = {
+            'type': 'response.output_text.delta',
+            'sequence_number': 0,
+            'item_id': 'msg_1',
+            'output_index': 0,
+            'content_index': 0,
+            'delta': 'Calling the tool.',
+            'logprobs': [],
+        }
+        return httpx.Response(
+            200,
+            headers={'Content-Type': 'text/event-stream'},
+            text=(
+                'event: response.output_text.delta\ndata: ' + json.dumps(delta) + '\n\n'
+                if stream_preamble
+                else ''
+            )
+            + 'event: response.completed\ndata: '
+            + json.dumps(event)
+            + '\n\n',
+        )
+
+    def client(**kwargs: Any) -> AsyncOpenAI:
+        return AsyncOpenAI(
+            **kwargs,
+            max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+    monkeypatch.setattr(llm_module, 'AsyncOpenAI', client)
+    agent = create_structured_agent(
+        llm_config=SampleOpenAIConfig(),
+        response_model=_SummaryOutput,
+        tools=[Tool.from_model(Inspect, inspect, name='inspect')],
+        extensions=(StructuredOutput(),),
+    )
+
+    async def receive_chunk(call: AgentCall) -> None:
+        chunks.append(call.chunk)
+
+    agent.events.subscribe(CHUNK_RECEIVED, receive_chunk)
+    result = asyncio.run(agent.invoke(StructuredInput(prompt='Inspect A-13.')))
+    assert result.output == _SummaryOutput(summary='record-13')
+    assert len(requests) == 2
+    assert chunks == ['Calling the tool.', 'Calling the tool.']

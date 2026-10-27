@@ -45,11 +45,11 @@ def test_structured_context_loop_requires_tool_protocol_and_rejects_plain_json(
         nonlocal turns
         turns += 1
         expected_choice = (
-            {"type": "function", "function": {"name": "read_required"}}
+            {"type": "function", "name": "read_required"}
             if turns == 1
-            else {"type": "function", "function": {"name": "submit_result"}}
+            else {"type": "function", "name": "submit_result"}
             if turns == 4
-            else None
+            else "required"
         )
         assert kwargs["tool_choice"] == expected_choice
         assert kwargs["response_format"] is None
@@ -93,7 +93,7 @@ def test_structured_context_loop_requires_tool_protocol_and_rejects_plain_json(
     assert turns == 4
 
 
-def test_textual_tool_call_stops_stream_and_retries_with_named_submission(
+def test_textual_tool_call_is_rejected_after_completion_and_retries_with_named_submission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     turns = 0
@@ -102,20 +102,16 @@ def test_textual_tool_call_stops_stream_and_retries_with_named_submission(
         nonlocal turns
         turns += 1
         if turns == 1:
-            assert kwargs["tool_choice"] == {
-                "type": "function",
-                "function": {"name": "read_required"},
-            }
+            assert kwargs["tool_choice"] == {"type": "function", "name": "read_required"}
             return _outcome(tool_calls=(tool_call("read_required"),))
         if turns == 2:
-            assert kwargs["tool_choice"] is None
+            assert kwargs["tool_choice"] == "required"
             assert json.loads(kwargs["messages"][-1]["content"])["files"][0]["path"] == "task.md"
-            await kwargs["on_chunk"]("<tool_call>")
-            pytest.fail("textual tool output must abort on its first content chunk")
-        assert kwargs["tool_choice"] == {"type": "function", "function": {"name": "submit_result"}}
+            return _outcome('<tool_call>{"name":"submit_result"}</tool_call>')
+        assert kwargs["tool_choice"] == {"type": "function", "name": "submit_result"}
         feedback = json.loads(kwargs["messages"][-1]["content"])
         assert feedback["validation_errors"][0]["type"] == "submission_required"
-        assert "API tool_calls" in feedback["response_suggestion"]
+        assert "Call submit_result" in feedback["response_suggestion"]
         return _outcome(tool_calls=(tool_call("submit_result", answer="done"),))
 
     monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
@@ -217,7 +213,7 @@ def test_task_loop_reads_context_and_repairs_rejected_submission_without_templat
     assert json.loads(result.messages[-1]["content"]) == {"accepted": True}
 
 
-@pytest.mark.parametrize("read_mode", ["none", "grep", "partial", "stale"])
+@pytest.mark.parametrize("read_mode", ["none", "grep", "grep_multiline", "partial", "stale"])
 def test_final_output_requires_complete_current_context(
     read_mode: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -229,8 +225,18 @@ def test_final_output_requires_complete_current_context(
     async def llm(**kwargs: Any) -> LlmChatOutcome:
         nonlocal calls
         calls += 1
-        if calls == 1 and read_mode == "grep":
-            return _outcome(tool_calls=(tool_call("grep", pattern=".*"),))
+        if calls == 1 and read_mode in {"grep", "grep_multiline"}:
+            return _outcome(
+                tool_calls=(
+                    tool_call(
+                        "grep", pattern=r"first\nsecond" if read_mode == "grep_multiline" else ".*"
+                    ),
+                )
+            )
+        if calls == 2 and read_mode == "grep_multiline":
+            assert [
+                match["line"] for match in json.loads(kwargs["messages"][-1]["content"])["matches"]
+            ] == [1, 2]
         if calls == 1 and read_mode in {"partial", "stale"}:
             return _outcome(
                 tool_calls=(

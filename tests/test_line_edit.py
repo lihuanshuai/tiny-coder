@@ -532,3 +532,15 @@ def test_grep_lines_locates_keywords_with_original_numbers(pattern: str | re.Pat
     assert numbered_text(source, start_line=4, end_line=4) == "4: - todo: expand"
     assert list(grep_lines(source, "missing")) == []
     assert list(grep_lines("", pattern)) == []
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_grep_lines_finds_multiline_source_without_duplicate_or_phantom_lines(newline: str) -> None:
+    source = newline.join(["# Title", "TODO: first", "", "TODO: second", "tail", ""])
+    assert list(grep_lines(source, r"^TODO: first\n\nTODO: second$|second")) == [
+        (2, "TODO: first"),
+        (3, ""),
+        (4, "TODO: second"),
+    ]
+    assert list(grep_lines(source, r"tail\n\Z")) == [(5, "tail")]
+    assert list(grep_lines(source, r"\Z")) == [(5, "tail")]

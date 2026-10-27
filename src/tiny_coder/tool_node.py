@@ -10,6 +10,7 @@ from typing import Any, TypeAlias
 from pydantic import BaseModel, ValidationError
 
 from tiny_coder.state import State, Update
+from tiny_coder.tool_arguments import ToolArgumentsError, validate_tool_payload
 
 ToolHandler: TypeAlias = Callable[..., Awaitable[str]]
 
@@ -74,15 +75,32 @@ class Tool:
 
     async def invoke(self, state: State, arguments: str) -> str:
         try:
-            payload = json.loads(arguments) if arguments.strip() else {}
-        except json.JSONDecodeError as error:
-            return f"error: invalid JSON arguments: {error}"
-        if not isinstance(payload, dict):
-            return "error: tool arguments must be a JSON object"
+            payload = validate_tool_payload(self.name, self.parameters, arguments)
+        except ToolArgumentsError as error:
+            return str(error)
         try:
             validated = self.model.model_validate(payload)
         except ValidationError as error:
-            return f"error: invalid arguments: {error}"
+            return "error: invalid arguments: " + json.dumps(
+                {
+                    "tool": self.name,
+                    "errors": [
+                        {
+                            **failure,
+                            "suggestion": f"{self.name}: Correct field "
+                            f"`{'.'.join(map(str, failure['loc'])) or '$'}`: {failure['msg']}. "
+                            "Resubmit the corrected argument object; the tool was not executed.",
+                        }
+                        for failure in error.errors(
+                            include_url=False, include_input=False, include_context=False
+                        )
+                    ],
+                    "required_fields": self.parameters.get("required", []),
+                    "provided_fields": sorted(payload),
+                    "executed": False,
+                },
+                ensure_ascii=False,
+            )
         try:
             result = await self.handler(state, **validated.model_dump())
         except Exception as error:
@@ -150,7 +168,10 @@ class ToolNode:
             name = call["name"]
             tool = self._by_name.get(name)
             if tool is None:
-                content = f"error: unknown tool: {name or '<missing>'}"
+                content = (
+                    f"error: unknown tool: {name or '<missing>'}; "
+                    f"choose exactly one of the registered tool names: {', '.join(self._by_name)}"
+                )
             else:
                 content = await tool.invoke(state, call["arguments"])
             results.append(

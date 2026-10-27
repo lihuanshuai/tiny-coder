@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tiny-coder"
-version = "1.4.0"
+version = "1.4.1"
 description = "Graph-based LLM agent runtime with tool calling and checkpointing"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,8 @@ license = { file = "LICENSE" }
 dependencies = [
     "httpcore2>=2.13.0",
     "jinja2>=3.1",
-    "openai>=1.0",
+    "jsonschema>=4.23",
+    "openai>=1.66.0",
     "pydantic>=2.0",
     "pyyaml>=6.0",
 ]

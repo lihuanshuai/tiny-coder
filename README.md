@@ -419,6 +419,11 @@ restore the outer stream automatically.
 
 ## Structured Output
 
+Requests use `/v1/responses`, including native function calls, `function_call_output`, and
+`text.format` for structured output. The endpoint must support Responses; there is no Chat
+Completions fallback. Conversation state, including reasoning items, is replayed locally with
+`store=false`. A named tool choice is `{"type": "function", "name": "tool_name"}`.
+
 `stream_llm_chat(..., client=client)` accepts a caller-owned `AsyncOpenAI` client for connection
 reuse and custom transport settings. The caller must close the injected client; streams are
 closed after each request, including failures. Without injection, the function creates and closes
