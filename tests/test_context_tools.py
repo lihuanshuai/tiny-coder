@@ -547,7 +547,7 @@ def test_submissions_and_rejected_context_are_recorded_and_checkpointed(
     checkpoint = asyncio.run(checkpointer.load())
     assert checkpoint is not None
     assert checkpoint.state["messages"] == result.messages
-    assert checkpoint.state["context_reads"]["empty.md"]["ranges"] == [[1, 0]]
+    assert checkpoint.state["context_reads"]["empty.md"]["ranges"] == []
 
 
 def test_required_batch_gates_submission_and_only_rereads_changed_snapshots(
@@ -643,3 +643,83 @@ def test_stringified_array_and_incomplete_json_receive_specific_feedback(
     )
     result = asyncio.run(agent.invoke(StructuredInput(prompt="Return file objects")))
     assert result.model(Result) == Result(files=[{"path": "note.md"}])
+
+
+def test_context_reads_return_only_gaps_and_reuse_the_current_revision() -> None:
+    file = ContextFile(
+        path="note.md", content="first\nsecond\nthird\nfourth\nfifth\n", required=True
+    )
+    call = AgentCall(
+        state={}, messages=[], llm_config=SampleLlmConfig(), system_prompt="", attempt=1
+    )
+
+    async def run() -> None:
+        await ContextTools([file]).prepare(call)
+
+        async def invoke(name: str, **arguments: Any) -> dict[str, Any]:
+            tool = next(tool for tool in call.tools if tool.name == name)
+            return json.loads(await tool.invoke(call.state, json.dumps(arguments)))
+
+        first = await invoke("read_file", path="note.md", start_line=1, end_line=2)
+        assert first["content"] == "1: first\n2: second"
+        assert first["read_ranges"] == [[1, 2]]
+        assert first["missing_ranges"] == [[3, 5]]
+        await invoke("read_file", path="note.md", start_line=4, end_line=4)
+        listing = (await invoke("list_files"))["files"][0]
+        assert listing["read_ranges"] == [[1, 2], [4, 4]]
+        assert listing["missing_ranges"] == [[3, 3], [5, 5]]
+        assert listing["read"] is False
+
+        fill = (await invoke("read_required"))["files"][0]
+        assert fill["content"] == "3: third\n5: fifth"
+        assert fill["returned_ranges"] == [[3, 3], [5, 5]]
+        assert fill["read_ranges"] == [[1, 5]]
+        assert fill["missing_ranges"] == []
+        assert fill["already_read"] is False
+        assert fill["revision"] == first["revision"]
+        repeated = await invoke("read_file", path="./note.md")
+        assert repeated["content"] == ""
+        assert repeated["already_read"] is True
+        assert repeated["returned_ranges"] == []
+        assert repeated["read_ranges"] == [[1, 5]]
+        assert repeated["revision"] == first["revision"]
+        assert (await invoke("read_required"))["files"] == []
+
+        # Persisted coverage must not suppress a new version, including shorter files.
+        call.state["context_reads"] = json.loads(json.dumps(call.state["context_reads"]))
+        file.content = "updated\nsecond\n"
+        listing = (await invoke("list_files"))["files"][0]
+        assert listing["read"] is False
+        assert listing["read_ranges"] == []
+        assert listing["missing_ranges"] == [[1, 2]]
+        updated = (await invoke("read_required"))["files"][0]
+        assert updated["content"] == "1: updated\n2: second"
+        assert updated["returned_ranges"] == [[1, 2]]
+        assert updated["read_ranges"] == [[1, 2]]
+        assert updated["revision"] != first["revision"]
+        assert updated["already_read"] is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("content", ["", "one\ntwo\nthree\nfour\nfive"])
+def test_overlapping_context_reads_never_repeat_source_lines(content: str) -> None:
+    file = ContextFile(path="note.md", content=content, required=True)
+    call = AgentCall(
+        state={}, messages=[], llm_config=SampleLlmConfig(), system_prompt="", attempt=1
+    )
+
+    async def run() -> None:
+        await ContextTools([file]).prepare(call)
+        tool = next(tool for tool in call.tools if tool.name == "read_file")
+        arguments = {"path": "note.md", "start_line": 1, "end_line": 3 if content else None}
+        first = json.loads(await tool.invoke(call.state, json.dumps(arguments)))
+        assert first["already_read"] is False
+        arguments.update(start_line=2 if content else 1, end_line=None)
+        second = json.loads(await tool.invoke(call.state, json.dumps(arguments)))
+        assert second["content"] == ("4: four\n5: five" if content else "")
+        assert second["returned_ranges"] == ([[4, 5]] if content else [])
+        assert second["missing_ranges"] == []
+        assert len(call.state["context_reads"]["note.md"]["ranges"]) == (1 if content else 0)
+
+    asyncio.run(run())

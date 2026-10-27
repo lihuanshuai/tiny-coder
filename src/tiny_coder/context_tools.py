@@ -36,13 +36,17 @@ class ContextFile(BaseModel):
 
 
 class _ListFiles(BaseModel):
-    """List available context paths and their access rules; returns no file contents."""
+    """List context paths, revisions, read/missing ranges and access rules; no file contents."""
 
     model_config = ConfigDict(extra="forbid")
 
 
 class _ReadFile(BaseModel):
-    """Read exact snapshot lines. Omit end_line to read to the end; line numbers are 1-based."""
+    """Read missing snapshot lines; reuse earlier tool content for already-read ranges.
+
+    Line numbers are 1-based; end_line=null reads to the end. returned_ranges identifies
+    new content; read_ranges covers all lines already provided at this revision.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -54,7 +58,7 @@ class _ReadFile(BaseModel):
 class _ReadRequired(BaseModel):
     """Read every required snapshot not fully read at its current revision in one call.
 
-    Use this before completing the task. Already fully read current snapshots are skipped.
+    Only missing line ranges are returned. Already fully read current snapshots are skipped.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -82,15 +86,38 @@ def _path(value: str) -> str:
     return path.as_posix()
 
 
+def _merge_ranges(ranges: list[list[int]]) -> list[list[int]]:
+    merged: list[list[int]] = []
+    for first, last in sorted(ranges):
+        if last < first:
+            continue
+        if merged and first <= merged[-1][1] + 1:
+            merged[-1][1] = max(last, merged[-1][1])
+        else:
+            merged.append([first, last])
+    return merged
+
+
+def _unread_ranges(ranges: list[list[int]], first: int, last: int) -> list[list[int]]:
+    missing = []
+    cursor = first
+    for start, end in _merge_ranges(ranges):
+        if start > last:
+            break
+        if start > cursor:
+            missing.append([cursor, start - 1])
+        cursor = max(cursor, end + 1)
+    if cursor <= last:
+        missing.append([cursor, last])
+    return missing
+
+
 def _read_complete(record: _ReadRecord | None, revision: str, total_lines: int) -> bool:
-    if record is None or record["revision"] != revision:
-        return False
-    end = 0
-    for first, last in sorted(record["ranges"]):
-        if first > end + 1:
-            return False
-        end = max(end, last)
-    return end >= total_lines
+    return (
+        record is not None
+        and record["revision"] == revision
+        and not _unread_ranges(record["ranges"], 1, total_lines)
+    )
 
 
 @dataclass
@@ -141,25 +168,31 @@ class ContextTools(AgentExtension):
 
         async def list_files(state: State) -> str:
             reads: dict[str, _ReadRecord] = state.get("context_reads", {})
+            files = []
+            for path, file in self._files(call).items():
+                revision = text_revision(file.content)
+                total_lines = len(text_lines(file.content))
+                record = reads.get(path)
+                ranges = (
+                    _merge_ranges(record["ranges"])
+                    if record is not None and record["revision"] == revision
+                    else []
+                )
+                files.append(
+                    {
+                        "path": path,
+                        "description": file.description,
+                        "writable": file.writable,
+                        "required": file.required,
+                        "total_lines": total_lines,
+                        "revision": revision,
+                        "read": _read_complete(record, revision, total_lines),
+                        "read_ranges": ranges,
+                        "missing_ranges": _unread_ranges(ranges, 1, total_lines),
+                    }
+                )
             return json.dumps(
-                {
-                    "files": [
-                        {
-                            "path": path,
-                            "description": file.description,
-                            "writable": file.writable,
-                            "required": file.required,
-                            "total_lines": len(text_lines(file.content)),
-                            "revision": text_revision(file.content),
-                            "read": _read_complete(
-                                reads.get(path),
-                                text_revision(file.content),
-                                len(text_lines(file.content)),
-                            ),
-                        }
-                        for path, file in self._files(call).items()
-                    ]
-                },
+                {"files": files},
                 ensure_ascii=False,
             )
 
@@ -178,10 +211,16 @@ class ContextTools(AgentExtension):
             revision = text_revision(file.content)
             reads: dict[str, _ReadRecord] = state.setdefault("context_reads", {})
             record = reads.get(canonical)
+            already_read = (
+                record is not None
+                and record["revision"] == revision
+                and not _unread_ranges(record["ranges"], start_line, end)
+            )
             if record is None or record["revision"] != revision:
                 record = _ReadRecord(revision=revision, ranges=[])
                 reads[canonical] = record
-            record["ranges"].append([start_line, end])
+            returned = _unread_ranges(record["ranges"], start_line, end)
+            record["ranges"] = _merge_ranges([*record["ranges"], *returned])
             return json.dumps(
                 {
                     "path": canonical,
@@ -191,7 +230,14 @@ class ContextTools(AgentExtension):
                     "start_line": start_line,
                     "end_line": end,
                     "total_lines": len(lines),
-                    "content": numbered_text(file.content, start_line=start_line, end_line=end),
+                    "returned_ranges": returned,
+                    "read_ranges": record["ranges"],
+                    "missing_ranges": _unread_ranges(record["ranges"], 1, len(lines)),
+                    "already_read": already_read,
+                    "content": "\n".join(
+                        numbered_text(file.content, start_line=first, end_line=last)
+                        for first, last in returned
+                    ),
                 },
                 ensure_ascii=False,
             )
