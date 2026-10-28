@@ -492,6 +492,108 @@ def test_native_tool_calls_use_call_id_and_preserve_parallel_order(
     assert inputs[-1] == {'type': 'function_call_output', 'call_id': 'call_2', 'output': 'done'}
 
 
+@pytest.mark.parametrize('buffered', [False, True])
+def test_native_tool_argument_preview_streams_before_completion_without_text_leakage(
+    monkeypatch: pytest.MonkeyPatch, buffered: bool
+) -> None:
+    from tiny_coder.llm import ToolCallDelta
+
+    calls = [
+        {
+            'type': 'function_call',
+            'id': 'fc_1',
+            'call_id': 'call_1',
+            'name': 'first',
+            'arguments': '{"text":"one"}',
+        },
+        {
+            'type': 'function_call',
+            'id': 'fc_2',
+            'call_id': 'call_2',
+            'name': 'second',
+            'arguments': '{"text":"two"}',
+        },
+    ]
+    packets = []
+    if not buffered:
+        for index, call in enumerate(calls):
+            packets.append(
+                _event(
+                    'response.output_item.added', output_index=index, item={**call, 'arguments': ''}
+                )
+            )
+        for index, delta in [(0, '{"text":'), (1, '{"text":"two"}'), (0, '"one"}')]:
+            packets.append(
+                _event(
+                    'response.function_call_arguments.delta',
+                    item_id=f'fc_{index + 1}',
+                    output_index=index,
+                    delta=delta,
+                )
+            )
+    packets.append(_terminal(_response(output=calls)))
+    _patch(monkeypatch, packets)
+    chunks: list[ToolCallDelta] = []
+    text_chunks: list[str] = []
+
+    async def preview(chunk: ToolCallDelta) -> None:
+        if not buffered:
+            assert not FakeResponses.stream.closed
+        chunks.append(chunk)
+
+    async def text_preview(chunk: str) -> None:
+        text_chunks.append(chunk)
+
+    result = _run(on_tool_chunk=preview, on_chunk=text_preview)
+    assert text_chunks == []
+    for index, call in enumerate(calls):
+        assert (
+            ''.join(chunk.delta for chunk in chunks if chunk.output_index == index)
+            == call['arguments']
+        )
+        assert {chunk.name for chunk in chunks if chunk.output_index == index} == {call['name']}
+    assert result.tool_calls[0].function['arguments'] == calls[0]['arguments']
+    assert FakeResponses.stream.closed
+
+
+def test_failed_tool_stream_is_previewed_but_never_returned_as_an_executable_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tiny_coder.llm import ToolCallDelta
+
+    _patch(
+        monkeypatch,
+        [
+            _event(
+                'response.output_item.added',
+                output_index=0,
+                item={
+                    'type': 'function_call',
+                    'id': 'fc_1',
+                    'call_id': 'call_1',
+                    'name': 'write',
+                    'arguments': '',
+                },
+            ),
+            _event(
+                'response.function_call_arguments.delta',
+                item_id='fc_1',
+                output_index=0,
+                delta='{"text":"partial',
+            ),
+        ],
+    )
+    chunks: list[ToolCallDelta] = []
+
+    async def preview(chunk: ToolCallDelta) -> None:
+        chunks.append(chunk)
+
+    with pytest.raises(JsonProtocolError, match='without a terminal response'):
+        _run(on_tool_chunk=preview)
+    assert ''.join(chunk.delta for chunk in chunks) == '{"text":"partial'
+    assert FakeResponses.stream.closed
+
+
 def test_reasoning_replayed_but_rejected_arguments_follow_edited_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

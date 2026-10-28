@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tiny_coder.json_utils import JsonProtocolError, JsonStringFieldStreamer, load_json_object
@@ -31,3 +33,14 @@ def test_json_string_field_streamer_decodes_chunked_value() -> None:
 
     assert printed == "hello\nworld!"
     assert streamer.streamed_text == "hello\nworld!"
+
+
+@pytest.mark.parametrize('chunk_size', [1, 2, 3, 7])
+def test_string_preview_decodes_split_unicode_and_surrogate_pairs(chunk_size: int) -> None:
+    value = '标点：“你好”。\n下一行。😀'
+    raw = json.dumps({'new_text': value})
+    streamer = JsonStringFieldStreamer('new_text')
+    displayed = ''.join(
+        streamer.feed(raw[i : i + chunk_size]) for i in range(0, len(raw), chunk_size)
+    )
+    assert displayed == value

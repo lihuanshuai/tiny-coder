@@ -25,6 +25,7 @@ from tiny_coder.llm import (
     LlmConfig,
     LlmExchange,
     ToolCall,
+    ToolCallDelta,
     ToolChoice,
     parse_structured,
     schema_response_format,
@@ -100,6 +101,7 @@ class AgentCall:
     previous_error: Exception | None = None
     feedback: list[str] = field(default_factory=list)
     chunk: str = ""
+    tool_chunk: ToolCallDelta | None = None
     steering: tuple[str, ...] = ()
     resources: ExitStack = field(default_factory=ExitStack, repr=False)
     tools: list[Tool] = field(default_factory=list)
@@ -139,6 +141,7 @@ CALL_FAILED = Event[AgentCall]("llm.call_failed")
 CALL_FINISHED = Event[AgentCall]("llm.call_finished")
 TOOL_FINISHED = Event[AgentCall]("llm.tool_finished")
 CHUNK_RECEIVED = Event[AgentCall]("llm.chunk_received")
+TOOL_CHUNK_RECEIVED = Event[AgentCall]("llm.tool_chunk_received")
 EXCHANGE_RECEIVED = Event[LlmExchange]("llm.exchange_received")
 
 
@@ -252,6 +255,13 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
 
     async def _emit_exchange(self, exchange: LlmExchange) -> None:
         await self.events.emit(EXCHANGE_RECEIVED, exchange)
+
+    async def _emit_tool_chunk(self, chunk: ToolCallDelta) -> None:
+        invocation = self._invocation.get()
+        assert invocation is not None and invocation.call is not None
+        call = invocation.call
+        call.tool_chunk = chunk
+        await self.events.emit(TOOL_CHUNK_RECEIVED, call)
 
     async def _invoke(self, input: StructuredInput) -> StructuredResult:
         """Invoke this agent with fresh messages and retry state.
@@ -454,6 +464,9 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
             tool_choice=tool_choice,
             response_format=None if tools else call.response_format,
             on_chunk=self._emit_chunk if self.events.has_subscribers(CHUNK_RECEIVED) else None,
+            on_tool_chunk=self._emit_tool_chunk
+            if self.events.has_subscribers(TOOL_CHUNK_RECEIVED)
+            else None,
             on_exchange=self._emit_exchange
             if self.events.has_subscribers(EXCHANGE_RECEIVED)
             else None,
@@ -581,6 +594,7 @@ __all__ = [
     "TOOL_FINISHED",
     "CallTiming",
     "CHUNK_RECEIVED",
+    "TOOL_CHUNK_RECEIVED",
     "EXCHANGE_RECEIVED",
     "StructuredAgent",
     "AgentConversation",

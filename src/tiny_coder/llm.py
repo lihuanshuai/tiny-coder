@@ -56,6 +56,15 @@ class ToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolCallDelta:
+    """Provisional tool arguments for display, never for execution."""
+
+    output_index: int
+    name: str
+    delta: str
+
+
+@dataclass(frozen=True, slots=True)
 class LlmChatOutcome:
     """Result from one complete Responses stream."""
 
@@ -325,6 +334,7 @@ async def stream_llm_chat(
     tool_choice: ToolChoice | None = None,
     response_format: dict[str, Any] | None = None,
     on_chunk: Callable[[str], Awaitable[None]] | None = None,
+    on_tool_chunk: Callable[[ToolCallDelta], Awaitable[None]] | None = None,
     on_exchange: Callable[[LlmExchange], Awaitable[None]] | None = None,
     client: AsyncOpenAI | None = None,
 ) -> LlmChatOutcome:
@@ -355,6 +365,8 @@ async def stream_llm_chat(
     reasoning_chars = 0
     server_timings: dict[str, float] = {}
     streamed_text = False
+    tool_names: dict[int, str] = {}
+    streamed_tools: set[int] = set()
     first_output: float | None = None
     stream: _ResponseStream | None = None
     try:
@@ -400,6 +412,15 @@ async def stream_llm_chat(
                 streamed_text = True
                 if on_chunk is not None:
                     await on_chunk(event.delta)
+            elif event.type == 'response.output_item.added' and event.item.type == 'function_call':
+                tool_names[event.output_index] = event.item.name
+                if on_tool_chunk is not None:
+                    await on_tool_chunk(ToolCallDelta(event.output_index, event.item.name, ''))
+            elif event.type == 'response.function_call_arguments.delta':
+                name = tool_names.get(event.output_index)
+                if on_tool_chunk is not None and name is not None and event.delta:
+                    await on_tool_chunk(ToolCallDelta(event.output_index, name, event.delta))
+                    streamed_tools.add(event.output_index)
             elif (
                 event.type == 'response.reasoning_text.delta'
                 or event.type == 'response.reasoning_summary_text.delta'
@@ -465,6 +486,10 @@ async def stream_llm_chat(
     # The terminal output is authoritative, including providers that buffer text.
     if not streamed_text and output_text and on_chunk is not None:
         await on_chunk(output_text)
+    if on_tool_chunk is not None:
+        for index, item in enumerate(final.output):
+            if item.type == 'function_call' and index not in streamed_tools:
+                await on_tool_chunk(ToolCallDelta(index, item.name, item.arguments))
     usage = final.usage
     prompt_eval_count = nonnegative_int_from_llm_field(usage.input_tokens) if usage else None
     eval_count = nonnegative_int_from_llm_field(usage.output_tokens) if usage else None
@@ -507,6 +532,7 @@ __all__ = [
     'LlmConfig',
     'LlmExchange',
     'ToolCall',
+    'ToolCallDelta',
     'ToolChoice',
     'nonnegative_int_from_llm_field',
     'openai_api_key',

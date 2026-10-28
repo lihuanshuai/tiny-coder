@@ -193,13 +193,37 @@ class JsonStringFieldStreamer:
                             return printed
                         hex_digits = self._buffer[i + 1 : i + 5]
                         try:
-                            decoded = chr(int(hex_digits, 16))
+                            codepoint = int(hex_digits, 16)
                         except ValueError:
-                            decoded = ""
-                        if decoded:
-                            printed += decoded
-                            self._streamed += decoded
-                        i += 5
+                            codepoint = 0xFFFD
+                        consumed = 5
+                        if 0xD800 <= codepoint <= 0xDBFF:
+                            if i + 6 >= len(self._buffer):
+                                self._search_start = i - 1
+                                return printed
+                            if self._buffer[i + 5 : i + 7] == "\\u":
+                                if i + 10 >= len(self._buffer):
+                                    self._search_start = i - 1
+                                    return printed
+                                try:
+                                    low = int(self._buffer[i + 7 : i + 11], 16)
+                                except ValueError:
+                                    low = 0
+                                if 0xDC00 <= low <= 0xDFFF:
+                                    codepoint = (
+                                        0x10000 + ((codepoint - 0xD800) << 10) + low - 0xDC00
+                                    )
+                                    consumed = 11
+                                else:
+                                    codepoint = 0xFFFD
+                            else:
+                                codepoint = 0xFFFD
+                        elif 0xDC00 <= codepoint <= 0xDFFF:
+                            codepoint = 0xFFFD
+                        decoded = chr(codepoint)
+                        printed += decoded
+                        self._streamed += decoded
+                        i += consumed
                         continue
                     decoded = JSON_ESCAPE_MAP.get(ch, ch)
                     printed += decoded
