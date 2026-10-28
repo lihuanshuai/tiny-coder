@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import ExitStack
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any, TypeVar
+from uuid import uuid4
 
 from pydantic import BaseModel
 
@@ -29,7 +32,7 @@ from tiny_coder.llm import (
 )
 from tiny_coder.state import State
 from tiny_coder.steering import current_instructions
-from tiny_coder.tool_node import Tool, ToolNode, has_tool_calls
+from tiny_coder.tool_node import Tool, ToolExecution, ToolNode, has_tool_calls
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -41,6 +44,34 @@ _RETRY_KEY = "_retry"
 _RESPONSE_FORMAT_KEY = "_response_format"
 _SYSTEM_PROMPT_KEY = "_system_prompt"
 SUBMIT_RESULT = "submit_result"
+
+
+@dataclass
+class CallTiming:
+    """Monotonic phase durations with UTC timestamps for one model turn."""
+
+    started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    completed_at: str | None = None
+    duration_ms: float | None = None
+    phases_ms: dict[str, float] = field(default_factory=dict)
+    failed_phase: str | None = None
+    _started: float = field(default_factory=lambda: perf_counter(), repr=False)
+
+    @contextmanager
+    def measure(self, phase: str) -> Iterator[None]:
+        started = perf_counter()
+        try:
+            yield
+        except BaseException:
+            if self.failed_phase is None:
+                self.failed_phase = phase
+            raise
+        finally:
+            self.phases_ms[phase] = (perf_counter() - started) * 1000
+
+    def finish(self) -> None:
+        self.duration_ms = (perf_counter() - self._started) * 1000
+        self.completed_at = datetime.now(timezone.utc).isoformat()
 
 
 @dataclass
@@ -76,6 +107,10 @@ class AgentCall:
     prepared_extensions: set[int] = field(default_factory=set, repr=False)
     submission_enabled: bool = True
     tool_choice: ToolChoice | None = None
+    call_id: str = field(default_factory=lambda: uuid4().hex)
+    timing: CallTiming = field(default_factory=CallTiming)
+    cancelled: bool = False
+    tool_executions: list[ToolExecution] = field(default_factory=list)
 
     @property
     def submission(self) -> ToolCall | None:
@@ -101,6 +136,8 @@ RESPONSE_RECEIVED = Event[AgentCall]("llm.response_received")
 BEFORE_OUTPUT = Event[AgentCall]("llm.before_output")
 AFTER_CALL = Event[AgentCall]("llm.after_call")
 CALL_FAILED = Event[AgentCall]("llm.call_failed")
+CALL_FINISHED = Event[AgentCall]("llm.call_finished")
+TOOL_FINISHED = Event[AgentCall]("llm.tool_finished")
 CHUNK_RECEIVED = Event[AgentCall]("llm.chunk_received")
 EXCHANGE_RECEIVED = Event[LlmExchange]("llm.exchange_received")
 
@@ -313,30 +350,42 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
         # Extensions import the event types above; load the default parser after module setup.
         from tiny_coder.agent_extensions import ResponseValidationError, StructuredOutput
 
+        call.timing = CallTiming()
         try:
             with call.resources:
-                await self.events.emit(CALL_STARTED, call)
-                await self.events.emit(BEFORE_CALL, call)
-                call.outcome = await self._complete(call)
-                call.messages.append(call.outcome.message)
-                await self.events.emit(RESPONSE_RECEIVED, call)
-                if call.submission is not None and len(call.outcome.tool_calls) != 1:
-                    raise ResponseValidationError(
-                        "submit_result must be the only tool call in its turn",
-                        suggestion="Complete context tool calls first, then call submit_result once in a separate turn.",
-                    )
-                if not call.outcome.tool_calls or call.submission is not None:
-                    await self.events.emit(BEFORE_OUTPUT, call)
-                await self.events.emit(AFTER_CALL, call)
-                if call.response_model is not None and call.output is None:
-                    await StructuredOutput(self.accept).parse(call)
-                if call.submission is not None:
-                    self._submission_reply(call, '{"accepted":true}')
+                with call.timing.measure("prepare"):
+                    await self.events.emit(CALL_STARTED, call)
+                    await self.events.emit(BEFORE_CALL, call)
+                with call.timing.measure("model"):
+                    call.outcome = await self._complete(call)
+                with call.timing.measure("response"):
+                    call.messages.append(call.outcome.message)
+                    await self.events.emit(RESPONSE_RECEIVED, call)
+                with call.timing.measure("validation"):
+                    if call.submission is not None and len(call.outcome.tool_calls) != 1:
+                        raise ResponseValidationError(
+                            "submit_result must be the only tool call in its turn",
+                            suggestion="Complete context tool calls first, then call submit_result once in a separate turn.",
+                        )
+                    if not call.outcome.tool_calls or call.submission is not None:
+                        await self.events.emit(BEFORE_OUTPUT, call)
+                    await self.events.emit(AFTER_CALL, call)
+                    if call.response_model is not None and call.output is None:
+                        await StructuredOutput(self.accept).parse(call)
+                    if call.submission is not None:
+                        self._submission_reply(call, '{"accepted":true}')
+        except asyncio.CancelledError:
+            call.cancelled = True
+            raise
         except Exception as error:
             call.error = error
-            await self.events.emit(CALL_FAILED, call)
+            with call.timing.measure("retry"):
+                await self.events.emit(CALL_FAILED, call)
             if not call.retry:
                 raise
+        finally:
+            call.timing.finish()
+            await self.events.emit(CALL_FINISHED, call)
 
     @staticmethod
     def _submission_reply(call: AgentCall, content: str) -> None:
@@ -354,7 +403,13 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
     async def _tools(self, state: State) -> dict[str, Any]:
         invocation = self._invocation.get()
         assert invocation is not None and invocation.call is not None
-        return dict(await ToolNode(invocation.call.tools)(state))
+        call = invocation.call
+
+        async def record_tool(execution: ToolExecution) -> None:
+            call.tool_executions.append(execution)
+            await self.events.emit(TOOL_FINISHED, call)
+
+        return dict(await ToolNode(call.tools, on_tool_finished=record_tool)(state))
 
     async def _complete(self, call: AgentCall) -> LlmChatOutcome:
         """Translate a prepared call to the LLM transport and publish streamed data."""
@@ -522,6 +577,9 @@ __all__ = [
     "BEFORE_OUTPUT",
     "AFTER_CALL",
     "CALL_FAILED",
+    "CALL_FINISHED",
+    "TOOL_FINISHED",
+    "CallTiming",
     "CHUNK_RECEIVED",
     "EXCHANGE_RECEIVED",
     "StructuredAgent",

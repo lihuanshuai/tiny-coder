@@ -6,7 +6,7 @@ import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from weakref import ReferenceType, ref
@@ -41,6 +41,7 @@ from tiny_coder.structured_agent import (
     StructuredInput,
     create_structured_agent,
 )
+from tiny_coder.tool_node import Tool
 
 
 class Output(BaseModel):
@@ -74,7 +75,8 @@ def test_call_recording_preserves_rejected_output_and_resolves_each_input(
 
     asyncio.run(run())
     with path.open("r", encoding="utf-8", newline="\n") as file:
-        records = [json.loads(line) for line in file]
+        entries = [json.loads(line) for line in file]
+    records = [entry for entry in entries if entry["event"] == "response"]
     assert [record["output"] for record in records] == [
         "invalid",
         '{"summary":"done"}',
@@ -86,6 +88,139 @@ def test_call_recording_preserves_rejected_output_and_resolves_each_input(
         ("two", 1, "second"),
     ]
     assert records[0]["stats"] == {"prompt_eval_count": 1, "eval_count": 1}
+
+
+def test_recording_links_model_validation_retry_and_each_tool_without_changing_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Read(BaseModel):
+        path: str
+
+    clock = [100.0]
+    calls, accepts = 0, 0
+
+    async def read(state: Any, path: str) -> str:
+        clock[0] += 0.75
+        return "source text"
+
+    async def llm(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal calls
+        calls += 1
+        clock[0] += 2.0
+        tools: tuple[tuple[str, dict[str, object]], ...]
+        if calls == 1:
+            tools = (
+                ("read", {"path": "one.md"}),
+                ("read", {"path": 123}),
+                ("unknown", {}),
+            )
+        else:
+            # Execution metrics belong in the JSONL, not the model's tool results.
+            assert not any(
+                "duration_ms" in message.get("content", "") for message in kwargs["messages"]
+            )
+            tools = (("submit_result", {"summary": "done"}),)
+        return replace(
+            _outcome(""),
+            tool_calls=tuple(
+                ToolCall(
+                    id=f"tool-{calls}-{index}",
+                    type="function",
+                    function={"name": name, "arguments": json.dumps(arguments)},
+                )
+                for index, (name, arguments) in enumerate(tools)
+            ),
+            llm={"done_reason": "tool_calls", "prompt_eval_duration": 500_000_000},
+        )
+
+    async def accept(call: AgentCall, output: BaseModel) -> None:
+        nonlocal accepts
+        accepts += 1
+        clock[0] += 0.25
+        if accepts == 1:
+            raise ResponseValidationError("missing fact", suggestion="Add the missing fact.")
+
+    monkeypatch.setattr("tiny_coder.structured_agent.perf_counter", lambda: clock[0])
+    monkeypatch.setattr("tiny_coder.tool_node.perf_counter", lambda: clock[0])
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+    path = tmp_path / "calls.jsonl"
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=Output,
+        tools=[Tool.from_model(Read, read, name="read")],
+        extensions=(RetryPolicy(2), CallRecording(path), StructuredOutput(accept)),
+    )
+    result = asyncio.run(agent.invoke(StructuredInput(prompt="Read then submit.")))
+    assert result.output == Output(summary="done")
+    entries = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    responses = [entry for entry in entries if entry["event"] == "response"]
+    finished = [entry for entry in entries if entry["event"] in {"call_finished", "failure"}]
+    tools = [entry for entry in entries if entry["event"] == "tool_finished"]
+    assert len(responses) == len(finished) == 3
+    assert [entry["status"] for entry in finished] == ["tools_requested", "retry", "accepted"]
+    assert [entry["call_id"] for entry in responses] == [entry["call_id"] for entry in finished]
+    assert len({entry["call_id"] for entry in responses}) == 3
+    assert [entry["attempt"] for entry in responses] == [1, 1, 2]
+    for entry in responses:
+        assert entry["started_at"] and entry["completed_at"]
+        assert entry["client_wall_time_ms"] == 10.0
+        assert entry["llm"] == {"done_reason": "tool_calls", "prompt_eval_duration": 500_000_000}
+    for entry in finished:
+        assert entry["timing"]["started_at"] and entry["timing"]["completed_at"]
+        assert entry["timing"]["phases_ms"]["model"] == 2000.0
+    assert finished[0]["timing"]["duration_ms"] == 2000.0
+    for entry in finished[1:]:
+        assert entry["timing"]["phases_ms"]["validation"] == 250.0
+        assert entry["timing"]["duration_ms"] == 2250.0
+    assert finished[1]["timing"]["failed_phase"] == "validation"
+    assert finished[2]["timing"]["failed_phase"] is None
+    assert [entry["tool"]["status"] for entry in tools] == ["completed", "error", "error"]
+    assert [entry["tool"]["duration_ms"] for entry in tools] == [750.0, 0.0, 0.0]
+    assert [entry["tool"]["tool_call_id"] for entry in tools] == [
+        "tool-1-0",
+        "tool-1-1",
+        "tool-1-2",
+    ]
+    assert all(entry["call_id"] == responses[0]["call_id"] for entry in tools)
+    assert "source text" not in json.dumps(tools)
+
+
+@pytest.mark.parametrize("failure", ["transport", "validation", "cancel"])
+def test_recording_keeps_final_failure_and_cancellation_timings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    clock = [0.0]
+
+    async def llm(**kwargs: Any) -> LlmChatOutcome:
+        clock[0] += 3.0
+        if failure == "transport":
+            raise APIConnectionError(request=Request("POST", "http://localhost:8080/v1/responses"))
+        if failure == "cancel":
+            raise asyncio.CancelledError
+        return _outcome("invalid")
+
+    monkeypatch.setattr("tiny_coder.structured_agent.perf_counter", lambda: clock[0])
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+    path = tmp_path / "failure.jsonl"
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=Output,
+        extensions=(RetryPolicy(1), CallRecording(path), StructuredOutput()),
+    )
+    with pytest.raises(asyncio.CancelledError if failure == "cancel" else RuntimeError):
+        asyncio.run(agent.invoke(StructuredInput(prompt="Submit.")))
+    entries = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    finished = entries[-1]
+    assert finished["event"] == "failure"
+    assert finished["status"] == ("cancelled" if failure == "cancel" else "failed")
+    assert finished["retry"] is False
+    assert finished["timing"]["duration_ms"] == 3000.0
+    assert finished["timing"]["phases_ms"]["model"] == 3000.0
+    assert finished["timing"]["failed_phase"] == (
+        "validation" if failure == "validation" else "model"
+    )
+    assert finished["timing"]["completed_at"]
+    assert len(entries) == (2 if failure == "validation" else 1)
 
 
 @pytest.mark.parametrize("value", ['[{"summary":"done"}', '[{"summary": "unterminated}'])
@@ -151,7 +286,7 @@ def test_malformed_container_retry_reports_syntax_and_omits_bad_history_argument
     assert result.output == ContainerOutput(summary="keep this", entries=[Output(summary="done")])
     assert calls == 2 and accepted == [result.output]
     with record.open(encoding="utf-8", newline="\n") as source:
-        records = [json.loads(line) for line in source]
+        records = [entry for line in source if (entry := json.loads(line))["event"] == "response"]
     assert records[0]["output"] == rejected
     assert records[0]["messages"][-1]["tool_calls"][0]["function"]["arguments"] == rejected
 

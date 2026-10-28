@@ -163,7 +163,7 @@ def test_steering_reaches_reused_children_and_rendered_retries(
         assert sum(m["content"] == "keep the ending" for m in call) == 1
     assert [m["content"] for m in calls[3][1:]] == ["task"]
     with record.open(encoding="utf-8", newline="\n") as stream:
-        records = [json.loads(line) for line in stream]
+        records = [entry for line in stream if (entry := json.loads(line))["event"] == "response"]
     assert [r.get("steering", []) for r in records] == [
         [],
         ["keep the ending", "use short paragraphs"],

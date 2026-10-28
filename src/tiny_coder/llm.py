@@ -165,7 +165,7 @@ def _llm_tail_metrics_dict(
     server_timings: Mapping[str, float],
     request_seconds: float,
 ) -> dict[str, Any]:
-    metrics: dict[str, Any] = {}
+    metrics: dict[str, Any] = dict(server_timings)
     usage = packet.usage
     if usage is not None:
         for value, target_key in (
@@ -355,6 +355,7 @@ async def stream_llm_chat(
     reasoning_chars = 0
     server_timings: dict[str, float] = {}
     streamed_text = False
+    first_output: float | None = None
     stream: _ResponseStream | None = None
     try:
         kwargs: dict[str, Any] = {
@@ -377,6 +378,17 @@ async def stream_llm_chat(
         create_response = cast(Callable[..., Awaitable[_ResponseStream]], client.responses.create)
         stream = await create_response(**kwargs)
         async for event in stream:
+            if (
+                first_output is None
+                and (
+                    event.type == 'response.output_text.delta'
+                    or event.type == 'response.function_call_arguments.delta'
+                    or event.type == 'response.reasoning_text.delta'
+                    or event.type == 'response.reasoning_summary_text.delta'
+                )
+                and event.delta
+            ):
+                first_output = time.perf_counter()
             if event.type == 'error':
                 raise RuntimeError(f'Responses stream error: {event.message}')
             if event.type == 'response.failed':
@@ -405,7 +417,12 @@ async def stream_llm_chat(
                 if isinstance(timings, dict):
                     values.update(
                         (key, timings.get(key))
-                        for key in ('prompt_per_second', 'predicted_per_second')
+                        for key in (
+                            'prompt_per_second',
+                            'predicted_per_second',
+                            'prompt_ms',
+                            'predicted_ms',
+                        )
                     )
                 for key, value in values.items():
                     if (valid := _positive_float_from_llm_field(value)) is not None:
@@ -477,6 +494,9 @@ async def stream_llm_chat(
             request_seconds=completed - started,
         ),
     )
+    if first_output is not None:
+        outcome.llm['time_to_first_output_ms'] = (first_output - started) * 1000
+        outcome.llm['stream_output_ms'] = (completed - first_output) * 1000
     if on_exchange is not None:
         await on_exchange(LlmExchange(messages=list(messages), response=outcome))
     return outcome

@@ -18,6 +18,11 @@ class JsonlExchangeRecorder:
         record = {
             "messages": exchange.messages,
             "response": {
+                "started_at": exchange.response.started_at,
+                "completed_at": exchange.response.completed_at,
+                "client_wall_time_ms": exchange.response.client_wall_time_ms,
+                "prompt_eval_count": exchange.response.prompt_eval_count,
+                "eval_count": exchange.response.eval_count,
                 "text": exchange.response.text,
                 "tool_calls": [
                     {

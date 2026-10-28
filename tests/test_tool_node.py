@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from tiny_coder.llm import tool_openai_spec
 from tiny_coder.state import State
-from tiny_coder.tool_node import Tool, ToolNode, has_tool_calls
+from tiny_coder.tool_node import Tool, ToolExecution, ToolNode, has_tool_calls
 
 
 class AddArgs(BaseModel):
@@ -141,6 +141,41 @@ def test_tool_node_executes_tool_calls_and_appends_results() -> None:
     assert update["messages"] == [
         {"role": "tool", "tool_call_id": "call_1", "name": "add", "content": "5"}
     ]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_tool_execution_records_handler_errors_and_cancellation(
+    monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    clock = [0.0]
+    executions: list[ToolExecution] = []
+
+    async def handler(state: State) -> str:
+        clock[0] += 1.5
+        if cancel:
+            raise asyncio.CancelledError
+        raise RuntimeError("handler failed")
+
+    async def record(execution: ToolExecution) -> None:
+        executions.append(execution)
+
+    monkeypatch.setattr("tiny_coder.tool_node.perf_counter", lambda: clock[0])
+    node = ToolNode([Tool.from_model(NoopArgs, handler, name="fail")], on_tool_finished=record)
+    state: State = {"messages": [_assistant_msg("fail", "{}")]}
+    if cancel:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(node(state))
+    else:
+        update = asyncio.run(node(state))
+        assert update["messages"][0]["content"] == "error: RuntimeError: handler failed"
+    assert len(executions) == 1
+    execution = executions[0]
+    assert execution.tool_call_id == "call_1"
+    assert execution.name == "fail"
+    assert execution.started_at and execution.completed_at
+    assert execution.duration_ms == 1500.0
+    assert execution.status == ("cancelled" if cancel else "error")
+    assert execution.error == (None if cancel else "error: RuntimeError: handler failed")
 
 
 def test_tool_node_returns_error_for_unknown_tool() -> None:

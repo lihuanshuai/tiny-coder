@@ -538,7 +538,7 @@ def test_submissions_and_rejected_context_are_recorded_and_checkpointed(
     )
     result = asyncio.run(agent.invoke(StructuredInput(prompt="Check the empty file")))
     with record_path.open(encoding="utf-8", newline="\n") as source:
-        records = [json.loads(line) for line in source]
+        records = [entry for line in source if (entry := json.loads(line))["event"] == "response"]
     assert json.loads(records[0]["output"]) == {"answer": "not read"}
     assert json.loads(records[2]["output"]) == {"answer": "empty"}
     read_message = records[2]["messages"][-2]

@@ -364,6 +364,8 @@ def test_responses_request_streaming_metrics_and_cleanup(monkeypatch: pytest.Mon
     assert result.llm['provider'] == 'openai-responses'
     assert result.llm['response_id'] == 'resp_1'
     assert result.llm['prompt_tokens_per_second'] == result.llm['eval_tokens_per_second'] == 2
+    assert result.llm['prompt_eval_duration'] == 1_500_000_000
+    assert result.llm['eval_duration'] == 2_000_000_000
     assert FakeResponses.kwargs['input'] == [{'role': 'user', 'content': 'hi'}]
     assert FakeResponses.kwargs['store'] is False
     assert FakeResponses.kwargs['stream'] is True
@@ -378,6 +380,46 @@ def test_responses_request_streaming_metrics_and_cleanup(monkeypatch: pytest.Mon
     assert FakeAsyncOpenAI.closed and FakeResponses.stream.closed
     assert FakeAsyncOpenAI.timeout == 37
     assert exchanges[0].response is result
+
+
+@pytest.mark.parametrize('kind', ['text', 'tool', 'reasoning', 'buffered'])
+def test_first_output_timings_only_use_observed_nonempty_deltas(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    packets = [_event('response.in_progress', response=_response()), _delta('')]
+    if kind == 'text':
+        packets.append(_delta('hello'))
+    elif kind == 'tool':
+        packets.append(
+            _event(
+                'response.function_call_arguments.delta',
+                delta='{"path":',
+                item_id='fc_1',
+                output_index=0,
+            )
+        )
+    elif kind == 'reasoning':
+        packets.append(
+            _event(
+                'response.reasoning_text.delta',
+                delta='check',
+                item_id='rs_1',
+                output_index=0,
+                content_index=0,
+            )
+        )
+    packets.append(_terminal())
+    _patch(monkeypatch, packets)
+    clock = iter([0.0, 2.0] if kind == 'buffered' else [0.0, 0.5, 2.0])
+    monkeypatch.setattr(llm_module.time, 'perf_counter', lambda: next(clock))
+    result = _run()
+    assert result.client_wall_time_ms == 2000.0
+    if kind == 'buffered':
+        assert 'time_to_first_output_ms' not in result.llm
+        assert 'stream_output_ms' not in result.llm
+    else:
+        assert result.llm['time_to_first_output_ms'] == 500.0
+        assert result.llm['stream_output_ms'] == 1500.0
 
 
 def test_text_format_and_native_named_tool_choice(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -494,7 +536,12 @@ def test_buffered_response_uses_whole_request_time(monkeypatch: pytest.MonkeyPat
 def test_server_timings_may_arrive_before_terminal(
     monkeypatch: pytest.MonkeyPatch, on_terminal: bool
 ) -> None:
-    values = {'prompt_per_second': 1200.0, 'predicted_per_second': 42.5}
+    values = {
+        'prompt_per_second': 1200.0,
+        'predicted_per_second': 42.5,
+        'prompt_ms': 150.0,
+        'predicted_ms': 200.0,
+    }
     _patch(
         monkeypatch,
         [
@@ -507,6 +554,8 @@ def test_server_timings_may_arrive_before_terminal(
     result = _run()
     assert result.llm['prompt_tokens_per_second'] == 1200
     assert result.llm['eval_tokens_per_second'] == 42.5
+    assert result.llm['prompt_ms'] == 150.0
+    assert result.llm['predicted_ms'] == 200.0
 
 
 @pytest.mark.parametrize('invalid', [float('inf'), float('nan'), -1.0, True])

@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import NoReturn, TypedDict, TypeVar
@@ -22,10 +22,12 @@ from tiny_coder.structured_agent import (
     AFTER_CALL,
     BEFORE_CALL,
     CALL_FAILED,
+    CALL_FINISHED,
     CALL_STARTED,
     CHUNK_RECEIVED,
     RESPONSE_RECEIVED,
     SUBMIT_RESULT,
+    TOOL_FINISHED,
     AgentCall,
     AgentExtension,
 )
@@ -380,7 +382,7 @@ class StructuredOutput(AgentExtension):
 
 @dataclass
 class CallRecording(AgentExtension):
-    """Record raw responses before parsing or acceptance, including rejected candidates."""
+    """Record raw responses and compact, linked lifecycle and tool timing events."""
 
     path: Path
     metadata: Mapping[str, object] | Callable[[AgentCall], Mapping[str, object]] = dataclass_field(
@@ -389,6 +391,8 @@ class CallRecording(AgentExtension):
 
     def register(self, events: EventBus) -> None:
         events.subscribe(RESPONSE_RECEIVED, self.record)
+        events.subscribe(CALL_FINISHED, self.record_finished)
+        events.subscribe(TOOL_FINISHED, self.record_tool)
 
     async def record(self, call: AgentCall) -> None:
         assert call.outcome is not None
@@ -410,9 +414,67 @@ class CallRecording(AgentExtension):
                 "eval_count": call.outcome.eval_count,
             },
             **_resolve(self.metadata, call),
+            "event": "response",
+            "call_id": call.call_id,
+            "attempt": call.attempt,
+            "started_at": call.outcome.started_at,
+            "completed_at": call.outcome.completed_at,
+            "client_wall_time_ms": call.outcome.client_wall_time_ms,
+            "llm": call.outcome.llm,
         }
         if call.steering:
             record["steering"] = list(call.steering)
+        self._append(record)
+
+    async def record_finished(self, call: AgentCall) -> None:
+        error_type: str | None = None
+        if call.cancelled:
+            status = "cancelled"
+            error_type = "CancelledError"
+        elif call.error is not None:
+            status = "retry" if call.retry else "failed"
+            error_type = type(call.error).__name__
+        elif call.output is not None:
+            status = "accepted"
+        elif call.outcome is not None and call.outcome.tool_calls:
+            status = "tools_requested"
+        else:
+            status = "completed"
+        self._append(
+            {
+                **_resolve(self.metadata, call),
+                "event": "failure" if call.error is not None or call.cancelled else "call_finished",
+                "call_id": call.call_id,
+                "turn": call.turn,
+                "attempt": call.attempt,
+                "model": call.llm_config.llm_model,
+                "status": status,
+                "error": str(call.error) if call.error is not None else None,
+                "error_type": error_type,
+                "retry": call.retry,
+                "timing": {
+                    "started_at": call.timing.started_at,
+                    "completed_at": call.timing.completed_at,
+                    "duration_ms": call.timing.duration_ms,
+                    "phases_ms": call.timing.phases_ms,
+                    "failed_phase": call.timing.failed_phase,
+                },
+            }
+        )
+
+    async def record_tool(self, call: AgentCall) -> None:
+        self._append(
+            {
+                **_resolve(self.metadata, call),
+                "event": "tool_finished",
+                "call_id": call.call_id,
+                "turn": call.turn,
+                "attempt": call.attempt,
+                "tool": asdict(call.tool_executions[-1]),
+            }
+        )
+
+    def _append(self, record: Mapping[str, object]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8", newline="\n") as file:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")

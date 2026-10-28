@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, TypeAlias
+from datetime import datetime, timezone
+from time import perf_counter
+from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ValidationError
 
@@ -141,11 +144,25 @@ def has_tool_calls(state: State) -> bool:
     return bool(_message_tool_calls(messages[-1]))
 
 
+@dataclass(frozen=True)
+class ToolExecution:
+    """Execution metadata kept out of the model's tool result."""
+
+    tool_call_id: str
+    name: str
+    started_at: str
+    completed_at: str
+    duration_ms: float
+    status: Literal["completed", "error", "cancelled"]
+    error: str | None = None
+
+
 @dataclass
 class ToolNode:
     """A graph node that executes the last assistant message's tool calls."""
 
     tools: list[Tool]
+    on_tool_finished: Callable[[ToolExecution], Awaitable[None]] | None = None
     _by_name: dict[str, Tool] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -167,13 +184,38 @@ class ToolNode:
         for call in calls:
             name = call["name"]
             tool = self._by_name.get(name)
-            if tool is None:
-                content = (
-                    f"error: unknown tool: {name or '<missing>'}; "
-                    f"choose exactly one of the registered tool names: {', '.join(self._by_name)}"
+            started_at = datetime.now(timezone.utc).isoformat()
+            started = perf_counter()
+            status: Literal["completed", "error", "cancelled"] = "completed"
+            error: str | None = None
+            try:
+                if tool is None:
+                    content = (
+                        f"error: unknown tool: {name or '<missing>'}; "
+                        f"choose exactly one of the registered tool names: {', '.join(self._by_name)}"
+                    )
+                else:
+                    content = await tool.invoke(state, call["arguments"])
+                if content.startswith("error:"):
+                    status, error = "error", content
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
+            except Exception as exception:
+                status, error = "error", f"{type(exception).__name__}: {exception}"
+                raise
+            finally:
+                execution = ToolExecution(
+                    tool_call_id=call["id"],
+                    name=name,
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    duration_ms=(perf_counter() - started) * 1000,
+                    status=status,
+                    error=error,
                 )
-            else:
-                content = await tool.invoke(state, call["arguments"])
+                if self.on_tool_finished is not None:
+                    await self.on_tool_finished(execution)
             results.append(
                 {
                     "role": "tool",
@@ -189,5 +231,6 @@ __all__ = [
     "Tool",
     "ToolHandler",
     "ToolNode",
+    "ToolExecution",
     "has_tool_calls",
 ]

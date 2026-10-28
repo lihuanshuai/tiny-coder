@@ -54,4 +54,9 @@ def test_jsonl_exchange_recorder_appends_records(tmp_path: Path) -> None:
         }
     ]
     assert payload["response"]["llm"] == {"provider": "openai-compatible"}
+    assert payload["response"]["started_at"] == exchange.response.started_at
+    assert payload["response"]["completed_at"] == exchange.response.completed_at
+    assert payload["response"]["client_wall_time_ms"] == 10.0
+    assert payload["response"]["prompt_eval_count"] == 3
+    assert payload["response"]["eval_count"] == 4
     assert "你好" in lines[0]
