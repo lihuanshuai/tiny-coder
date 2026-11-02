@@ -426,12 +426,25 @@ def test_text_format_and_native_named_tool_choice(monkeypatch: pytest.MonkeyPatc
     _patch(monkeypatch, [_terminal()])
     schema = schema_response_format(_SummaryOutput)
     tool = SimpleNamespace(name='add', description='Add', parameters={'type': 'object'})
-    _run(response_format=schema, tools=[tool], tool_choice={'type': 'function', 'name': 'add'})
+    other = SimpleNamespace(name='read_file', description='Read', parameters={'type': 'object'})
+    _run(
+        response_format=schema, tools=[other, tool], tool_choice={'type': 'function', 'name': 'add'}
+    )
     assert FakeResponses.kwargs['text'] == {'format': schema}
     assert FakeResponses.kwargs['tool_choice'] == {'type': 'function', 'name': 'add'}
     assert FakeResponses.kwargs['tools'] == [tool_openai_spec(tool)]
     assert FakeResponses.kwargs['tools'][0]['name'] == 'add'
     assert 'function' not in FakeResponses.kwargs['tools'][0]
+
+
+def test_named_tool_choice_rejects_unavailable_tool_before_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch(monkeypatch, [_terminal()])
+    tool = SimpleNamespace(name='read_file', description='Read', parameters={'type': 'object'})
+    with pytest.raises(ValueError, match='named tool_choice is not available: submit_result'):
+        _run(tools=[tool], tool_choice={'type': 'function', 'name': 'submit_result'})
+    assert FakeResponses.kwargs == {}
 
 
 def test_native_tool_calls_use_call_id_and_preserve_parallel_order(

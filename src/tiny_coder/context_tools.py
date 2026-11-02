@@ -42,10 +42,11 @@ class _ListFiles(BaseModel):
 
 
 class _ReadFile(BaseModel):
-    """Read missing snapshot lines; reuse earlier tool content for already-read ranges.
+    """Read the requested snapshot lines, including previously read lines.
 
     Line numbers are 1-based; end_line=null reads to the end. returned_ranges identifies
-    new content; read_ranges covers all lines already provided at this revision.
+    returned content; read_ranges covers all lines provided at this revision.
+    Prefer earlier tool content when sufficient; reread a small range to repair anchors.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -196,7 +197,9 @@ class ContextTools(AgentExtension):
                 ensure_ascii=False,
             )
 
-        async def read_file(state: State, path: str, start_line: int, end_line: int | None) -> str:
+        def read_snapshot(
+            state: State, path: str, start_line: int, end_line: int | None, *, unread_only: bool
+        ) -> str:
             file = self._file(call, path)
             canonical = _path(path)
             lines = text_lines(file.content)
@@ -219,7 +222,10 @@ class ContextTools(AgentExtension):
             if record is None or record["revision"] != revision:
                 record = _ReadRecord(revision=revision, ranges=[])
                 reads[canonical] = record
-            returned = _unread_ranges(record["ranges"], start_line, end)
+            if unread_only:
+                returned = _unread_ranges(record["ranges"], start_line, end)
+            else:
+                returned = [[start_line, end]] if lines else []
             record["ranges"] = _merge_ranges([*record["ranges"], *returned])
             return json.dumps(
                 {
@@ -242,6 +248,9 @@ class ContextTools(AgentExtension):
                 ensure_ascii=False,
             )
 
+        async def read_file(state: State, path: str, start_line: int, end_line: int | None) -> str:
+            return read_snapshot(state, path, start_line, end_line, unread_only=False)
+
         async def grep(state: State, pattern: str, path: str | None, max_matches: int) -> str:
             try:
                 regex = re.compile(pattern)
@@ -263,7 +272,8 @@ class ContextTools(AgentExtension):
 
         async def read_required(state: State) -> str:
             files = [
-                json.loads(await read_file(state, path, 1, None)) for path in self._missing(call)
+                json.loads(read_snapshot(state, path, 1, None, unread_only=True))
+                for path in self._missing(call)
             ]
             return json.dumps({"files": files}, ensure_ascii=False)
 

@@ -372,6 +372,20 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
                     call.messages.append(call.outcome.message)
                     await self.events.emit(RESPONSE_RECEIVED, call)
                 with call.timing.measure("validation"):
+                    if (
+                        call.response_model is not None
+                        and call.tool_choice == {"type": "function", "name": SUBMIT_RESULT}
+                        and call.submission is None
+                    ):
+                        requested = [
+                            tool.function.get("name", "") for tool in call.outcome.tool_calls
+                        ]
+                        raise ResponseValidationError(
+                            f"submit_result required; received {requested or 'assistant text'}",
+                            code="submission_required",
+                            context={"expected_tool": SUBMIT_RESULT, "received_tools": requested},
+                            suggestion="Call submit_result alone with the complete result object matching its schema. Context is already loaded; do not request other tools or emit assistant text. No tool from this rejected response was executed.",
+                        )
                     if call.submission is not None and len(call.outcome.tool_calls) != 1:
                         raise ResponseValidationError(
                             "submit_result must be the only tool call in its turn",

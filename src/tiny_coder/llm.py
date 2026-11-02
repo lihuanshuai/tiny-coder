@@ -383,6 +383,11 @@ async def stream_llm_chat(
             kwargs['max_output_tokens'] = llm_cfg.max_output_tokens
         if tools is not None:
             kwargs['tools'] = [tool_openai_spec(tool) for tool in tools]
+            if isinstance(tool_choice, dict):
+                selected = tool_choice['name']
+                kwargs['tools'] = [tool for tool in kwargs['tools'] if tool['name'] == selected]
+                if not kwargs['tools']:
+                    raise ValueError(f'named tool_choice is not available: {selected}')
         if tool_choice is not None:
             kwargs['tool_choice'] = tool_choice
         if response_format is not None:

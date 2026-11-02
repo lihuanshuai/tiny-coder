@@ -107,6 +107,61 @@ async def _echo(state: State, text: str) -> str:
 echo_tool = Tool.from_model(EchoArgs, _echo, name="echo")
 
 
+@pytest.mark.parametrize("recover", [True, False])
+def test_forced_submission_rejects_other_tools_without_executing_them(
+    monkeypatch: pytest.MonkeyPatch, recover: bool
+) -> None:
+    turns = 0
+    executed: list[str] = []
+
+    async def echo(state: State, text: str) -> str:
+        executed.append(text)
+        return text
+
+    async def prepare(call: AgentCall) -> None:
+        call.tool_choice = {"type": "function", "name": "submit_result"}
+
+    async def llm(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal turns
+        turns += 1
+        assert kwargs["tool_choice"] == {"type": "function", "name": "submit_result"}
+        if turns == 2:
+            feedback = json.loads(kwargs["messages"][-1]["content"])
+            error = feedback["validation_errors"][0]
+            assert error["type"] == "submission_required"
+            assert error["ctx"]["received_tools"] == ["echo"]
+            assert "Call submit_result alone" in feedback["response_suggestion"]
+            assert not executed
+            if recover:
+                return _outcome(tool_calls=(_submit_call("done", 2),))
+        return _outcome(
+            tool_calls=(
+                ToolCall(
+                    id=f"ignored-{turns}",
+                    type="function",
+                    function={"name": "echo", "arguments": json.dumps({"text": "do not execute"})},
+                ),
+            )
+        )
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=SampleStructured,
+        max_attempts=2,
+        tools=[Tool.from_model(EchoArgs, echo, name="echo")],
+    )
+    agent.events.subscribe(BEFORE_CALL, prepare)
+    if recover:
+        result = asyncio.run(agent.invoke(StructuredInput(prompt="Submit the result")))
+        assert result.output == SampleStructured(name="done", count=2)
+    else:
+        with pytest.raises(RuntimeError, match="submit_result required"):
+            asyncio.run(agent.invoke(StructuredInput(prompt="Submit the result")))
+    assert turns == 2
+    assert not executed
+
+
 def test_steering_reaches_reused_children_and_rendered_retries(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

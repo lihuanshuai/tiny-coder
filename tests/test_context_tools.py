@@ -645,7 +645,7 @@ def test_stringified_array_and_incomplete_json_receive_specific_feedback(
     assert result.model(Result) == Result(files=[{"path": "note.md"}])
 
 
-def test_context_reads_return_only_gaps_and_reuse_the_current_revision() -> None:
+def test_required_reads_return_gaps_but_explicit_reads_return_the_requested_source() -> None:
     file = ContextFile(
         path="note.md", content="first\nsecond\nthird\nfourth\nfifth\n", required=True
     )
@@ -677,10 +677,10 @@ def test_context_reads_return_only_gaps_and_reuse_the_current_revision() -> None
         assert fill["missing_ranges"] == []
         assert fill["already_read"] is False
         assert fill["revision"] == first["revision"]
-        repeated = await invoke("read_file", path="./note.md")
-        assert repeated["content"] == ""
+        repeated = await invoke("read_file", path="./note.md", start_line=2, end_line=4)
+        assert repeated["content"] == "2: second\n3: third\n4: fourth"
         assert repeated["already_read"] is True
-        assert repeated["returned_ranges"] == []
+        assert repeated["returned_ranges"] == [[2, 4]]
         assert repeated["read_ranges"] == [[1, 5]]
         assert repeated["revision"] == first["revision"]
         assert (await invoke("read_required"))["files"] == []
@@ -703,7 +703,7 @@ def test_context_reads_return_only_gaps_and_reuse_the_current_revision() -> None
 
 
 @pytest.mark.parametrize("content", ["", "one\ntwo\nthree\nfour\nfive"])
-def test_overlapping_context_reads_never_repeat_source_lines(content: str) -> None:
+def test_overlapping_explicit_reads_return_the_entire_requested_range(content: str) -> None:
     file = ContextFile(path="note.md", content=content, required=True)
     call = AgentCall(
         state={}, messages=[], llm_config=SampleLlmConfig(), system_prompt="", attempt=1
@@ -717,8 +717,8 @@ def test_overlapping_context_reads_never_repeat_source_lines(content: str) -> No
         assert first["already_read"] is False
         arguments.update(start_line=2 if content else 1, end_line=None)
         second = json.loads(await tool.invoke(call.state, json.dumps(arguments)))
-        assert second["content"] == ("4: four\n5: five" if content else "")
-        assert second["returned_ranges"] == ([[4, 5]] if content else [])
+        assert second["content"] == ("2: two\n3: three\n4: four\n5: five" if content else "")
+        assert second["returned_ranges"] == ([[2, 5]] if content else [])
         assert second["missing_ranges"] == []
         assert len(call.state["context_reads"]["note.md"]["ranges"]) == (1 if content else 0)
 
