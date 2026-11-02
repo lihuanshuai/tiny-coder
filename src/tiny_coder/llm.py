@@ -27,6 +27,23 @@ _ResponseStream: TypeAlias = AsyncStream[ResponseStreamEvent]
 ToolChoice: TypeAlias = Literal['none', 'auto', 'required'] | ToolChoiceFunctionParam
 
 
+class IncompleteResponseError(JsonProtocolError):
+    """A rejected terminal response; partial function arguments must never execute."""
+
+    def __init__(
+        self,
+        *,
+        status: str,
+        reason: str,
+        max_output_tokens: int | None,
+        tool_names: tuple[str, ...],
+    ) -> None:
+        self.reason = reason
+        self.max_output_tokens = max_output_tokens
+        self.tool_names = tool_names
+        super().__init__(f'Responses {status}: {reason}; partial text and tool calls rejected')
+
+
 class LlmConfig(BaseModel):
     """Configuration required by a Responses-compatible server."""
 
@@ -38,9 +55,8 @@ class LlmConfig(BaseModel):
 
     base_url: str = Field(min_length=1)
     llm_model: str = Field(min_length=1)
-    num_ctx: int = Field(gt=0)
+    num_ctx: int = Field(gt=0, description="Local conversation budget, not a request parameter.")
     temperature: float = Field(ge=0.0)
-    repeat_penalty: float = Field(ge=0.0)
     think: bool
     timeout: float = Field(gt=0.0)
     max_output_tokens: int | None = Field(default=None, gt=0)
@@ -221,13 +237,6 @@ def openai_api_key() -> str:
     return os.environ.get("OPENAI_API_KEY") or "not-needed"
 
 
-def openai_extra_body(llm_cfg: LlmConfig) -> dict[str, Any]:
-    return {
-        "num_ctx": llm_cfg.num_ctx,
-        "repeat_penalty": llm_cfg.repeat_penalty,
-    }
-
-
 def _inline_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Expose nested argument fields to tool renderers that do not follow local refs.
 
@@ -376,7 +385,6 @@ async def stream_llm_chat(
             'temperature': llm_cfg.temperature,
             'stream': True,
             'store': False,
-            'extra_body': openai_extra_body(llm_cfg),
             'reasoning': {'effort': 'medium' if llm_cfg.think else 'none'},
         }
         if llm_cfg.max_output_tokens is not None:
@@ -469,9 +477,16 @@ async def stream_llm_chat(
             'Responses stream ended without a terminal response; partial output rejected'
         )
     if final.status != 'completed':
-        reason = final.incomplete_details.reason if final.incomplete_details else 'unknown'
-        raise JsonProtocolError(
-            f'Responses {final.status}: {reason}; partial text and tool calls rejected'
+        reason = (
+            final.incomplete_details.reason if final.incomplete_details else None
+        ) or 'unknown'
+        raise IncompleteResponseError(
+            status=final.status or 'unknown',
+            reason=reason,
+            max_output_tokens=llm_cfg.max_output_tokens,
+            tool_names=tuple(item.name for item in final.output if item.type == 'function_call')
+            or tuple(tool_names.values())
+            or ((tool_choice['name'],) if isinstance(tool_choice, dict) else ()),
         )
     tool_calls = tuple(
         ToolCall(
@@ -533,6 +548,7 @@ async def stream_llm_chat(
 
 
 __all__ = [
+    'IncompleteResponseError',
     'LlmChatOutcome',
     'LlmConfig',
     'LlmExchange',
@@ -541,7 +557,6 @@ __all__ = [
     'ToolChoice',
     'nonnegative_int_from_llm_field',
     'openai_api_key',
-    'openai_extra_body',
     'parse_structured',
     'responses_input',
     'schema_response_format',

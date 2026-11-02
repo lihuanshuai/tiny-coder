@@ -14,7 +14,7 @@ from tiny_coder.agent_extensions import CallRecording, ResponseValidationError, 
 from tiny_coder.checkpoint import JsonCheckpointer
 from tiny_coder.context_tools import ContextFile, ContextTools
 from tiny_coder.graph import GraphError
-from tiny_coder.llm import LlmChatOutcome, ToolCall
+from tiny_coder.llm import LlmChatOutcome, ToolCall, tool_openai_spec
 from tiny_coder.structured_agent import (
     BEFORE_CALL,
     AgentCall,
@@ -33,6 +33,126 @@ def tool_call(name: str, **arguments: Any) -> ToolCall:
         type="function",
         function={"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)},
     )
+
+
+@pytest.mark.parametrize("no_change_tool", ["list_files", "read_required"])
+@pytest.mark.parametrize("obey", [True, False])
+def test_unchanged_context_tools_require_submission_and_bound_ignored_choices(
+    monkeypatch: pytest.MonkeyPatch, no_change_tool: str, obey: bool
+) -> None:
+    turns = 0
+    listing_size = 0
+
+    async def llm(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal turns, listing_size
+        turns += 1
+        if turns == 1:
+            return _outcome(tool_calls=(tool_call("read_required"),))
+        if no_change_tool == "list_files" and turns in (2, 3):
+            if turns == 3:
+                listing_size = len(kwargs["messages"][-1]["content"])
+                assert len(json.loads(kwargs["messages"][-1]["content"])["files"]) == 89
+            return _outcome(tool_calls=(tool_call("list_files"),))
+        if no_change_tool == "read_required" and turns == 2:
+            return _outcome(tool_calls=(tool_call("read_required"),))
+        assert kwargs["tool_choice"] == {"type": "function", "name": "submit_result"}
+        if turns == (4 if no_change_tool == "list_files" else 3):
+            unchanged = json.loads(kwargs["messages"][-1]["content"])
+            assert unchanged["unchanged"] is True
+            assert unchanged["files"] == []
+            if listing_size:
+                assert len(kwargs["messages"][-1]["content"]) < listing_size / 10
+        return _outcome(
+            tool_calls=(
+                tool_call("submit_result", answer="done") if obey else tool_call("list_files"),
+            )
+        )
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=Answer,
+        max_attempts=2,
+        extensions=(
+            ContextTools(
+                [
+                    ContextFile(path=f"note-{n}.md", content="Source", required=n == 0)
+                    for n in range(89)
+                ]
+            ),
+        ),
+    )
+    if obey:
+        assert asyncio.run(agent.invoke(StructuredInput(prompt="Read then submit"))).model(
+            Answer
+        ) == Answer(answer="done")
+    else:
+        with pytest.raises(RuntimeError, match="submit_result required"):
+            asyncio.run(agent.invoke(StructuredInput(prompt="Read then submit")))
+    assert turns == (4 if no_change_tool == "list_files" else 3) + (not obey)
+
+
+def test_catalog_refreshes_on_reads_and_source_changes_before_forcing_submission() -> None:
+    files = [
+        ContextFile(path="required.md", content="First", required=True),
+        ContextFile(path="optional.md", content="Second"),
+    ]
+    context = ContextTools(files)
+    call = AgentCall(
+        state={}, messages=[], llm_config=SampleLlmConfig(), system_prompt="", attempt=1
+    )
+    asyncio.run(context.prepare(call))
+
+    async def invoke(name: str, **arguments: Any) -> dict[str, Any]:
+        tool = next(tool for tool in call.tools if tool.name == name)
+        return json.loads(await tool.invoke(call.state, json.dumps(arguments)))
+
+    async def run() -> None:
+        first = await invoke("list_files")
+        assert len(first["files"]) == 2
+        assert (await invoke("list_files"))["unchanged"] is True
+        await invoke("read_required")
+        assert (await invoke("list_files"))["files"][0]["read"] is True
+        unchanged = await invoke("list_files")
+        assert unchanged["unchanged"] is True
+        call.messages = [{"role": "tool", "name": "list_files", "content": json.dumps(unchanged)}]
+        files[1].content = "Changed optional source"
+        call.tools = []
+        call.tool_choice = None
+        await context.prepare(call)
+        assert call.tool_choice is None
+        refreshed = await invoke("list_files")
+        assert len(refreshed["files"]) == 2
+        assert refreshed["files"][1]["revision"] != first["files"][1]["revision"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("path", ["", "first.md", "./first.md"])
+def test_grep_uses_a_strict_string_path_and_empty_searches_all_snapshots(path: str) -> None:
+    call = AgentCall(
+        state={}, messages=[], llm_config=SampleLlmConfig(), system_prompt="", attempt=1
+    )
+    context = ContextTools(
+        [
+            ContextFile(path="first.md", content="TODO: First\n", required=True),
+            ContextFile(path="second.md", content="TODO: Second\n", required=True),
+        ]
+    )
+    asyncio.run(context.prepare(call))
+    tool = next(tool for tool in call.tools if tool.name == "grep")
+    spec = tool_openai_spec(tool)
+    assert spec["strict"] is True
+    assert spec["parameters"]["properties"]["path"]["type"] == "string"
+    assert "anyOf" not in spec["parameters"]["properties"]["path"]
+    assert "path" in spec["parameters"]["required"]
+    result = json.loads(
+        asyncio.run(tool.invoke(call.state, json.dumps({"pattern": "TODO", "path": path})))
+    )
+    assert [match["path"] for match in result["matches"]] == (
+        ["first.md", "second.md"] if path == "" else ["first.md"]
+    )
+    assert "context_reads" not in call.state
 
 
 def test_structured_context_loop_requires_tool_protocol_and_rejects_plain_json(

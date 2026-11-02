@@ -17,6 +17,7 @@ from tiny_coder import llm as llm_module
 from tiny_coder.agent_extensions import StructuredOutput
 from tiny_coder.json_utils import JsonProtocolError
 from tiny_coder.llm import (
+    IncompleteResponseError,
     LlmChatOutcome,
     LlmConfig,
     LlmExchange,
@@ -109,7 +110,6 @@ class SampleOpenAIConfig(LlmConfig):
     llm_model: str = "sample-model"
     num_ctx: int = 4096
     temperature: float = 0.5
-    repeat_penalty: float = 1.1
     think: bool = False
     timeout: float = 37.0
     max_output_tokens: int | None = 8192
@@ -240,7 +240,6 @@ def test_llm_config_declares_required_fields() -> None:
         "llm_model",
         "num_ctx",
         "temperature",
-        "repeat_penalty",
         "think",
         "timeout",
         "max_output_tokens",
@@ -371,7 +370,7 @@ def test_responses_request_streaming_metrics_and_cleanup(monkeypatch: pytest.Mon
     assert FakeResponses.kwargs['stream'] is True
     assert FakeResponses.kwargs['max_output_tokens'] == 8192
     assert FakeResponses.kwargs['reasoning'] == {'effort': 'none'}
-    assert 'think' not in FakeResponses.kwargs['extra_body']
+    assert not {'extra_body', 'num_ctx', 'repeat_penalty', 'think'} & FakeResponses.kwargs.keys()
     assert result.llm['reasoning_tokens'] == 0
     assert (
         not {'messages', 'max_tokens', 'stream_options', 'response_format'}
@@ -721,8 +720,10 @@ def test_caller_owned_client_is_never_closed(monkeypatch: pytest.MonkeyPatch, fa
     assert FakeResponses.stream.closed
 
 
+@pytest.mark.parametrize('named_only', [False, True])
 def test_truncated_function_call_is_rejected_as_retryable_protocol_error(
     monkeypatch: pytest.MonkeyPatch,
+    named_only: bool,
 ) -> None:
     function = {
         'type': 'function_call',
@@ -738,13 +739,21 @@ def test_truncated_function_call_is_rejected_as_retryable_protocol_error(
                 _response(
                     status='incomplete',
                     incomplete_details={'reason': 'max_output_tokens'},
-                    output=[function],
+                    output=[] if named_only else [function],
                 )
             )
         ],
     )
-    with pytest.raises(JsonProtocolError, match='max_output_tokens.*tool calls rejected'):
-        _run()
+    with pytest.raises(
+        IncompleteResponseError, match='max_output_tokens.*tool calls rejected'
+    ) as error:
+        _run(
+            tools=[SimpleNamespace(name='replace_lines', parameters={'type': 'object'})],
+            tool_choice={'type': 'function', 'name': 'replace_lines'} if named_only else 'required',
+        )
+    assert error.value.reason == 'max_output_tokens'
+    assert error.value.max_output_tokens == 8192
+    assert error.value.tool_names == ('replace_lines',)
 
 
 def test_missing_usage_remains_zero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -774,7 +783,7 @@ def test_thinking_and_output_limit_options(monkeypatch: pytest.MonkeyPatch) -> N
         )
     )
     assert FakeResponses.kwargs['reasoning'] == {'effort': 'medium'}
-    assert 'think' not in FakeResponses.kwargs['extra_body']
+    assert 'extra_body' not in FakeResponses.kwargs
     assert 'max_output_tokens' not in FakeResponses.kwargs
 
 

@@ -48,7 +48,6 @@ class LocalLlmConfig(LlmConfig):
     llm_model: str = "local-model"
     num_ctx: int = 8192
     temperature: float = 0.1
-    repeat_penalty: float = 1.1
     think: bool = False
     timeout: float = 600.0
     max_output_tokens: int = 8192

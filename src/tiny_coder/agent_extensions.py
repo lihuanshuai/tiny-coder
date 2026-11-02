@@ -17,7 +17,7 @@ from pydantic_core import ErrorDetails
 from tiny_coder.apply_patch import resolve_agent_file_path, resolve_agent_root
 from tiny_coder.eventbus import EventBus
 from tiny_coder.json_utils import JsonStringFieldStreamer, load_json_object
-from tiny_coder.llm import LlmConfig, parse_structured
+from tiny_coder.llm import IncompleteResponseError, LlmConfig, parse_structured
 from tiny_coder.structured_agent import (
     AFTER_CALL,
     BEFORE_CALL,
@@ -68,6 +68,21 @@ class ResponseValidationError(ValueError):
 def _response_suggestion(error: Exception) -> str:
     if isinstance(error, ResponseValidationError):
         return error.suggestion
+    if isinstance(error, IncompleteResponseError):
+        if error.reason == "max_output_tokens":
+            return (
+                f"Output reached max_output_tokens={error.max_output_tokens}. "
+                "Partial output was discarded; no tool from it was executed. "
+                "Keep already queued edits and loaded context. Retry the unfinished operation "
+                "with one small complete tool call; split independent edits across calls, "
+                "copy only the source fragment being changed, and keep the final summary brief. "
+                "Do not repeat unchanged context reads or file listings."
+            )
+        return (
+            f"The provider stopped the response with reason {error.reason!r}. "
+            "Partial output was discarded; do not execute or continue its incomplete arguments. "
+            "Resubmit a complete result matching the requested tool schema."
+        )
     if isinstance(error, OSError):
         return "检查失败的文件路径、访问权限和输入文件，解决读写问题后重试。"
     return (
@@ -539,7 +554,9 @@ class RetryPolicy(AgentExtension):
         ) from error
 
     def _add_feedback(self, call: AgentCall) -> None:
-        if call.outcome is None and not isinstance(call.error, ResponseValidationError):
+        if call.outcome is None and not isinstance(
+            call.error, (ResponseValidationError, IncompleteResponseError)
+        ):
             return
         assert call.error is not None
         cause = call.error.__cause__
@@ -567,6 +584,18 @@ class RetryPolicy(AgentExtension):
                 errors.append(detail)
         elif isinstance(call.error, ResponseValidationError):
             errors.append(call.error.feedback())
+        elif isinstance(call.error, IncompleteResponseError):
+            errors.append(
+                {
+                    "type": "output_incomplete",
+                    "msg": str(call.error),
+                    "ctx": {
+                        "reason": call.error.reason,
+                        "max_output_tokens": call.error.max_output_tokens,
+                        "tool_names": list(call.error.tool_names),
+                    },
+                }
+            )
         else:
             errors.append({"msg": str(call.error)})
         content = json.dumps(

@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from tiny_coder.agent_extensions import CallRecording, JinjaPrompt, RetryPolicy, StructuredOutput
 from tiny_coder.graph import GraphError
-from tiny_coder.llm import LlmChatOutcome, LlmConfig, LlmExchange, ToolCall
+from tiny_coder.llm import IncompleteResponseError, LlmChatOutcome, LlmConfig, LlmExchange, ToolCall
 from tiny_coder.state import State
 from tiny_coder.steering import Steering
 from tiny_coder.structured_agent import (
@@ -80,7 +80,6 @@ class SampleLlmConfig(LlmConfig):
     llm_model: str = "test"
     num_ctx: int = 4096
     temperature: float = 0.0
-    repeat_penalty: float = 1.0
     think: bool = False
     timeout: float = 30.0
     max_output_tokens: int = 100
@@ -105,6 +104,52 @@ async def _echo(state: State, text: str) -> str:
 
 
 echo_tool = Tool.from_model(EchoArgs, _echo, name="echo")
+
+
+@pytest.mark.parametrize("recover", [True, False])
+def test_incomplete_tool_output_gets_specific_feedback_without_losing_context(
+    monkeypatch: pytest.MonkeyPatch, recover: bool
+) -> None:
+    turns = 0
+
+    async def llm(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal turns
+        turns += 1
+        if turns == 2:
+            feedback = json.loads(kwargs["messages"][-1]["content"])
+            error = feedback["validation_errors"][0]
+            assert error["type"] == "output_incomplete"
+            assert error["ctx"]["reason"] == "max_output_tokens"
+            assert error["ctx"]["max_output_tokens"] == 100
+            assert error["ctx"]["tool_names"] == ["submit_result"]
+            assert "one small complete tool call" in feedback["response_suggestion"]
+            assert "Do not repeat unchanged context reads" in feedback["response_suggestion"]
+            assert kwargs["messages"][1]["content"] == "Use the loaded source."
+            if recover:
+                return _outcome(tool_calls=(_submit_call("done", 2),))
+        raise IncompleteResponseError(
+            status="incomplete",
+            reason="max_output_tokens",
+            max_output_tokens=100,
+            tool_names=("submit_result",),
+        )
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=SampleStructured,
+        max_attempts=2,
+        tools=[echo_tool],
+    )
+    request = StructuredInput(prompt="Use the loaded source.", state={"queued": ["keep"]})
+    if recover:
+        result = asyncio.run(agent.invoke(request))
+        assert result.model(SampleStructured) == SampleStructured(name="done", count=2)
+        assert result.state["queued"] == ["keep"]
+    else:
+        with pytest.raises(RuntimeError, match="one small complete tool call"):
+            asyncio.run(agent.invoke(request))
+    assert turns == 2
 
 
 @pytest.mark.parametrize("recover", [True, False])

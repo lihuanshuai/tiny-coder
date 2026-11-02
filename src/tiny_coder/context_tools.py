@@ -36,7 +36,10 @@ class ContextFile(BaseModel):
 
 
 class _ListFiles(BaseModel):
-    """List context paths, revisions, read/missing ranges and access rules; no file contents."""
+    """List context paths, revisions, read/missing ranges and access rules; no file contents.
+
+    An unchanged catalog returns only its revision; reuse the earlier listing.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -71,7 +74,9 @@ class _Grep(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     pattern: str = Field(min_length=1)
-    path: str | None = None
+    path: str = Field(
+        default="", description="Context path from list_files; empty searches all snapshots."
+    )
     max_matches: int = Field(default=100, ge=1, le=500, strict=True)
 
 
@@ -167,8 +172,8 @@ class ContextTools(AgentExtension):
         ):
             call.tool_choice = {"type": "function", "name": SUBMIT_RESULT}
 
-        async def list_files(state: State) -> str:
-            reads: dict[str, _ReadRecord] = state.get("context_reads", {})
+        def listing() -> str:
+            reads: dict[str, _ReadRecord] = call.state.get("context_reads", {})
             files = []
             for path, file in self._files(call).items():
                 revision = text_revision(file.content)
@@ -196,6 +201,14 @@ class ContextTools(AgentExtension):
                 {"files": files},
                 ensure_ascii=False,
             )
+
+        async def list_files(state: State) -> str:
+            content = listing()
+            revision = text_revision(content)
+            if state.get("context_listing_revision") == revision:
+                return json.dumps({"files": [], "unchanged": True, "revision": revision})
+            state["context_listing_revision"] = revision
+            return content
 
         def read_snapshot(
             state: State, path: str, start_line: int, end_line: int | None, *, unread_only: bool
@@ -251,12 +264,12 @@ class ContextTools(AgentExtension):
         async def read_file(state: State, path: str, start_line: int, end_line: int | None) -> str:
             return read_snapshot(state, path, start_line, end_line, unread_only=False)
 
-        async def grep(state: State, pattern: str, path: str | None, max_matches: int) -> str:
+        async def grep(state: State, pattern: str, path: str, max_matches: int) -> str:
             try:
                 regex = re.compile(pattern)
             except re.error as error:
                 raise ValueError(f"invalid grep regex: {error}") from error
-            files = self._files(call) if path is None else {_path(path): self._file(call, path)}
+            files = self._files(call) if path == "" else {_path(path): self._file(call, path)}
             matches: list[dict[str, str | int]] = []
             for name, file in files.items():
                 revision = text_revision(file.content)
@@ -275,7 +288,24 @@ class ContextTools(AgentExtension):
                 json.loads(read_snapshot(state, path, 1, None, unread_only=True))
                 for path in self._missing(call)
             ]
-            return json.dumps({"files": files}, ensure_ascii=False)
+            return json.dumps({"files": files, "unchanged": not files}, ensure_ascii=False)
+
+        if call.submission_enabled and call.response_model is not None and call.messages:
+            last = call.messages[-1]
+            if last.get("role") == "tool" and last.get("name") in {"list_files", "read_required"}:
+                try:
+                    reply = json.loads(last["content"])
+                except (ValueError, TypeError):
+                    reply = {}
+                if (
+                    isinstance(reply, dict)
+                    and reply.get("unchanged") is True
+                    and (
+                        last["name"] == "read_required"
+                        or reply.get("revision") == text_revision(listing())
+                    )
+                ):
+                    call.tool_choice = {"type": "function", "name": SUBMIT_RESULT}
 
         call.tools.extend(
             [
