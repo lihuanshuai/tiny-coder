@@ -497,7 +497,7 @@ class CallRecording(AgentExtension):
 
 @dataclass
 class RetryPolicy(AgentExtension):
-    """Bound retries and select an alternate config after validation failures."""
+    """Bound failed model/tool rounds and retain only the latest failed tool exchange."""
 
     max_attempts: int | Callable[[AgentCall], int]
     validation_llm_config: LlmConfig | None | Callable[[AgentCall], LlmConfig | None] = None
@@ -511,11 +511,57 @@ class RetryPolicy(AgentExtension):
         events.subscribe(CALL_FAILED, self.retry)
 
     async def configure(self, call: AgentCall) -> None:
-        self._attempt_limit(call)
-        if call.feedback:
+        limit = self._attempt_limit(call)
+        tool_errors = []
+        for message in reversed(call.messages):
+            if message.get("role") != "tool":
+                break
+            content = str(message.get("content", ""))
+            if content.startswith("error:"):
+                tool_errors.append(content)
+        if call.attempt > limit:
+            raise RuntimeError(
+                f"tool execution failed after {limit} attempt(s): " + "\n".join(tool_errors)
+            )
+        self._compact_failed_tools(call)
+        if call.feedback or tool_errors:
             config = _resolve(self.validation_llm_config, call)
             if config is not None:
                 call.llm_config = config
+
+    @staticmethod
+    def _compact_failed_tools(call: AgentCall) -> None:
+        # Prune only completed failed calls, together with their replies. Source
+        # reads, successful edits, and the newest actionable failure stay intact.
+        # Raw calls/results have already been recorded before this preparation.
+        failed = {
+            message["tool_call_id"]
+            for message in call.messages
+            if message.get("role") == "tool"
+            and str(message.get("content", "")).startswith("error:")
+        }
+        groups = [
+            {tool["id"] for tool in message.get("tool_calls", [])} & failed
+            for message in call.messages
+            if message.get("role") == "assistant"
+        ]
+        groups = [group for group in groups if group]
+        if len(groups) < 2:
+            return
+        obsolete = set().union(*groups[:-1]) - groups[-1]
+        messages = []
+        for message in call.messages:
+            if message.get("role") == "tool" and message.get("tool_call_id") in obsolete:
+                continue
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                tools = [tool for tool in message["tool_calls"] if tool["id"] not in obsolete]
+                if not tools and not message.get("content"):
+                    continue
+                message = {**message, "tool_calls": tools}
+                if not tools:
+                    del message["tool_calls"]
+            messages.append(message)
+        call.messages = messages
 
     def _attempt_limit(self, call: AgentCall) -> int:
         limit = _resolve(self.max_attempts, call)

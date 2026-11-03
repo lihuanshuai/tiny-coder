@@ -148,7 +148,7 @@ def test_recording_links_model_validation_retry_and_each_tool_without_changing_m
         llm_config=SampleLlmConfig(),
         response_model=Output,
         tools=[Tool.from_model(Read, read, name="read")],
-        extensions=(RetryPolicy(2), CallRecording(path), StructuredOutput(accept)),
+        extensions=(RetryPolicy(3), CallRecording(path), StructuredOutput(accept)),
     )
     result = asyncio.run(agent.invoke(StructuredInput(prompt="Read then submit.")))
     assert result.output == Output(summary="done")
@@ -160,7 +160,7 @@ def test_recording_links_model_validation_retry_and_each_tool_without_changing_m
     assert [entry["status"] for entry in finished] == ["tools_requested", "retry", "accepted"]
     assert [entry["call_id"] for entry in responses] == [entry["call_id"] for entry in finished]
     assert len({entry["call_id"] for entry in responses}) == 3
-    assert [entry["attempt"] for entry in responses] == [1, 1, 2]
+    assert [entry["attempt"] for entry in responses] == [1, 2, 3]
     for entry in responses:
         assert entry["started_at"] and entry["completed_at"]
         assert entry["client_wall_time_ms"] == 10.0
@@ -183,6 +183,111 @@ def test_recording_links_model_validation_retry_and_each_tool_without_changing_m
     ]
     assert all(entry["call_id"] == responses[0]["call_id"] for entry in tools)
     assert "source text" not in json.dumps(tools)
+
+
+@pytest.mark.parametrize("limit", [1, 3])
+def test_failed_tools_consume_retry_budget_before_another_model_request(
+    monkeypatch: pytest.MonkeyPatch, limit: int
+) -> None:
+    calls = 0
+    attempts = []
+
+    async def fail(state: Any, text: str) -> str:
+        return "error: wrong source; read the original fragment before editing"
+
+    async def llm(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal calls
+        calls += 1
+        return _outcome(tool_calls=(replace(_echo_call("bad anchor"), id=f"fail-{calls}"),))
+
+    async def prepared(call: AgentCall) -> None:
+        attempts.append(call.attempt)
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        tools=[replace(echo_tool, handler=fail)],
+        max_attempts=limit,
+    )
+    agent.events.subscribe(BEFORE_CALL, prepared)
+    with pytest.raises(RuntimeError, match=f"tool execution failed after {limit} attempt") as error:
+        asyncio.run(agent.invoke(StructuredInput(prompt="Edit the source.")))
+    assert "read the original fragment" in str(error.value)
+    assert calls == limit
+    assert attempts == list(range(1, limit + 1))
+
+
+def test_failed_history_compaction_preserves_sources_successes_and_tool_pairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    attempts = []
+
+    async def edit(state: Any, text: str) -> str:
+        if text.startswith("bad"):
+            return "error: copy source exactly"
+        state["reads"] = state.get("reads", 0) + 1
+        return "original source snapshot"
+
+    async def prepared(call: AgentCall) -> None:
+        attempts.append(call.attempt)
+
+    async def llm(**kwargs: Any) -> LlmChatOutcome:
+        nonlocal calls
+        calls += 1
+        messages = kwargs["messages"]
+        tool_calls = {tool["id"] for message in messages for tool in message.get("tool_calls", [])}
+        results = {message["tool_call_id"] for message in messages if message["role"] == "tool"}
+        assert tool_calls == results  # No orphan tool requests or replies.
+        assert messages[1]["content"] == "Edit the source."
+        if calls >= 3:
+            assert "bad-1" not in tool_calls
+            assert "read-1" in tool_calls  # A successful call from a mixed batch survives.
+        if calls == 5:
+            assert "bad-2" not in tool_calls
+            assert {"bad-3", "read-1", "read-2"} == tool_calls
+            assert sum(m.get("content") == "original source snapshot" for m in messages) == 2
+        if calls == 1:
+            requested = (
+                replace(_echo_call("read"), id="read-1"),
+                replace(_echo_call("bad" * 2000), id="bad-1"),
+            )
+        elif calls == 2:
+            requested = (replace(_echo_call("bad" * 2000), id="bad-2"),)
+        elif calls == 3:
+            requested = (replace(_echo_call("read"), id="read-2"),)
+        elif calls == 4:
+            requested = (replace(_echo_call("bad" * 2000), id="bad-3"),)
+        else:
+            assert calls == 5
+            requested = (
+                ToolCall(
+                    id="submit",
+                    type="function",
+                    function={"name": "submit_result", "arguments": '{"summary":"done"}'},
+                ),
+            )
+        return _outcome(tool_calls=requested)
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+    path = tmp_path / "history.jsonl"
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        response_model=Output,
+        tools=[replace(echo_tool, handler=edit)],
+        max_attempts=4,
+        extensions=(CallRecording(path),),
+    )
+    agent.events.subscribe(BEFORE_CALL, prepared)
+    result = asyncio.run(agent.invoke(StructuredInput(prompt="Edit the source.")))
+    assert result.output == Output(summary="done")
+    assert result.state["reads"] == 2
+    assert attempts == [1, 2, 3, 3, 4]
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    raw = [record for record in records if record["event"] == "response"]
+    assert json.loads(raw[0]["messages"][-1]["tool_calls"][1]["function"]["arguments"]) == {
+        "text": "bad" * 2000
+    }
 
 
 @pytest.mark.parametrize("failure", ["transport", "validation", "cancel"])

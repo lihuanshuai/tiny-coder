@@ -350,6 +350,7 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
             and invocation.call.outcome is not None
             and invocation.call.outcome.tool_calls
             and not invocation.call.retry
+            and not any(tool.status == "error" for tool in invocation.call.tool_executions)
         ):
             call.attempt = invocation.call.attempt
         invocation.call = call
@@ -543,8 +544,9 @@ def create_structured_agent(
     and validate its arguments locally; exploration is not constrained to JSON output.
     Without tools, request JSON schema output directly. ``accept`` may reject a result
     before it is returned. ``max_attempts`` enables failure feedback and retries;
-    successful tool rounds do not consume that budget. ``max_steps`` bounds all LLM
-    and tool-node executions, including loops without a final submission.
+    failed tool rounds also consume this budget; successful tool rounds do not.
+    ``max_steps`` bounds all LLM and tool-node executions, including loops without
+    a final submission.
     """
     if max_steps < 1:
         raise ValueError("max_steps must be at least 1")

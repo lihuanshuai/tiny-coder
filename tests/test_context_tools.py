@@ -420,7 +420,7 @@ def test_context_read_errors_are_tool_results_and_can_be_corrected(
     agent = create_structured_agent(
         llm_config=SampleLlmConfig(),
         response_model=Answer,
-        max_attempts=1,
+        max_attempts=2,
         extensions=(
             ContextTools([ContextFile(path="note.md", content="first\nsecond", required=True)]),
         ),
