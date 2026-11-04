@@ -126,6 +126,14 @@ def _read_complete(record: _ReadRecord | None, revision: str, total_lines: int) 
     )
 
 
+def acknowledge_context_write(state: State, path: str, before: str, after: str) -> None:
+    """Keep a fully read snapshot current after an acknowledged tool edit."""
+    reads: dict[str, _ReadRecord] = state.get("context_reads", {})
+    if _read_complete(reads.get(path), text_revision(before), len(text_lines(before))):
+        total = len(text_lines(after))
+        reads[path] = {"revision": text_revision(after), "ranges": [[1, total]] if total else []}
+
+
 @dataclass
 class ContextTools(AgentExtension):
     """Load allowlisted, invocation-local snapshots through actual tool messages.

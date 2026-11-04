@@ -104,6 +104,8 @@ class AgentCall:
     tool_chunk: ToolCallDelta | None = None
     steering: tuple[str, ...] = ()
     resources: ExitStack = field(default_factory=ExitStack, repr=False)
+    invocation_resources: ExitStack = field(default_factory=ExitStack, repr=False)
+    invocation_data: dict[str, object] = field(default_factory=dict, repr=False)
     tools: list[Tool] = field(default_factory=list)
     turn: int = 1
     prepared_extensions: set[int] = field(default_factory=set, repr=False)
@@ -209,6 +211,8 @@ class _Invocation:
     call: AgentCall | None = None
     tools: Sequence[Tool] = ()
     prepared_extensions: set[int] = field(default_factory=set)
+    resources: ExitStack = field(default_factory=ExitStack)
+    data: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -289,7 +293,10 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
                 output=call.output if call is not None else None,
             )
         finally:
-            self._invocation.reset(token)
+            try:
+                invocation.resources.close()
+            finally:
+                self._invocation.reset(token)
 
     def _initial_state(self, input: StructuredInput, model: type[BaseModel] | None) -> State:
         history = deepcopy([dict(message) for message in input.messages])
@@ -344,6 +351,8 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
             tools=list(invocation.tools),
             turn=invocation.call.turn + 1 if invocation.call is not None else 1,
             prepared_extensions=invocation.prepared_extensions,
+            invocation_resources=invocation.resources,
+            invocation_data=invocation.data,
         )
         if (
             invocation.call is not None
