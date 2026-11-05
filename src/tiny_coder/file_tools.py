@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from functools import cached_property
 from pathlib import Path
+from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from tiny_coder.apply_patch import ApplyPatch, apply_patches, resolve_agent_file_path
 from tiny_coder.line_edit import (
@@ -17,8 +19,7 @@ from tiny_coder.line_edit import (
     text_lines,
     text_revision,
 )
-from tiny_coder.state import State
-from tiny_coder.tool_node import Tool
+from tiny_coder.tool_node import Tool, tool
 
 
 def _read_text(path: Path) -> str:
@@ -33,65 +34,41 @@ def _display_path(root: Path, path: Path) -> str:
         return str(path)
 
 
-class ReadFileArgs(BaseModel):
-    """Read numbered UTF-8 lines and the revision required by edit_file/write_file."""
+class FileTools:
+    """Async filesystem operations bound to one workspace root."""
 
-    path: str = Field(description="Workspace-relative path of the file to read.")
-    start_line: int = Field(default=1, ge=1, strict=True)
-    end_line: int | None = Field(default=None, ge=0, strict=True)
+    def __init__(self, root: Path) -> None:
+        self.root = root.expanduser().resolve()
 
+    @cached_property
+    def tools(self) -> list[Tool[..., str]]:
+        """Build the workspace tool definitions once; individual methods remain callable."""
+        return [
+            tool(handler)
+            for handler in (
+                self.search_files,
+                self.read_file,
+                self.edit_file,
+                self.write_file,
+                self.list_dir,
+                self.run_command,
+            )
+        ]
 
-class WriteFileArgs(BaseModel):
-    """Write a complete UTF-8 file; overwriting requires its current read revision."""
-
-    path: str = Field(description="Workspace-relative path of the file to write.")
-    content: str = Field(description="Complete new file content.")
-    expected_revision: str | None = Field(default=None)
-
-
-class EditFileArgs(BaseModel):
-    """Edit with old_start/old_count/new_text; add old_text for adaptive minimal edits."""
-
-    path: str
-    expected_revision: str = Field(description="Revision returned by read_file or search_files.")
-    replacements: list[LineReplacement] = Field(min_length=1)
-
-
-class SearchFilesArgs(BaseModel):
-    """Search UTF-8 files, skipping hidden entries; return paths, line numbers and revisions."""
-
-    pattern: str = Field(min_length=1)
-    path: str = Field(default=".", description="Workspace-relative file or directory.")
-    glob: str = Field(default="*", description="Filename glob within the directory.")
-    regex: bool = False
-    max_matches: int = Field(default=100, ge=1, le=1000, strict=True)
-
-
-class ListDirArgs(BaseModel):
-    """List entries inside one workspace directory."""
-
-    path: str = Field(default=".", description="Workspace-relative directory path.")
-
-
-class RunCommandArgs(BaseModel):
-    """Run a shell command with the workspace as its working directory."""
-
-    command: str = Field(description="Shell command to execute.")
-    timeout: float = Field(default=60.0, gt=0, description="Timeout in seconds.")
-
-
-def read_file_tool(root: Path) -> Tool:
-    workspace = root.expanduser().resolve()
-
-    async def handler(state: State, path: str, start_line: int, end_line: int | None) -> str:
-        _ = state
-        target = resolve_agent_file_path(workspace, Path(path))
+    async def read_file(
+        self,
+        path: Annotated[str, Field(description="Workspace-relative path of the file to read.")],
+        start_line: Annotated[int, Field(ge=1, strict=True)] = 1,
+        end_line: Annotated[int | None, Field(ge=0, strict=True)] = None,
+    ) -> str:
+        """Read numbered UTF-8 lines and the revision required by edit_file/write_file."""
+        target = resolve_agent_file_path(self.root, Path(path))
         if not target.is_file():
             return f"error: file not found: {path}"
         content = await asyncio.to_thread(_read_text, target)
         return json.dumps(
             {
-                "path": _display_path(workspace, target),
+                "path": _display_path(self.root, target),
                 "revision": text_revision(content),
                 "total_lines": len(text_lines(content)),
                 "content": numbered_text(content, start_line=start_line, end_line=end_line),
@@ -99,50 +76,42 @@ def read_file_tool(root: Path) -> Tool:
             ensure_ascii=False,
         )
 
-    return Tool.from_model(ReadFileArgs, handler, name="read_file")
-
-
-def write_file_tool(root: Path) -> Tool:
-    workspace = root.expanduser().resolve()
-
-    async def handler(state: State, path: str, content: str, expected_revision: str | None) -> str:
-        _ = state
-        target = resolve_agent_file_path(workspace, Path(path))
+    async def write_file(
+        self,
+        path: Annotated[str, Field(description="Workspace-relative path of the file to write.")],
+        content: Annotated[str, Field(description="Complete new file content.")],
+        expected_revision: str | None = None,
+    ) -> str:
+        """Write a complete UTF-8 file; overwriting requires its current read revision."""
+        target = resolve_agent_file_path(self.root, Path(path))
         if target.exists() and expected_revision is None:
             return "error: overwriting requires expected_revision; read_file first"
         await asyncio.to_thread(
             apply_patches,
-            workspace,
+            self.root,
             [ApplyPatch(target, content=content, expected_revision=expected_revision)],
         )
-        return f"wrote {_display_path(workspace, target)} ({len(content)} chars)"
+        return f"wrote {_display_path(self.root, target)} ({len(content)} chars)"
 
-    return Tool.from_model(WriteFileArgs, handler, name="write_file")
-
-
-def edit_file_tool(root: Path) -> Tool:
-    workspace = root.expanduser().resolve()
-
-    async def handler(
-        state: State, path: str, expected_revision: str, replacements: list[dict[str, object]]
+    async def edit_file(
+        self,
+        path: str,
+        expected_revision: Annotated[
+            str, Field(description="Revision returned by read_file or search_files.")
+        ],
+        replacements: Annotated[list[LineReplacement], Field(min_length=1)],
     ) -> str:
-        _ = state
+        """Edit with old_start/old_count/new_text; add old_text for adaptive minimal edits."""
         patch = ApplyPatch(
             Path(path),
-            replacements=[LineReplacement.model_validate(item) for item in replacements],
+            replacements=replacements,
             expected_revision=expected_revision,
         )
-        await asyncio.to_thread(apply_patches, workspace, [patch])
+        await asyncio.to_thread(apply_patches, self.root, [patch])
         return f"edited {path}; read_file again for updated line numbers and revision"
 
-    return Tool.from_model(EditFileArgs, handler, name="edit_file")
-
-
-def search_files_tool(root: Path) -> Tool:
-    workspace = root.expanduser().resolve()
-
-    def search(path: str, pattern: str, glob: str, regex: bool, max_matches: int) -> str:
-        target = resolve_agent_file_path(workspace, Path(path))
+    def _search(self, path: str, pattern: str, glob: str, regex: bool, max_matches: int) -> str:
+        target = resolve_agent_file_path(self.root, Path(path))
         if not target.exists():
             raise FileNotFoundError(path)
         query = re.compile(pattern if regex else re.escape(pattern))
@@ -160,7 +129,7 @@ def search_files_tool(root: Path) -> Tool:
             if not candidate.is_file() or not candidate.match(glob):
                 continue
             # Directory traversal can encounter symlinks pointing outside the workspace.
-            if not candidate.resolve().is_relative_to(workspace):
+            if not candidate.resolve().is_relative_to(self.root):
                 continue
             try:
                 content = _read_text(candidate)
@@ -174,7 +143,7 @@ def search_files_tool(root: Path) -> Tool:
                     return json.dumps({"matches": matches, "truncated": True}, ensure_ascii=False)
                 matches.append(
                     {
-                        "path": _display_path(workspace, candidate),
+                        "path": _display_path(self.root, candidate),
                         "line": number,
                         "content": line,
                         "revision": revision,
@@ -182,21 +151,23 @@ def search_files_tool(root: Path) -> Tool:
                 )
         return json.dumps({"matches": matches, "truncated": False}, ensure_ascii=False)
 
-    async def handler(
-        state: State, path: str, pattern: str, glob: str, regex: bool, max_matches: int
+    async def search_files(
+        self,
+        pattern: Annotated[str, Field(min_length=1)],
+        path: Annotated[str, Field(description="Workspace-relative file or directory.")] = ".",
+        glob: Annotated[str, Field(description="Filename glob within the directory.")] = "*",
+        regex: bool = False,
+        max_matches: Annotated[int, Field(ge=1, le=1000, strict=True)] = 100,
     ) -> str:
-        _ = state
-        return await asyncio.to_thread(search, path, pattern, glob, regex, max_matches)
+        """Search UTF-8 files, skipping hidden entries; return paths, line numbers and revisions."""
+        return await asyncio.to_thread(self._search, path, pattern, glob, regex, max_matches)
 
-    return Tool.from_model(SearchFilesArgs, handler, name="search_files")
-
-
-def list_dir_tool(root: Path) -> Tool:
-    workspace = root.expanduser().resolve()
-
-    async def handler(state: State, path: str) -> str:
-        _ = state
-        target = resolve_agent_file_path(workspace, Path(path))
+    async def list_dir(
+        self,
+        path: Annotated[str, Field(description="Workspace-relative directory path.")] = ".",
+    ) -> str:
+        """List entries inside one workspace directory."""
+        target = resolve_agent_file_path(self.root, Path(path))
         if not target.is_dir():
             return f"error: directory not found: {path}"
         entries = sorted(
@@ -204,17 +175,15 @@ def list_dir_tool(root: Path) -> Tool:
         )
         return "\n".join(entries) if entries else "(empty)"
 
-    return Tool.from_model(ListDirArgs, handler, name="list_dir")
-
-
-def run_command_tool(root: Path) -> Tool:
-    workspace = root.expanduser().resolve()
-
-    async def handler(state: State, command: str, timeout: float) -> str:
-        _ = state
+    async def run_command(
+        self,
+        command: Annotated[str, Field(description="Shell command to execute.")],
+        timeout: Annotated[float, Field(gt=0, description="Timeout in seconds.")] = 60.0,
+    ) -> str:
+        """Run a shell command with the workspace as its working directory."""
         process = await asyncio.create_subprocess_shell(
             command,
-            cwd=workspace,
+            cwd=self.root,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -230,33 +199,5 @@ def run_command_tool(root: Path) -> Tool:
         output = stdout_bytes.decode("utf-8", errors="replace")
         return f"exit_code={process.returncode}\n{output.rstrip()}"
 
-    return Tool.from_model(RunCommandArgs, handler, name="run_command")
 
-
-def default_file_tools(root: Path) -> list[Tool]:
-    """Return the standard workspace tools bound to one root directory."""
-    return [
-        search_files_tool(root),
-        read_file_tool(root),
-        edit_file_tool(root),
-        write_file_tool(root),
-        list_dir_tool(root),
-        run_command_tool(root),
-    ]
-
-
-__all__ = [
-    "ListDirArgs",
-    "EditFileArgs",
-    "SearchFilesArgs",
-    "ReadFileArgs",
-    "RunCommandArgs",
-    "WriteFileArgs",
-    "default_file_tools",
-    "list_dir_tool",
-    "edit_file_tool",
-    "search_files_tool",
-    "read_file_tool",
-    "run_command_tool",
-    "write_file_tool",
-]
+__all__ = ["FileTools"]

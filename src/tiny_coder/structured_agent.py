@@ -11,7 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from time import perf_counter
-from typing import Any, TypeVar
+from typing import Any, Self, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -33,7 +33,14 @@ from tiny_coder.llm import (
 )
 from tiny_coder.state import State
 from tiny_coder.steering import current_instructions
-from tiny_coder.tool_node import Tool, ToolExecution, ToolNode, has_tool_calls
+from tiny_coder.tool_node import (
+    Tool,
+    ToolDefinition,
+    ToolExecution,
+    ToolNode,
+    _register_tools,
+    has_tool_calls,
+)
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -45,6 +52,10 @@ _RETRY_KEY = "_retry"
 _RESPONSE_FORMAT_KEY = "_response_format"
 _SYSTEM_PROMPT_KEY = "_system_prompt"
 SUBMIT_RESULT = "submit_result"
+
+
+async def _submit_result(state: State, **kwargs: Any) -> str:
+    raise RuntimeError("submit_result is handled by the agent loop")
 
 
 @dataclass
@@ -106,7 +117,7 @@ class AgentCall:
     resources: ExitStack = field(default_factory=ExitStack, repr=False)
     invocation_resources: ExitStack = field(default_factory=ExitStack, repr=False)
     invocation_data: dict[str, object] = field(default_factory=dict, repr=False)
-    tools: list[Tool] = field(default_factory=list)
+    tools: list[Tool[..., Any]] = field(default_factory=list)
     turn: int = 1
     prepared_extensions: set[int] = field(default_factory=set, repr=False)
     submission_enabled: bool = True
@@ -115,6 +126,10 @@ class AgentCall:
     timing: CallTiming = field(default_factory=CallTiming)
     cancelled: bool = False
     tool_executions: list[ToolExecution] = field(default_factory=list)
+
+    def register_tools(self, *definitions: ToolDefinition, replace: bool = False) -> None:
+        """Add tools for this call; replace=True explicitly overrides existing names."""
+        _register_tools(self.tools, *definitions, replace=replace)
 
     @property
     def submission(self) -> ToolCall | None:
@@ -199,7 +214,7 @@ class StructuredInput:
     response_model: type[BaseModel] | None = None
     system_prompt: str | None = None
     context: object | None = None
-    tools: Sequence[Tool] | None = None
+    tools: Sequence[ToolDefinition] | None = None
     state: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -209,7 +224,7 @@ class _Invocation:
     context: object | None
     feedback: list[str] = field(default_factory=list)
     call: AgentCall | None = None
-    tools: Sequence[Tool] = ()
+    tools: Sequence[Tool[..., Any]] = ()
     prepared_extensions: set[int] = field(default_factory=set)
     resources: ExitStack = field(default_factory=ExitStack)
     data: dict[str, object] = field(default_factory=dict)
@@ -223,7 +238,7 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
     llm_config: LlmConfig
     response_model: type[BaseModel] | None = None
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
-    tools: list[Tool] = field(default_factory=list)
+    tools: list[Tool[..., Any]] = field(default_factory=list)
     checkpointer: Checkpointer | None = None
     accept: Callable[[AgentCall, BaseModel], Awaitable[None]] | None = None
     _invocation: ContextVar[_Invocation | None] = field(
@@ -231,6 +246,11 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
         init=False,
         repr=False,
     )
+
+    def register_tools(self, *definitions: ToolDefinition, replace: bool = False) -> Self:
+        """Register defaults for future invocations; running calls keep their own tools."""
+        _register_tools(self.tools, *definitions, replace=replace)
+        return self
 
     def use(self, *extensions: AgentExtension) -> StructuredAgent:
         """Compose capabilities for all future invocations."""
@@ -275,10 +295,12 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
         """
         model = input.response_model or self.response_model
         initial = self._initial_state(input, model)
+        tools: list[Tool[..., Any]] = []
+        _register_tools(tools, *(self.tools if input.tools is None else input.tools))
         invocation = _Invocation(
             response_model=model,
             context=input.context,
-            tools=self.tools if input.tools is None else input.tools,
+            tools=tools,
         )
         token = self._invocation.set(invocation)
         try:
@@ -458,16 +480,12 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
                 raise ValueError(f"reserved tool name: {SUBMIT_RESULT}")
 
         if tools and call.response_model is not None and call.submission_enabled:
-
-            async def submit(state: State, **kwargs: Any) -> str:
-                raise RuntimeError("submit_result is handled by the agent loop")
-
             tools.append(
                 Tool(
                     name=SUBMIT_RESULT,
                     description="Submit the complete final result after reading context and completing the task. Call this alone. Validation errors are returned for correction; a rejected submission is not accepted.",
                     model=call.response_model,
-                    handler=submit,
+                    handler=_submit_result,
                     parameters_schema=call.response_format["schema"]
                     if call.response_format is not None
                     else None,
@@ -540,7 +558,7 @@ def create_structured_agent(
     llm_config: LlmConfig,
     response_model: type[BaseModel] | None = None,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-    tools: Sequence[Tool] | None = None,
+    tools: Sequence[ToolDefinition] | None = None,
     checkpointer: Checkpointer | None = None,
     max_steps: int = 100,
     extensions: Sequence[AgentExtension] = (),
@@ -559,8 +577,8 @@ def create_structured_agent(
     """
     if max_steps < 1:
         raise ValueError("max_steps must be at least 1")
-    resolved_tools = list(tools) if tools is not None else []
-    ToolNode(resolved_tools)
+    resolved_tools: list[Tool[..., Any]] = []
+    _register_tools(resolved_tools, *(tools or ()))
     graph = Graph(max_steps=max_steps)
     agent = StructuredAgent(
         graph=graph,

@@ -36,7 +36,7 @@ import asyncio
 from pathlib import Path
 
 from tiny_coder.checkpoint import JsonCheckpointer
-from tiny_coder.file_tools import default_file_tools
+from tiny_coder.file_tools import FileTools
 from tiny_coder.graph import END, Graph
 from tiny_coder.llm import LlmConfig, stream_llm_chat
 from tiny_coder.state import State
@@ -56,7 +56,7 @@ class LocalLlmConfig(LlmConfig):
 SYSTEM = "You are a coding agent. Use tools to inspect and change the workspace."
 
 config = LocalLlmConfig()
-tools = default_file_tools(Path.cwd())
+tools = FileTools(Path.cwd()).tools
 
 
 async def llm_node(state: State) -> dict[str, object]:
@@ -97,28 +97,45 @@ default reducer appends new items for the `messages` key and replaces every othe
 
 ## Tools
 
-A `Tool` is a Pydantic argument model plus an async handler. The model's JSON schema is what the LLM
-sees, and the handler receives the validated keyword arguments.
+Define tools with `@tool`: the function name, docstring, type annotations and defaults provide
+the tool definition. `Annotated` and Pydantic `Field` add argument descriptions and constraints.
 
 ```python
-from pydantic import BaseModel, Field
+from typing import Annotated
 
-from tiny_coder.state import State
-from tiny_coder.tool_node import Tool
+from pydantic import Field
+
+from tiny_coder.tool_node import tool
 
 
-class SearchArgs(BaseModel):
+@tool
+async def search(query: Annotated[str, Field(min_length=1, description="What to search for.")]) -> str:
     """Search the web for one query."""
-
-    query: str = Field(description="What to search for.")
-
-
-async def search(state: State, query: str) -> str:
     return await my_search(query)
-
-
-search_tool = Tool.from_model(SearchArgs, search)
 ```
+
+Register the resulting object in `tools=[search]`. All handlers must use `async def`;
+synchronous handlers are rejected during definition. An optional `state: State` parameter is
+injected by the runtime and excluded from the model's arguments. Other parameters must be typed named arguments.
+Results may be strings or JSON-serializable values. Handlers receive validated Python values,
+including nested Pydantic models, rather than dictionaries dumped from those models.
+
+`Tool[P, R]` and `ToolHandler[P, R]` retain the parameter signature and result type through
+`ParamSpec` and `TypeVar`. Calling `await search.handler(query="...")` is type checked against the
+original signature and returns its declared result type. Schema overrides
+preserve these types. `invoke(state, json_arguments)` is the dynamic model boundary and always
+returns a serialized string; heterogeneous agent tool registries use `Tool[..., Any]`.
+
+Schemas are always inferred from the signature. Use a Pydantic model as a parameter type for
+structured inputs and custom validators; it appears as a nested object in the tool arguments.
+`name` and `description` can override the inferred metadata. `Tool.from_model(Model, handler)`
+remains available for explicit model-based definitions; its handler receives `state` as the first
+positional argument.
+
+For invocation-specific constraints, `search.with_parameters(query={"type": "string", "enum":
+allowed_queries})` returns an independent definition. Each override replaces that field's entire
+JSON Schema. Both the overridden schema and the original Pydantic validators run before execution;
+unknown fields and invalid model arguments are rejected with targeted feedback.
 
 `ToolNode(tools)` reads the last message, executes each `tool_calls` entry by name, and returns
 `{"messages": [...]}` tool result messages. Unknown tools, invalid arguments, and handler exceptions
@@ -128,7 +145,15 @@ Built-in workspace tools live in `tiny_coder.file_tools`:
 
 - `search_files`, `read_file`, `edit_file`, `write_file`, `list_dir`, `run_command`.
 
-`default_file_tools(root)` binds these tools to a workspace root and blocks paths that escape it.
+`workspace = FileTools(root)` binds these operations to one workspace root and blocks paths that
+escape it. `workspace.tools` lazily builds and reuses the tool definitions. Register selected methods
+directly with `agent.register_tools(workspace.read_file, workspace.search_files)`.
+
+`agent.register_tools(..., replace=True)` explicitly replaces defaults by name for future invocations.
+In lifecycle callbacks, `call.register_tools(..., replace=True)` overrides only the current call.
+Duplicates in one batch are rejected even with replacement enabled. Pass an existing definition to
+`tool(existing, description=..., parameters=...)` to update metadata without rebuilding its argument
+model; the original definition remains unchanged.
 
 Use `search_files` to find literal text or a regex, then `read_file` to inspect a line range.
 Both return original line numbers and a source `revision`. `read_file` returns JSON with
@@ -213,12 +238,12 @@ Tools can be combined with structured output. The agent routes `tool_calls` thro
 then returns the final structured response:
 
 ```python
-from tiny_coder.file_tools import default_file_tools
+from tiny_coder.file_tools import FileTools
 
 agent = create_structured_agent(
     llm_config=LocalLlmConfig(),
     response_model=Plan,
-    tools=default_file_tools(Path.cwd()),
+    tools=FileTools(Path.cwd()).tools,
     max_steps=20,
 )
 ```

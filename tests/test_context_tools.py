@@ -843,3 +843,42 @@ def test_overlapping_explicit_reads_return_the_entire_requested_range(content: s
         assert len(call.state["context_reads"]["note.md"]["ranges"]) == (1 if content else 0)
 
     asyncio.run(run())
+
+
+def test_preparation_reuses_context_tools_and_reads_the_current_call() -> None:
+    context = ContextTools(
+        lambda call: [ContextFile(path="note.md", content=str(call.context), required=True)]
+    )
+    first = AgentCall(
+        state={},
+        messages=[],
+        llm_config=SampleLlmConfig(),
+        system_prompt="",
+        attempt=1,
+        context="old",
+    )
+
+    async def run() -> None:
+        await context.prepare(first)
+        tools = list(first.tools)
+        second = AgentCall(
+            state=first.state,
+            messages=[],
+            llm_config=first.llm_config,
+            system_prompt="",
+            attempt=2,
+            context="new",
+            invocation_data=first.invocation_data,
+        )
+        await context.prepare(second)
+        assert all(left is right for left, right in zip(tools, second.tools))
+        await context.prepare(second)
+        assert len(second.tools) == 4
+        reply = json.loads(
+            await next(
+                definition for definition in second.tools if definition.name == "read_required"
+            ).invoke(second.state, "{}")
+        )
+        assert reply["files"][0]["content"] == "1: new"
+
+    asyncio.run(run())

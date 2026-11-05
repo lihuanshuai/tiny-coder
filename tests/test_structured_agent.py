@@ -25,7 +25,7 @@ from tiny_coder.structured_agent import (
     StructuredResult,
     create_structured_agent,
 )
-from tiny_coder.tool_node import Tool
+from tiny_coder.tool_node import Tool, tool
 
 
 @pytest.mark.parametrize(
@@ -924,3 +924,100 @@ def test_concurrent_runs_keep_schemas_separate_with_a_shared_budget(
 def test_agent_step_limit_must_be_positive(limit: int) -> None:
     with pytest.raises(ValueError, match="max_steps must be at least 1"):
         create_structured_agent(llm_config=SampleLlmConfig(), max_steps=limit)
+
+
+@pytest.mark.parametrize("scope", ["agent", "call"])
+def test_registration_requires_explicit_atomic_overrides(scope: str) -> None:
+    agent = create_structured_agent(llm_config=SampleLlmConfig(), tools=[echo_tool])
+    call = AgentCall(
+        state={},
+        messages=[],
+        llm_config=SampleLlmConfig(),
+        system_prompt="",
+        attempt=1,
+        tools=list(agent.tools),
+    )
+    target = agent if scope == "agent" else call
+
+    async def extra(value: int) -> int:
+        return value
+
+    replacement = tool(echo_tool, description="Updated echo")
+    for definitions, replace in (
+        ((extra, replacement), False),
+        ((extra, replacement, replacement), True),
+    ):
+        with pytest.raises(ValueError, match="duplicate tool name"):
+            target.register_tools(*definitions, replace=replace)
+        assert target.tools == [echo_tool]
+    target.register_tools(extra, replacement, replace=True)
+    assert [definition.name for definition in target.tools] == ["echo", "extra"]
+    assert target.tools[0] is replacement
+    assert agent.tools == [echo_tool] if scope == "call" else call.tools == [echo_tool]
+
+
+@pytest.mark.parametrize("input_tools", [False, True])
+def test_async_methods_register_directly_and_current_call_overrides_are_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+    input_tools: bool,
+) -> None:
+    class Workspace:
+        async def echo(self, text: str) -> str:
+            return f"scoped:{text}"
+
+    workspace = Workspace()
+    scoped = tool(workspace.echo)
+    turns: dict[str, int] = {}
+
+    async def prepare(call: AgentCall) -> None:
+        call.register_tools(
+            tool(scoped, parameters={"text": {"type": "string", "enum": [str(call.context)]}}),
+            replace=True,
+        )
+
+    async def llm(**kwargs: Any) -> LlmChatOutcome:
+        task = kwargs["messages"][1]["content"]
+        turns[task] = turns.get(task, 0) + 1
+        definition = next(definition for definition in kwargs["tools"] if definition.name == "echo")
+        assert definition.model is scoped.model
+        assert definition.parameters["properties"]["text"]["enum"] == [task]
+        await asyncio.sleep(0)
+        if turns[task] == 1:
+            return _outcome(
+                tool_calls=(
+                    ToolCall(
+                        id=task,
+                        type="function",
+                        function={"name": "echo", "arguments": json.dumps({"text": task})},
+                    ),
+                )
+            )
+        assert kwargs["messages"][-1]["content"] == f"scoped:{task}"
+        return _outcome(text="done")
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+    agent = create_structured_agent(
+        llm_config=SampleLlmConfig(),
+        tools=None if input_tools else [workspace.echo],
+    )
+    agent.events.subscribe(BEFORE_CALL, prepare)
+
+    async def run() -> None:
+        results = await asyncio.gather(
+            *[
+                agent.invoke(
+                    StructuredInput(
+                        prompt=name,
+                        context=name,
+                        tools=[workspace.echo] if input_tools else None,
+                    )
+                )
+                for name in ("left", "right")
+            ]
+        )
+        assert [result.text for result in results] == ["done", "done"]
+
+    asyncio.run(run())
+    assert len(agent.tools) == (0 if input_tools else 1)
+    if agent.tools:
+        assert "enum" not in agent.tools[0].parameters["properties"]["text"]

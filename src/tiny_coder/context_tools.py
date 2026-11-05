@@ -4,8 +4,9 @@ import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import PurePosixPath
-from typing import TypedDict
+from typing import Annotated, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,7 +21,7 @@ from tiny_coder.structured_agent import (
     AgentCall,
     AgentExtension,
 )
-from tiny_coder.tool_node import Tool
+from tiny_coder.tool_node import Tool, tool
 
 
 class ContextFile(BaseModel):
@@ -33,51 +34,6 @@ class ContextFile(BaseModel):
     description: str = ""
     writable: bool = False
     required: bool = False
-
-
-class _ListFiles(BaseModel):
-    """List context paths, revisions, read/missing ranges and access rules; no file contents.
-
-    An unchanged catalog returns only its revision; reuse the earlier listing.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class _ReadFile(BaseModel):
-    """Read the requested snapshot lines, including previously read lines.
-
-    Line numbers are 1-based; end_line=null reads to the end. returned_ranges identifies
-    returned content; read_ranges covers all lines provided at this revision.
-    Prefer earlier tool content when sufficient; reread a small range to repair anchors.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    path: str
-    start_line: int = Field(default=1, ge=1, strict=True)
-    end_line: int | None = Field(default=None, ge=1, strict=True)
-
-
-class _ReadRequired(BaseModel):
-    """Read every required snapshot not fully read at its current revision in one call.
-
-    Only missing line ranges are returned. Already fully read current snapshots are skipped.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class _Grep(BaseModel):
-    """Locate a regex in exposed snapshots. Search hits do not count as reading a file."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    pattern: str = Field(min_length=1)
-    path: str = Field(
-        default="", description="Context path from list_files; empty searches all snapshots."
-    )
-    max_matches: int = Field(default=100, ge=1, le=500, strict=True)
 
 
 class _ReadRecord(TypedDict):
@@ -180,123 +136,13 @@ class ContextTools(AgentExtension):
         ):
             call.tool_choice = {"type": "function", "name": SUBMIT_RESULT}
 
-        def listing() -> str:
-            reads: dict[str, _ReadRecord] = call.state.get("context_reads", {})
-            files = []
-            for path, file in self._files(call).items():
-                revision = text_revision(file.content)
-                total_lines = len(text_lines(file.content))
-                record = reads.get(path)
-                ranges = (
-                    _merge_ranges(record["ranges"])
-                    if record is not None and record["revision"] == revision
-                    else []
-                )
-                files.append(
-                    {
-                        "path": path,
-                        "description": file.description,
-                        "writable": file.writable,
-                        "required": file.required,
-                        "total_lines": total_lines,
-                        "revision": revision,
-                        "read": _read_complete(record, revision, total_lines),
-                        "read_ranges": ranges,
-                        "missing_ranges": _unread_ranges(ranges, 1, total_lines),
-                    }
-                )
-            return json.dumps(
-                {"files": files},
-                ensure_ascii=False,
-            )
-
-        async def list_files(state: State) -> str:
-            content = listing()
-            revision = text_revision(content)
-            if state.get("context_listing_revision") == revision:
-                return json.dumps({"files": [], "unchanged": True, "revision": revision})
-            state["context_listing_revision"] = revision
-            return content
-
-        def read_snapshot(
-            state: State, path: str, start_line: int, end_line: int | None, *, unread_only: bool
-        ) -> str:
-            file = self._file(call, path)
-            canonical = _path(path)
-            lines = text_lines(file.content)
-            end = len(lines) if end_line is None else end_line
-            if end < start_line or start_line > len(lines) or end > len(lines):
-                if lines or start_line != 1 or end_line is not None:
-                    raise ValueError(
-                        f"invalid line range {start_line}..{end}; {canonical} has {len(lines)} lines. "
-                        f"Set start_line and end_line within 1..{len(lines)} with end_line >= "
-                        "start_line, or use end_line=null to read to the end."
-                    )
-            revision = text_revision(file.content)
-            reads: dict[str, _ReadRecord] = state.setdefault("context_reads", {})
-            record = reads.get(canonical)
-            already_read = (
-                record is not None
-                and record["revision"] == revision
-                and not _unread_ranges(record["ranges"], start_line, end)
-            )
-            if record is None or record["revision"] != revision:
-                record = _ReadRecord(revision=revision, ranges=[])
-                reads[canonical] = record
-            if unread_only:
-                returned = _unread_ranges(record["ranges"], start_line, end)
-            else:
-                returned = [[start_line, end]] if lines else []
-            record["ranges"] = _merge_ranges([*record["ranges"], *returned])
-            return json.dumps(
-                {
-                    "path": canonical,
-                    "revision": revision,
-                    "description": file.description,
-                    "writable": file.writable,
-                    "start_line": start_line,
-                    "end_line": end,
-                    "total_lines": len(lines),
-                    "returned_ranges": returned,
-                    "read_ranges": record["ranges"],
-                    "missing_ranges": _unread_ranges(record["ranges"], 1, len(lines)),
-                    "already_read": already_read,
-                    "content": "\n".join(
-                        numbered_text(file.content, start_line=first, end_line=last)
-                        for first, last in returned
-                    ),
-                },
-                ensure_ascii=False,
-            )
-
-        async def read_file(state: State, path: str, start_line: int, end_line: int | None) -> str:
-            return read_snapshot(state, path, start_line, end_line, unread_only=False)
-
-        async def grep(state: State, pattern: str, path: str, max_matches: int) -> str:
-            try:
-                regex = re.compile(pattern)
-            except re.error as error:
-                raise ValueError(f"invalid grep regex: {error}") from error
-            files = self._files(call) if path == "" else {_path(path): self._file(call, path)}
-            matches: list[dict[str, str | int]] = []
-            for name, file in files.items():
-                revision = text_revision(file.content)
-                for number, line in grep_lines(file.content, regex):
-                    if len(matches) == max_matches:
-                        return json.dumps(
-                            {"matches": matches, "truncated": True}, ensure_ascii=False
-                        )
-                    matches.append(
-                        {"path": name, "line": number, "text": line, "revision": revision}
-                    )
-            return json.dumps({"matches": matches, "truncated": False}, ensure_ascii=False)
-
-        async def read_required(state: State) -> str:
-            files = [
-                json.loads(read_snapshot(state, path, 1, None, unread_only=True))
-                for path in self._missing(call)
-            ]
-            return json.dumps({"files": files, "unchanged": not files}, ensure_ascii=False)
+        key = f"context_tools:{id(self)}"
+        reader = call.invocation_data.get(key)
+        if not isinstance(reader, _ContextReader):
+            reader = _ContextReader(self, call)
+            call.invocation_data[key] = reader
+        else:
+            reader.call = call
 
         if call.submission_enabled and call.response_model is not None and call.messages:
             last = call.messages[-1]
@@ -310,19 +156,12 @@ class ContextTools(AgentExtension):
                     and reply.get("unchanged") is True
                     and (
                         last["name"] == "read_required"
-                        or reply.get("revision") == text_revision(listing())
+                        or reply.get("revision") == text_revision(reader.listing())
                     )
                 ):
                     call.tool_choice = {"type": "function", "name": SUBMIT_RESULT}
 
-        call.tools.extend(
-            [
-                Tool.from_model(_ListFiles, list_files, name="list_files"),
-                Tool.from_model(_ReadFile, read_file, name="read_file"),
-                Tool.from_model(_ReadRequired, read_required, name="read_required"),
-                Tool.from_model(_Grep, grep, name="grep"),
-            ]
-        )
+        call.register_tools(*reader.tools, replace=True)
 
     def _missing(self, call: AgentCall) -> list[str]:
         reads: dict[str, _ReadRecord] = call.state.get("context_reads", {})
@@ -348,6 +187,166 @@ class ContextTools(AgentExtension):
                 context={"paths": missing},
                 suggestion="Call read_required once to read all listed paths at their current revisions, then submit the complete result. Alternatively use read_file to cover all their lines. grep hits do not provide full source. No submission has been accepted.",
             )
+
+
+@dataclass
+class _ContextReader:
+    context: ContextTools
+    call: AgentCall
+
+    @cached_property
+    def tools(self) -> list[Tool[..., str]]:
+        return [
+            tool(handler)
+            for handler in (self.list_files, self.read_file, self.read_required, self.grep)
+        ]
+
+    def listing(self) -> str:
+        reads: dict[str, _ReadRecord] = self.call.state.get("context_reads", {})
+        files = []
+        for path, file in self.context._files(self.call).items():
+            revision = text_revision(file.content)
+            total_lines = len(text_lines(file.content))
+            record = reads.get(path)
+            ranges = (
+                _merge_ranges(record["ranges"])
+                if record is not None and record["revision"] == revision
+                else []
+            )
+            files.append(
+                {
+                    "path": path,
+                    "description": file.description,
+                    "writable": file.writable,
+                    "required": file.required,
+                    "total_lines": total_lines,
+                    "revision": revision,
+                    "read": _read_complete(record, revision, total_lines),
+                    "read_ranges": ranges,
+                    "missing_ranges": _unread_ranges(ranges, 1, total_lines),
+                }
+            )
+        return json.dumps(
+            {"files": files},
+            ensure_ascii=False,
+        )
+
+    async def list_files(self, state: State) -> str:
+        """List context paths, revisions, read/missing ranges and access rules; no contents.
+
+        An unchanged catalog returns only its revision; reuse the earlier listing.
+        """
+        content = self.listing()
+        revision = text_revision(content)
+        if state.get("context_listing_revision") == revision:
+            return json.dumps({"files": [], "unchanged": True, "revision": revision})
+        state["context_listing_revision"] = revision
+        return content
+
+    def read_snapshot(
+        self, state: State, path: str, start_line: int, end_line: int | None, *, unread_only: bool
+    ) -> str:
+        file = self.context._file(self.call, path)
+        canonical = _path(path)
+        lines = text_lines(file.content)
+        end = len(lines) if end_line is None else end_line
+        if end < start_line or start_line > len(lines) or end > len(lines):
+            if lines or start_line != 1 or end_line is not None:
+                raise ValueError(
+                    f"invalid line range {start_line}..{end}; {canonical} has {len(lines)} lines. "
+                    f"Set start_line and end_line within 1..{len(lines)} with end_line >= "
+                    "start_line, or use end_line=null to read to the end."
+                )
+        revision = text_revision(file.content)
+        reads: dict[str, _ReadRecord] = state.setdefault("context_reads", {})
+        record = reads.get(canonical)
+        already_read = (
+            record is not None
+            and record["revision"] == revision
+            and not _unread_ranges(record["ranges"], start_line, end)
+        )
+        if record is None or record["revision"] != revision:
+            record = _ReadRecord(revision=revision, ranges=[])
+            reads[canonical] = record
+        if unread_only:
+            returned = _unread_ranges(record["ranges"], start_line, end)
+        else:
+            returned = [[start_line, end]] if lines else []
+        record["ranges"] = _merge_ranges([*record["ranges"], *returned])
+        return json.dumps(
+            {
+                "path": canonical,
+                "revision": revision,
+                "description": file.description,
+                "writable": file.writable,
+                "start_line": start_line,
+                "end_line": end,
+                "total_lines": len(lines),
+                "returned_ranges": returned,
+                "read_ranges": record["ranges"],
+                "missing_ranges": _unread_ranges(record["ranges"], 1, len(lines)),
+                "already_read": already_read,
+                "content": "\n".join(
+                    numbered_text(file.content, start_line=first, end_line=last)
+                    for first, last in returned
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    async def read_file(
+        self,
+        state: State,
+        path: str,
+        start_line: Annotated[int, Field(ge=1, strict=True)] = 1,
+        end_line: Annotated[int | None, Field(ge=1, strict=True)] = None,
+    ) -> str:
+        """Read requested snapshot lines, including previously read lines.
+
+        Line numbers are 1-based; end_line=null reads to the end. returned_ranges
+        identifies returned content; read_ranges covers all lines at this revision.
+        Prefer earlier tool content when sufficient; reread a small range to repair anchors.
+        """
+        return self.read_snapshot(state, path, start_line, end_line, unread_only=False)
+
+    async def grep(
+        self,
+        pattern: Annotated[str, Field(min_length=1)],
+        path: Annotated[
+            str,
+            Field(description="Context path from list_files; empty searches all snapshots."),
+        ] = "",
+        max_matches: Annotated[int, Field(ge=1, le=500, strict=True)] = 100,
+    ) -> str:
+        """Locate a regex in exposed snapshots. Hits do not count as reading a file."""
+        try:
+            regex = re.compile(pattern)
+        except re.error as error:
+            raise ValueError(f"invalid grep regex: {error}") from error
+        files = (
+            self.context._files(self.call)
+            if path == ""
+            else {_path(path): self.context._file(self.call, path)}
+        )
+        matches: list[dict[str, str | int]] = []
+        for name, file in files.items():
+            revision = text_revision(file.content)
+            for number, line in grep_lines(file.content, regex):
+                if len(matches) == max_matches:
+                    return json.dumps({"matches": matches, "truncated": True}, ensure_ascii=False)
+                matches.append({"path": name, "line": number, "text": line, "revision": revision})
+        return json.dumps({"matches": matches, "truncated": False}, ensure_ascii=False)
+
+    async def read_required(self, state: State) -> str:
+        """Read every required snapshot not fully read at its current revision in one call.
+
+        Only missing line ranges are returned; fully read current snapshots are skipped.
+        """
+        files = [
+            json.loads(self.read_snapshot(state, path, 1, None, unread_only=True))
+            for path in self.context._missing(self.call)
+        ]
+        return json.dumps({"files": files, "unchanged": not files}, ensure_ascii=False)
 
 
 __all__ = ["ContextFile", "ContextTools"]

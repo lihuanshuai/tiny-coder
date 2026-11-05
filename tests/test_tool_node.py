@@ -2,14 +2,41 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Literal
+from collections.abc import Callable, Coroutine
+from pathlib import Path
+from textwrap import dedent
+from typing import Annotated, Any, Literal
 
 import pytest
-from pydantic import BaseModel, Field
+from mypy import api as mypy_api
+from pydantic import BaseModel, Field, field_validator
 
 from tiny_coder.llm import tool_openai_spec
 from tiny_coder.state import State
-from tiny_coder.tool_node import Tool, ToolExecution, ToolNode, has_tool_calls
+from tiny_coder.tool_node import Tool, ToolExecution, ToolNode, has_tool_calls, tool
+
+
+@tool
+async def add_typed(
+    state: State, left: Annotated[int, Field(ge=1)], *, right: int = 2
+) -> dict[str, int]:
+    """Add positive numbers and record the result."""
+    state["sum"] = left + right
+    return {"sum": left + right}
+
+
+def test_decorated_tool_infers_schema_defaults_and_injects_state() -> None:
+    spec = tool_openai_spec(add_typed)
+    assert spec["name"] == "add_typed"
+    assert spec["description"] == "Add positive numbers and record the result."
+    assert set(spec["parameters"]["properties"]) == {"left", "right"}
+    assert spec["parameters"]["properties"]["left"]["minimum"] == 1
+    assert spec["parameters"]["required"] == ["left", "right"]
+    state: State = {}
+    assert json.loads(asyncio.run(add_typed.invoke(state, '{"left":3}'))) == {"sum": 5}
+    assert state == {"sum": 5}
+    for invalid in ('{"left":0}', '{"left":"3"}', '{"left":3,"state":{}}'):
+        assert asyncio.run(add_typed.invoke({}, invalid)).startswith("error: invalid arguments")
 
 
 class AddArgs(BaseModel):
@@ -23,7 +50,219 @@ class NoopArgs(BaseModel):
     """Do nothing."""
 
 
-def _add_tool(calls: list[tuple[int, int]] | None = None) -> Tool:
+class PositiveBatch(BaseModel):
+    """A validated group of additions."""
+
+    additions: list[AddArgs]
+
+    @field_validator("additions")
+    @classmethod
+    def nonempty(cls, value: list[AddArgs]) -> list[AddArgs]:
+        if not value:
+            raise ValueError("provide at least one addition")
+        return value
+
+
+def test_decorator_infers_nested_models_and_preserves_their_validators() -> None:
+    @tool(name="batch")
+    async def add(batch: PositiveBatch) -> int:
+        return sum(item.left + item.right for item in batch.additions)
+
+    assert add.name == "batch"
+    assert "at least one addition" in asyncio.run(add.invoke({}, '{"batch":{"additions":[]}}'))
+    assert asyncio.run(add.invoke({}, '{"batch":{"additions":[{"left":1,"right":2}]}}')) == "3"
+
+
+def test_async_tool_accepts_keyword_state() -> None:
+    @tool(description="Record a value.")
+    async def worker(*, state: State) -> int:
+        state["value"] = 42
+        return state["value"]
+
+    async def run() -> None:
+        state: State = {}
+        result = await worker.invoke(state, "{}")
+        assert int(result) == state["value"] == 42
+
+    asyncio.run(run())
+
+
+def test_typed_async_handler_preserves_signature_and_return_type() -> None:
+    @tool
+    async def later(value: int) -> int:
+        return value + 1
+
+    assert asyncio.run(later.invoke({}, '{"value":1}')) == "2"
+
+    async def run() -> None:
+        assert await later.handler(value=2) == 3
+        assert await add_typed.handler({}, left=2, right=3) == {"sum": 5}
+
+    asyncio.run(run())
+
+
+def _sync_handler(value: int) -> int:
+    return value
+
+
+def _sync_coroutine_handler(value: int) -> Coroutine[Any, Any, int]:
+    async def result() -> int:
+        return value
+
+    return result()
+
+
+@pytest.mark.parametrize("handler", [_sync_handler, _sync_coroutine_handler])
+def test_all_tool_definition_paths_reject_synchronous_handlers(handler: Callable[..., Any]) -> None:
+    for define in (
+        lambda: tool(handler),
+        lambda: tool(handler, name="invalid"),
+        lambda: tool(name="invalid")(handler),
+        lambda: Tool.from_model(AddArgs, handler),
+        lambda: Tool(name="invalid", description="Invalid", model=AddArgs, handler=handler),
+    ):
+        with pytest.raises(TypeError, match="async def"):
+            define()
+
+
+def test_generic_tool_types_preserve_parameters_and_results(tmp_path: Path) -> None:
+    source = tmp_path / "tool_typing.py"
+    with source.open("w", encoding="utf-8", newline="\n") as target:
+        target.write(
+            dedent('''\
+            from typing import assert_type
+            from pydantic import BaseModel
+            from tiny_coder.state import State
+            from tiny_coder.tool_node import Tool, tool
+
+            @tool
+            async def add(left: int, right: int = 2) -> int:
+                return left + right
+
+            @tool(name="echo")
+            async def echo(value: str) -> str:
+                return value
+
+            @tool()
+            async def flag(*, enabled: bool = False) -> bool:
+                return enabled
+
+            @tool
+            async def stateful(state: State, value: int) -> int:
+                return value
+
+            class Args(BaseModel):
+                value: str
+
+            async def handle(state: State, value: str) -> str:
+                return value
+
+            class Worker:
+                async def handle(self, *, value: str) -> str:
+                    return value
+
+            def synchronous(value: int) -> int:
+                return value
+
+            explicit = Tool.from_model(Args, handle)
+            bound = tool(Worker().handle)
+            updated = tool(bound, description="Updated")
+            restricted = echo.with_parameters(value={"type": "string", "enum": ["ok"]})
+
+            async def check() -> None:
+                assert_type(await add.handler(1, right=2), int)
+                assert_type(await flag.handler(enabled=True), bool)
+                assert_type(await stateful.handler({}, value=1), int)
+                assert_type(await explicit.handler({}, value="ok"), str)
+                assert_type(await bound.handler(value="ok"), str)
+                assert_type(await restricted.handler(value="ok"), str)
+                assert_type(await updated.handler(value="ok"), str)
+                await add.handler("bad")
+                await restricted.handler(unknown="bad")
+                incorrect: str = await add.handler(1)
+                incompatible: Tool[[str], str] = add
+                tool(synchronous)
+                tool(name="invalid")(synchronous)
+                Tool.from_model(Args, synchronous)
+                await bound.handler(value=1)
+            ''')
+        )
+    stdout, stderr, status = mypy_api.run(
+        [
+            "--no-incremental",
+            "--no-error-summary",
+            str(source),
+            str(Path(__file__).parent.parent / "src" / "tiny_coder"),
+        ]
+    )
+    assert status == 1 and not stderr, stdout + stderr
+    errors = [line for line in stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 8, stdout
+    assert all("tool_typing.py:" in error for error in errors), stdout
+    assert 'incompatible type "str"' in errors[0]
+    assert 'Unexpected keyword argument "unknown"' in errors[1]
+    assert all("Incompatible types in assignment" in error for error in errors[2:4])
+    assert all("incompatible type" in error and "Coroutine" in error for error in errors[4:7])
+    assert 'incompatible type "int"' in errors[7]
+
+
+def test_parameter_overrides_are_isolated_and_enforced() -> None:
+    restricted = add_typed.with_parameters(left={"type": "integer", "enum": [1, 2]})
+    assert "enum" not in add_typed.parameters["properties"]["left"]
+    assert "[1, 2]" in asyncio.run(restricted.invoke({}, '{"left":3}'))
+    assert asyncio.run(restricted.invoke({}, '{"left":2}')) == '{"sum": 4}'
+    with pytest.raises(ValueError, match="unknown parameter"):
+        restricted.with_parameters(typo={"enum": [1]})
+    # An overridden wire field cannot disable the model's original validation.
+    invalid = add_typed.with_parameters(left={"type": "integer", "enum": [0]})
+    state: State = {}
+    assert "greater than or equal to 1" in asyncio.run(invalid.invoke(state, '{"left":0}'))
+    assert not state
+
+
+def test_existing_tool_updates_reuse_model_and_preserve_original_constraints() -> None:
+    assert tool(add_typed) is add_typed
+    assert add_typed.with_parameters() is add_typed
+    updated = tool(
+        add_typed,
+        name="restricted_add",
+        description="Only add one.",
+        parameters={"left": {"type": "integer", "enum": [1]}},
+    )
+    assert updated.model is add_typed.model
+    assert updated.handler is add_typed.handler
+    assert updated.description == "Only add one."
+    assert updated.name == "restricted_add"
+    assert add_typed.name == "add_typed"
+    assert "enum" not in add_typed.parameters["properties"]["left"]
+    assert "[1]" in asyncio.run(updated.invoke({}, '{"left":2}'))
+    assert json.loads(asyncio.run(updated.invoke({}, '{"left":1}'))) == {"sum": 3}
+
+
+def test_decorator_rejects_ambiguous_definitions_before_registration() -> None:
+    async def missing_annotation(value):  # type: ignore[no-untyped-def]
+        return value
+
+    async def variadic(*args: str) -> str:
+        return ""
+
+    async def positional(value: str, /) -> str:
+        return value
+
+    async def incorrect_state(state: int) -> str:
+        return str(state)
+
+    for handler, message in (
+        (missing_annotation, "type annotation"),
+        (variadic, "named argument"),
+        (positional, "named argument"),
+        (incorrect_state, "annotated as State"),
+    ):
+        with pytest.raises(TypeError, match=message):
+            tool(handler)
+
+
+def _add_tool(calls: list[tuple[int, int]] | None = None) -> Tool[..., str]:
     async def handler(state: State, left: int, right: int) -> str:
         _ = state
         if calls is not None:
