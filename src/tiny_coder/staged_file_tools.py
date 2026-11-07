@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from pathlib import Path
+from shutil import copyfile
 from tempfile import TemporaryDirectory
 from types import TracebackType
 from typing import Annotated
@@ -10,40 +11,44 @@ from typing import Annotated
 from pydantic import Field
 
 from tiny_coder.context_tools import acknowledge_context_write
-from tiny_coder.line_edit import (
-    AdaptiveLineReplacement,
-    apply_line_replacements,
-    text_lines,
-    text_revision,
-)
+from tiny_coder.line_edit import numbered_text, text_lines, text_revision
 from tiny_coder.state import State
 
 FilePath = Annotated[str, Field(min_length=1)]
 FileContent = Annotated[str, Field(min_length=1)]
 FileRevision = Annotated[str, Field(min_length=1)]
 InsertionLine = Annotated[int, Field(ge=1, strict=True)]
-# Reuse the domain model's range constraints when exposing primitive tool arguments.
-ReplacementStart = Annotated[int, AdaptiveLineReplacement.model_fields["old_start"]]
-ReplacementCount = Annotated[int, AdaptiveLineReplacement.model_fields["old_count"]]
-ReplacementSource = Annotated[
-    str,
+ReplacementStart = Annotated[
+    int,
+    Field(ge=1, strict=True, description="First line to replace, 1-based in the latest revision."),
+]
+ReplacementCount = Annotated[
+    int,
     Field(
-        min_length=1,
-        description=(
-            "Exact source fragment from this file's latest temporary working copy. "
-            "After a successful edit, use new content and line numbers for further edits."
-        ),
+        ge=1,
+        strict=True,
+        description="Number of complete lines to replace, including blank lines; not the ending line number.",
     ),
 ]
 
 
-class FileReplacement(AdaptiveLineReplacement):
-    path: FilePath
-    old_text: ReplacementSource
-
-
 class IneffectiveReplacementError(ValueError):
-    """An unchanged or already acknowledged edit that needs no source reread."""
+    """A range replacement that leaves the working copy unchanged."""
+
+
+class _FileContents(Mapping[str, str]):
+    def __init__(self, paths: Mapping[str, Path]) -> None:
+        self.paths = dict(paths)
+
+    def __getitem__(self, path: str) -> str:
+        with self.paths[path].open(encoding="utf-8", newline="\n") as source:
+            return source.read()
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.paths)
+
+    def __len__(self) -> int:
+        return len(self.paths)
 
 
 class TemporaryFileTools:
@@ -52,30 +57,35 @@ class TemporaryFileTools:
     Each successful operation changes the temporary file immediately. Subsequent
     reads and edits use its new content and revision. No edit queue is retained.
     Use as a context manager to clean up on success, failure or cancellation.
+    String values create owned copies; Path values bind existing caller-owned
+    temporary files directly. Closing removes only owned files and snapshots.
     """
 
     def __init__(
         self,
-        files: Mapping[str, str],
+        files: Mapping[str, str | Path],
         *,
         directory: Path = Path(".cache"),
         validate: Callable[[State, str, str], Awaitable[None]] | None = None,
-        replacement_error: Callable[[FileReplacement, ValueError], str] | None = None,
     ) -> None:
-        self.originals = dict(files)
         self.validate = validate
-        self.replacement_error = replacement_error
         self.written: set[str] = set()
-        self._last_replacements: dict[str, tuple[str, str, bool]] = {}
         self.recovery_path: str | None = None
         directory.mkdir(parents=True, exist_ok=True)
         self._directory = TemporaryDirectory(prefix="tiny-coder-", dir=directory)
         self.root = Path(self._directory.name)
         # Logical paths may be virtual. Never use them as filesystem paths.
-        self._paths = {path: self.root / f"{i}.txt" for i, path in enumerate(files)}
+        self._paths = {
+            path: content if isinstance(content, Path) else self.root / f"{i}.txt"
+            for i, (path, content) in enumerate(files.items())
+        }
+        originals = {path: self.root / f"{i}.original" for i, path in enumerate(files)}
         try:
             for path, content in files.items():
-                self._write(path, content)
+                if not isinstance(content, Path):
+                    self._write(path, content)
+                copyfile(self._paths[path], originals[path])
+            self.originals: Mapping[str, str] = _FileContents(originals)
         except BaseException:
             self.close()
             raise
@@ -113,100 +123,106 @@ class TemporaryFileTools:
         with self._paths[path].open("w", encoding="utf-8", newline="\n") as target:
             target.write(content)
 
-    async def _accept(self, state: State, path: str, content: str) -> str:
+    async def _accept(
+        self, state: State, path: str, content: str, *, start: int = 1, removed: int | None = None
+    ) -> str:
         source = self.read(path)
         if self.validate is not None:
             await self.validate(state, path, content)
         self._write(path, content)
-        self._last_replacements.pop(path, None)
         self.written.add(path)
         self.recovery_path = None
         # An edit of a fully read source is known to the model from its arguments.
         acknowledge_context_write(state, path, source, content)
-        return self._result(path, changed=source != content)
+        return self._result(
+            path,
+            changed=source != content,
+            start=start,
+            removed=len(text_lines(source)) if removed is None else removed,
+            line_delta=len(text_lines(content)) - len(text_lines(source)),
+        )
 
-    def _result(self, path: str, *, changed: bool, already_applied: bool = False) -> str:
+    def _result(
+        self, path: str, *, changed: bool, start: int, removed: int, line_delta: int
+    ) -> str:
         content = self.read(path)
+        total_lines = len(text_lines(content))
+        added = removed + line_delta
+        context_start = max(1, start + added - 2)
+        context_end = min(total_lines, start + added + 1)
         result = {
             "path": path,
             "applied": True,
             "temporary": True,
             "changed": changed,
             "revision": text_revision(content),
-            "total_lines": len(text_lines(content)),
+            "total_lines": total_lines,
             "chars": len(content),
+            "edit": {
+                "start_line": start,
+                "removed_lines": removed,
+                "added_lines": added,
+                "line_delta": line_delta,
+                "following_old_line": start + removed,
+                "following_new_line": start + added,
+            },
+            "context": {
+                "start_line": context_start,
+                "end_line": context_end,
+                "content": numbered_text(content, start_line=context_start, end_line=context_end),
+            },
         }
-        if already_applied:
-            result["already_applied"] = True
-            result["next_action"] = (
-                "This exact operation already succeeded on the current working copy. "
-                "Do not repeat it. Use the latest content and line numbers for remaining "
-                "changes, or submit_result if the task is complete."
-            )
         return json.dumps(
             result,
             ensure_ascii=False,
         )
 
-    async def replace_lines(
+    async def replace_range(
         self,
         state: State,
         path: FilePath,
         old_start: ReplacementStart,
         old_count: ReplacementCount,
-        old_text: ReplacementSource,
         new_text: str,
+        expected_revision: FileRevision,
     ) -> str:
-        """Replace one fragment in the latest temporary working copy.
+        """Replace complete lines at an exact revision and return bounded updated context.
 
-        Success changes that copy immediately; subsequent edits use its new
-        content and line numbers. Original files remain unchanged.
+        Use line numbers and revision from the latest read or successful edit.
+        The result maps the following old line to its new position via line_delta.
+        Stale revisions and out-of-bounds ranges never change the working copy.
         """
-        proposal = FileReplacement(
-            path=path,
-            old_start=old_start,
-            old_count=old_count,
-            old_text=old_text,
-            new_text=new_text,
-        )
         source = self.read(path)
-        signature = text_revision(proposal.model_dump_json())
-        try:
-            previous = self._last_replacements.get(path)
-            if previous is not None and previous[:2] == (signature, text_revision(source)):
-                if previous[2]:
-                    raise IneffectiveReplacementError(
-                        "this exact operation already succeeded and was acknowledged; "
-                        "repeating it does not change the working copy"
-                    )
-                self._last_replacements[path] = (*previous[:2], True)
-                return self._result(path, changed=False, already_applied=True)
-            updated = apply_line_replacements(source, [proposal])
-            if updated == source:
-                raise IneffectiveReplacementError(
-                    "replacement leaves the working copy unchanged; "
-                    "old_text and new_text must produce an actual change"
-                )
-        except ValueError as error:
-            if not isinstance(error, IneffectiveReplacementError):
-                self.recovery_path = path
-            if self.replacement_error is not None:
-                return "error: " + self.replacement_error(proposal, error)
-            if isinstance(error, IneffectiveReplacementError):
-                return (
-                    f"error: replace_lines {path}: {error}. No temporary content changed. "
-                    "Do not resend this operation or reread the unchanged source. "
-                    "Rewrite new_text to implement the remaining task, choose another "
-                    "pending edit, or call submit_result if the task is complete."
-                )
-            return (
-                f"error: replace_lines {path}: {error}. No temporary content changed. "
-                "Read this file's latest working copy and correct the source and line "
-                "range; if the intended content is already present, omit this edit."
+        lines = text_lines(source)
+        if expected_revision != text_revision(source):
+            self.recovery_path = path
+            raise ValueError(
+                f"replace_range {path}: expected_revision is stale. Read {path} near "
+                f"line {old_start} and use its latest revision and line numbers. "
+                "No change applied; earlier successful edits remain."
             )
-        result = await self._accept(state, path, updated)
-        self._last_replacements[path] = (signature, text_revision(updated), False)
-        return result
+        if old_start < 1 or old_count < 1 or old_start + old_count - 1 > len(lines):
+            self.recovery_path = path
+            raise ValueError(
+                f"replace_range {path}: requested start={old_start}, count={old_count}; "
+                f"use a complete range within lines 1..{len(lines)}. Read {path} near "
+                "the intended section and correct the range. No change applied."
+            )
+        replacement = new_text
+        if replacement and lines[old_start + old_count - 2].endswith("\n"):
+            replacement = replacement.rstrip("\n") + "\n"
+        updated = (
+            "".join(lines[: old_start - 1])
+            + replacement
+            + "".join(lines[old_start + old_count - 1 :])
+        )
+        if updated == source:
+            raise IneffectiveReplacementError(
+                f"replace_range {path}: lines {old_start}..{old_start + old_count - 1} "
+                "already contain new_text. Omit this edit; continue pending edits or "
+                "submit_result if finished. No change applied."
+            )
+        return await self._accept(state, path, updated, start=old_start, removed=old_count)
 
     async def insert_text(
         self,
@@ -240,7 +256,11 @@ class TemporaryFileTools:
             prefix += "\n"
         inserted = content if content.endswith("\n") else content + "\n"
         return await self._accept(
-            state, path, prefix + inserted + "".join(lines[before_line - 1 :])
+            state,
+            path,
+            prefix + inserted + "".join(lines[before_line - 1 :]),
+            start=before_line,
+            removed=0,
         )
 
     async def write_file(

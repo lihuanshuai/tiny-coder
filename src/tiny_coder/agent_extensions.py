@@ -9,6 +9,7 @@ from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import NoReturn, TypedDict, TypeVar
 
+from httpx import TransportError
 from jinja2 import Template
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from pydantic import BaseModel, ValidationError
@@ -464,7 +465,9 @@ class CallRecording(AgentExtension):
                 "attempt": call.attempt,
                 "model": call.llm_config.llm_model,
                 "status": status,
-                "error": str(call.error) if call.error is not None else None,
+                "error": (str(call.error).strip() or error_type)
+                if call.error is not None
+                else None,
                 "error_type": error_type,
                 "retry": call.retry,
                 "timing": {
@@ -685,9 +688,16 @@ class RetryPolicy(AgentExtension):
 
     async def retry(self, call: AgentCall) -> None:
         error = call.error
-        detail = str(error)
+        detail = str(error).strip() or type(error).__name__
         if isinstance(
-            error, (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError)
+            error,
+            (
+                APIConnectionError,
+                APITimeoutError,
+                InternalServerError,
+                RateLimitError,
+                TransportError,
+            ),
         ):
             failure = "LLM call failed"
         elif isinstance(error, (ValueError, OSError)):

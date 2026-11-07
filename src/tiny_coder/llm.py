@@ -341,6 +341,7 @@ async def stream_llm_chat(
     messages: Sequence[Mapping[str, Any]],
     tools: Sequence[object] | None = None,
     tool_choice: ToolChoice | None = None,
+    parallel_tool_calls: bool | None = None,
     response_format: dict[str, Any] | None = None,
     on_chunk: Callable[[str], Awaitable[None]] | None = None,
     on_tool_chunk: Callable[[ToolCallDelta], Awaitable[None]] | None = None,
@@ -391,6 +392,8 @@ async def stream_llm_chat(
             kwargs['max_output_tokens'] = llm_cfg.max_output_tokens
         if tools is not None:
             kwargs['tools'] = [tool_openai_spec(tool) for tool in tools]
+            if parallel_tool_calls is not None:
+                kwargs['parallel_tool_calls'] = parallel_tool_calls
             if isinstance(tool_choice, dict):
                 selected = tool_choice['name']
                 kwargs['tools'] = [tool for tool in kwargs['tools'] if tool['name'] == selected]

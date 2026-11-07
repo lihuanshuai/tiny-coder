@@ -5,10 +5,10 @@ import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import cached_property
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Annotated, TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from tiny_coder.agent_extensions import ResponseValidationError
 from tiny_coder.eventbus import EventBus
@@ -25,15 +25,28 @@ from tiny_coder.tool_node import Tool, tool
 
 
 class ContextFile(BaseModel):
-    """An explicitly exposed snapshot; tools never access the filesystem themselves."""
+    """An allowlisted snapshot or file, read afresh for each tool operation."""
 
     model_config = ConfigDict(extra="forbid")
 
     path: str
-    content: str
+    content: str = ""
+    source: Path | None = None
     description: str = ""
     writable: bool = False
     required: bool = False
+
+    @model_validator(mode="after")
+    def validate_source(self) -> ContextFile:
+        if self.source is not None and self.content:
+            raise ValueError("use either source or content, not both")
+        return self
+
+    def read(self) -> str:
+        if self.source is None:
+            return self.content
+        with self.source.open(encoding="utf-8", newline="\n") as stream:
+            return stream.read()
 
 
 class _ReadRecord(TypedDict):
@@ -90,11 +103,23 @@ def acknowledge_context_write(state: State, path: str, before: str, after: str) 
         reads[path] = {"revision": text_revision(after), "ranges": [[1, total]] if total else []}
 
 
+def unread_context_paths(state: State, files: Sequence[ContextFile]) -> list[str]:
+    """Return paths with missing lines at their current source revision."""
+    reads: dict[str, _ReadRecord] = state.get("context_reads", {})
+    missing = []
+    for file in files:
+        path = _path(file.path)
+        content = file.read()
+        if not _read_complete(reads.get(path), text_revision(content), len(text_lines(content))):
+            missing.append(path)
+    return missing
+
+
 @dataclass
 class ContextTools(AgentExtension):
     """Load allowlisted, invocation-local snapshots through actual tool messages.
 
-    A provider may publish a newer in-memory draft after validation. Required files
+    A provider may expose a file updated by editing tools. Required files
     must be read at their current revision before final output can be accepted.
     Reading disjoint ranges is supported; grep never satisfies this requirement.
     """
@@ -138,8 +163,9 @@ class ContextTools(AgentExtension):
 
         key = f"context_tools:{id(self)}"
         reader = call.invocation_data.get(key)
-        if not isinstance(reader, _ContextReader):
-            reader = _ContextReader(self, call)
+        paths = list(self._files(call))
+        if not isinstance(reader, _ContextReader) or reader.paths != paths:
+            reader = _ContextReader(self, call, paths)
             call.invocation_data[key] = reader
         else:
             reader.call = call
@@ -161,19 +187,23 @@ class ContextTools(AgentExtension):
                 ):
                     call.tool_choice = {"type": "function", "name": SUBMIT_RESULT}
 
-        call.register_tools(*reader.tools, replace=True)
+        definitions = [
+            configured
+            for definition in reader.tools
+            if (configured := self.configure_tool(call, definition)) is not None
+        ]
+        names = {definition.name for definition in reader.tools}
+        call.tools = [definition for definition in call.tools if definition.name not in names]
+        call.register_tools(*definitions, replace=True)
+
+    def configure_tool(self, call: AgentCall, definition: Tool[..., str]) -> Tool[..., str] | None:
+        """Constrain a context tool for this call, or return None to disable it."""
+        return definition
 
     def _missing(self, call: AgentCall) -> list[str]:
-        reads: dict[str, _ReadRecord] = call.state.get("context_reads", {})
-        missing: list[str] = []
-        for path, file in self._files(call).items():
-            if not file.required:
-                continue
-            if not _read_complete(
-                reads.get(path), text_revision(file.content), len(text_lines(file.content))
-            ):
-                missing.append(path)
-        return missing
+        return unread_context_paths(
+            call.state, [file for file in self._files(call).values() if file.required]
+        )
 
     async def check_reads(self, call: AgentCall) -> None:
         assert call.outcome is not None
@@ -193,20 +223,31 @@ class ContextTools(AgentExtension):
 class _ContextReader:
     context: ContextTools
     call: AgentCall
+    paths: list[str]
 
     @cached_property
     def tools(self) -> list[Tool[..., str]]:
-        return [
-            tool(handler)
-            for handler in (self.list_files, self.read_file, self.read_required, self.grep)
-        ]
+        definitions = []
+        for handler in (self.list_files, self.read_file, self.read_required, self.grep):
+            if handler == self.read_file and not self.paths:
+                continue
+            definition = tool(handler)
+            if handler == self.read_file:
+                definition = definition.with_parameters(path={"type": "string", "enum": self.paths})
+            elif handler == self.grep:
+                definition = definition.with_parameters(
+                    path={"type": "string", "enum": ["", *self.paths]}
+                )
+            definitions.append(definition)
+        return definitions
 
     def listing(self) -> str:
         reads: dict[str, _ReadRecord] = self.call.state.get("context_reads", {})
         files = []
         for path, file in self.context._files(self.call).items():
-            revision = text_revision(file.content)
-            total_lines = len(text_lines(file.content))
+            content = file.read()
+            revision = text_revision(content)
+            total_lines = len(text_lines(content))
             record = reads.get(path)
             ranges = (
                 _merge_ranges(record["ranges"])
@@ -248,16 +289,17 @@ class _ContextReader:
     ) -> str:
         file = self.context._file(self.call, path)
         canonical = _path(path)
-        lines = text_lines(file.content)
-        end = len(lines) if end_line is None else end_line
-        if end < start_line or start_line > len(lines) or end > len(lines):
-            if lines or start_line != 1 or end_line is not None:
-                raise ValueError(
-                    f"invalid line range {start_line}..{end}; {canonical} has {len(lines)} lines. "
-                    f"Set start_line and end_line within 1..{len(lines)} with end_line >= "
-                    "start_line, or use end_line=null to read to the end."
-                )
-        revision = text_revision(file.content)
+        content = file.read()
+        lines = text_lines(content)
+        end = len(lines) if end_line is None else min(end_line, len(lines))
+        if (end_line is not None and end_line < start_line) or start_line > max(1, len(lines)):
+            raise ValueError(
+                f"invalid line range {start_line}..{end_line}; "
+                f"{canonical} has {len(lines)} lines. "
+                f"Set start_line within 1..{max(1, len(lines))} with end_line >= "
+                "start_line, or use end_line=null to read to the end."
+            )
+        revision = text_revision(content)
         reads: dict[str, _ReadRecord] = state.setdefault("context_reads", {})
         record = reads.get(canonical)
         already_read = (
@@ -287,7 +329,7 @@ class _ContextReader:
                 "missing_ranges": _unread_ranges(record["ranges"], 1, len(lines)),
                 "already_read": already_read,
                 "content": "\n".join(
-                    numbered_text(file.content, start_line=first, end_line=last)
+                    numbered_text(content, start_line=first, end_line=last)
                     for first, last in returned
                 ),
             },
@@ -303,7 +345,8 @@ class _ContextReader:
     ) -> str:
         """Read requested snapshot lines, including previously read lines.
 
-        Line numbers are 1-based; end_line=null reads to the end. returned_ranges
+        Line numbers are 1-based; end_line=null reads to the end, and a larger
+        end_line stops at EOF. Copy path from the exposed catalog. returned_ranges
         identifies returned content; read_ranges covers all lines at this revision.
         Prefer earlier tool content when sufficient; reread a small range to repair anchors.
         """
@@ -330,8 +373,9 @@ class _ContextReader:
         )
         matches: list[dict[str, str | int]] = []
         for name, file in files.items():
-            revision = text_revision(file.content)
-            for number, line in grep_lines(file.content, regex):
+            content = file.read()
+            revision = text_revision(content)
+            for number, line in grep_lines(content, regex):
                 if len(matches) == max_matches:
                     return json.dumps({"matches": matches, "truncated": True}, ensure_ascii=False)
                 matches.append({"path": name, "line": number, "text": line, "revision": revision})
@@ -349,4 +393,4 @@ class _ContextReader:
         return json.dumps({"files": files, "unchanged": not files}, ensure_ascii=False)
 
 
-__all__ = ["ContextFile", "ContextTools"]
+__all__ = ["ContextFile", "ContextTools", "unread_context_paths"]

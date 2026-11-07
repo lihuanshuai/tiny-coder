@@ -122,6 +122,7 @@ class AgentCall:
     prepared_extensions: set[int] = field(default_factory=set, repr=False)
     submission_enabled: bool = True
     tool_choice: ToolChoice | None = None
+    parallel_tool_calls: bool | None = None
     call_id: str = field(default_factory=lambda: uuid4().hex)
     timing: CallTiming = field(default_factory=CallTiming)
     cancelled: bool = False
@@ -504,6 +505,7 @@ class StructuredAgent(Agent[StructuredInput, StructuredResult]):
             ],
             tools=tools or None,
             tool_choice=tool_choice,
+            parallel_tool_calls=call.parallel_tool_calls,
             response_format=None if tools else call.response_format,
             on_chunk=self._emit_chunk if self.events.has_subscribers(CHUNK_RECEIVED) else None,
             on_tool_chunk=self._emit_tool_chunk

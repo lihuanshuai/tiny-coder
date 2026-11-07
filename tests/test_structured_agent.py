@@ -165,11 +165,13 @@ def test_forced_submission_rejects_other_tools_without_executing_them(
 
     async def prepare(call: AgentCall) -> None:
         call.tool_choice = {"type": "function", "name": "submit_result"}
+        call.parallel_tool_calls = False
 
     async def llm(**kwargs: Any) -> LlmChatOutcome:
         nonlocal turns
         turns += 1
         assert kwargs["tool_choice"] == {"type": "function", "name": "submit_result"}
+        assert kwargs["parallel_tool_calls"] is False
         if turns == 2:
             feedback = json.loads(kwargs["messages"][-1]["content"])
             error = feedback["validation_errors"][0]

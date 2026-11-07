@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,7 +15,7 @@ from openai.types.responses import Response, ResponseStreamEvent
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from tiny_coder import llm as llm_module
-from tiny_coder.agent_extensions import StructuredOutput
+from tiny_coder.agent_extensions import CallRecording, StructuredOutput
 from tiny_coder.json_utils import JsonProtocolError
 from tiny_coder.llm import (
     IncompleteResponseError,
@@ -436,6 +437,19 @@ def test_text_format_and_native_named_tool_choice(monkeypatch: pytest.MonkeyPatc
     assert 'function' not in FakeResponses.kwargs['tools'][0]
 
 
+@pytest.mark.parametrize('parallel', [None, False, True])
+def test_parallel_tool_call_control_is_forwarded_only_when_set(
+    monkeypatch: pytest.MonkeyPatch, parallel: bool | None
+) -> None:
+    _patch(monkeypatch, [_terminal()])
+    definition = SimpleNamespace(name='edit', description='Edit', parameters={'type': 'object'})
+    _run(tools=[definition], parallel_tool_calls=parallel)
+    if parallel is None:
+        assert 'parallel_tool_calls' not in FakeResponses.kwargs
+    else:
+        assert FakeResponses.kwargs['parallel_tool_calls'] is parallel
+
+
 def test_named_tool_choice_rejects_unavailable_tool_before_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -729,7 +743,7 @@ def test_truncated_function_call_is_rejected_as_retryable_protocol_error(
         'type': 'function_call',
         'id': 'fc_1',
         'call_id': 'call_1',
-        'name': 'replace_lines',
+        'name': 'replace_range',
         'arguments': '{"path":',
     }
     _patch(
@@ -748,12 +762,12 @@ def test_truncated_function_call_is_rejected_as_retryable_protocol_error(
         IncompleteResponseError, match='max_output_tokens.*tool calls rejected'
     ) as error:
         _run(
-            tools=[SimpleNamespace(name='replace_lines', parameters={'type': 'object'})],
-            tool_choice={'type': 'function', 'name': 'replace_lines'} if named_only else 'required',
+            tools=[SimpleNamespace(name='replace_range', parameters={'type': 'object'})],
+            tool_choice={'type': 'function', 'name': 'replace_range'} if named_only else 'required',
         )
     assert error.value.reason == 'max_output_tokens'
     assert error.value.max_output_tokens == 8192
-    assert error.value.tool_names == ('replace_lines',)
+    assert error.value.tool_names == ('replace_range',)
 
 
 def test_missing_usage_remains_zero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -910,3 +924,112 @@ def test_agent_loop_uses_native_responses_over_sdk_transport(
     assert result.output == _SummaryOutput(summary='record-13')
     assert len(requests) == 2
     assert chunks == ['Calling the tool.', 'Calling the tool.']
+
+
+@pytest.mark.parametrize('recovers', [False, True])
+def test_agent_retries_interrupted_sdk_stream_without_replaying_tools(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, recovers: bool
+) -> None:
+    class Edit(BaseModel):
+        text: str
+
+    requests: list[dict[str, Any]] = []
+    clients: list[AsyncOpenAI] = []
+    streams: list[httpx.AsyncByteStream] = []
+    applied: list[str] = []
+
+    class InterruptedStream(httpx.AsyncByteStream):
+        closed = False
+
+        def __init__(self, request: httpx.Request) -> None:
+            self.request = request
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            events = [
+                {
+                    'type': 'response.output_item.added',
+                    'sequence_number': 0,
+                    'output_index': 0,
+                    'item': {
+                        'type': 'function_call',
+                        'id': 'fc_partial',
+                        'call_id': 'call_partial',
+                        'name': 'edit',
+                        'arguments': '',
+                    },
+                },
+                {
+                    'type': 'response.function_call_arguments.delta',
+                    'sequence_number': 1,
+                    'output_index': 0,
+                    'item_id': 'fc_partial',
+                    'delta': '{"text":"unfinished',
+                },
+            ]
+            for event in events:
+                yield f'event: {event["type"]}\ndata: {json.dumps(event)}\n\n'.encode()
+            raise httpx.ReadError('', request=self.request)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    async def edit(state: State, text: str) -> str:
+        applied.append(text)
+        return 'saved'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 2 or (len(requests) == 3 and not recovers):
+            stream = InterruptedStream(request)
+            streams.append(stream)
+            return httpx.Response(200, headers={'Content-Type': 'text/event-stream'}, stream=stream)
+        assert len(requests) in (1, 3)
+        item = {
+            'type': 'function_call',
+            'id': f'fc_{len(requests)}',
+            'call_id': f'call_{len(requests)}',
+            'name': 'edit' if len(requests) == 1 else 'submit_result',
+            'arguments': '{"text":"complete"}' if len(requests) == 1 else '{"summary":"saved"}',
+        }
+        event = _terminal(_response(output=[item])).model_dump(mode='json')
+        return httpx.Response(
+            200,
+            headers={'Content-Type': 'text/event-stream'},
+            text='event: response.completed\ndata: ' + json.dumps(event) + '\n\n',
+        )
+
+    def client(**kwargs: Any) -> AsyncOpenAI:
+        instance = AsyncOpenAI(
+            **kwargs,
+            max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        clients.append(instance)
+        return instance
+
+    monkeypatch.setattr(llm_module, 'AsyncOpenAI', client)
+    log_path = tmp_path / 'session.jsonl'
+    agent = create_structured_agent(
+        llm_config=SampleOpenAIConfig(),
+        response_model=_SummaryOutput,
+        tools=[Tool.from_model(Edit, edit, name='edit')],
+        max_attempts=2,
+        extensions=(StructuredOutput(), CallRecording(log_path)),
+    )
+    if recovers:
+        result = asyncio.run(agent.invoke(StructuredInput(prompt='Edit once, then summarize.')))
+        assert result.output == _SummaryOutput(summary='saved')
+    else:
+        with pytest.raises(RuntimeError, match='LLM call failed after 2 attempt\\(s\\): ReadError'):
+            asyncio.run(agent.invoke(StructuredInput(prompt='Edit once, then summarize.')))
+    assert applied == ['complete']
+    assert len(requests) == 3
+    assert requests[1]['input'] == requests[2]['input']
+    assert all(instance.is_closed() for instance in clients)
+    assert all(isinstance(stream, InterruptedStream) and stream.closed for stream in streams)
+    with log_path.open(encoding='utf-8', newline='\n') as file:
+        failures = [event for line in file if (event := json.loads(line))['event'] == 'failure']
+    assert [event['status'] for event in failures] == (
+        ['retry'] if recovers else ['retry', 'failed']
+    )
+    assert all(event['error_type'] == event['error'] == 'ReadError' for event in failures)

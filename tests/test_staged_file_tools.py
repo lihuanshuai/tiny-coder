@@ -12,8 +12,6 @@ from tiny_coder.context_tools import acknowledge_context_write
 from tiny_coder.line_edit import text_revision
 from tiny_coder.llm import LlmChatOutcome, ToolCall
 from tiny_coder.staged_file_tools import (
-    FileReplacement,
-    IneffectiveReplacementError,
     TemporaryFileTools,
 )
 from tiny_coder.state import State
@@ -31,7 +29,7 @@ def bind(workspace: TemporaryFileTools, operation: str) -> Tool[..., str]:
     parameters: dict[str, dict[str, Any]] = {
         "path": {"type": "string", "enum": list(workspace.originals)}
     }
-    if operation != "replace_lines":
+    if operation != "replace_range":
         parameters["expected_revision"] = {
             "type": "string",
             "enum": list(
@@ -46,13 +44,15 @@ def invoke(tool: Tool[..., str], state: State, **arguments: object) -> str:
 
 
 def edit(old: str, new: str, *, path: str = "one.md", start: int = 1) -> dict[str, object]:
-    return dict(path=path, old_start=start, old_count=1, old_text=old, new_text=new)
+    return dict(
+        path=path, old_start=start, old_count=1, expected_revision=text_revision(old), new_text=new
+    )
 
 
 def test_native_async_methods_edit_and_preserve_failed_write_progress(tmp_path: Path) -> None:
     async def run() -> None:
         with TemporaryFileTools({"one.md": "first\n"}, directory=tmp_path / ".cache") as workspace:
-            await workspace.replace_lines({}, "one.md", 1, 1, "first", "FIRST")
+            await workspace.replace_range({}, "one.md", 1, 1, "FIRST", text_revision("first\n"))
             revision = text_revision(workspace.read("one.md"))
             await workspace.insert_text({}, "one.md", 2, "second", revision)
             assert workspace.read("one.md") == "FIRST\nsecond\n"
@@ -69,17 +69,176 @@ def test_native_async_methods_edit_and_preserve_failed_write_progress(tmp_path: 
     asyncio.run(run())
 
 
+def test_bound_paths_edit_existing_files_and_keep_original_snapshots_on_disk(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "draft.md"
+    path.write_text("first\n", encoding="utf-8", newline="\n")
+
+    async def run() -> None:
+        with TemporaryFileTools({"draft.md": path}, directory=tmp_path / ".cache") as workspace:
+            assert workspace.originals["draft.md"] == "first\n"
+            path.write_text("external\n", encoding="utf-8", newline="\n")
+            assert workspace.read("draft.md") == "external\n"
+            await workspace.replace_range(
+                {}, "draft.md", 1, 1, "updated", text_revision("external\n")
+            )
+            assert path.read_text(encoding="utf-8") == "updated\n"
+            assert workspace.originals["draft.md"] == "first\n"
+            assert workspace.changes() == {"draft.md": "updated\n"}
+            root = workspace.root
+        assert not root.exists()
+        assert path.read_text(encoding="utf-8") == "updated\n"
+
+    asyncio.run(run())
+
+
+def test_replace_range_uses_latest_revision_and_preserves_neighboring_lines(tmp_path: Path) -> None:
+    async def run() -> None:
+        source = "# Heading\n\nold\n\n## Next\nkeep\n"
+        with TemporaryFileTools({"one.md": source}, directory=tmp_path) as workspace:
+            result = json.loads(
+                await workspace.replace_range(
+                    {}, "one.md", 3, 1, "new\nextra", text_revision(source)
+                )
+            )
+            assert workspace.read("one.md") == "# Heading\n\nnew\nextra\n\n## Next\nkeep\n"
+            assert result["total_lines"] == 7
+            await workspace.replace_range({}, "one.md", 4, 1, "revised", result["revision"])
+            assert workspace.read("one.md").endswith("new\nrevised\n\n## Next\nkeep\n")
+            assert workspace.originals["one.md"] == source
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("replacement", ["expanded\nextra\nthird", "", "revised"])
+def test_edit_result_locates_following_target_after_line_shift(
+    tmp_path: Path, replacement: str
+) -> None:
+    async def run() -> None:
+        source = "heading\nfirst\n\nsecond\nkeep\n"
+        with TemporaryFileTools({"one.md": source}, directory=tmp_path) as workspace:
+            result = json.loads(
+                await workspace.replace_range(
+                    {}, "one.md", 2, 1, replacement, text_revision(source)
+                )
+            )
+            delta = len(replacement.splitlines()) - 1
+            assert result["edit"]["line_delta"] == delta
+            assert result["edit"]["following_old_line"] == 3
+            assert result["edit"]["following_new_line"] == 3 + delta
+            target = 4 + result["edit"]["line_delta"]
+            assert f"{target}: second" in result["context"]["content"]
+            await workspace.replace_range({}, "one.md", target, 1, "SECOND", result["revision"])
+            assert workspace.read("one.md").endswith("\nSECOND\nkeep\n")
+            assert "second" not in workspace.read("one.md")
+
+    asyncio.run(run())
+
+
+def test_insert_result_and_empty_deletion_report_bounded_context(tmp_path: Path) -> None:
+    async def run() -> None:
+        with TemporaryFileTools({"one.md": "tail"}, directory=tmp_path) as workspace:
+            result = json.loads(
+                await workspace.insert_text(
+                    {},
+                    "one.md",
+                    1,
+                    "\n".join(f"new {i}" for i in range(100)),
+                    text_revision("tail"),
+                )
+            )
+            assert result["edit"]["added_lines"] == 100
+            assert result["edit"]["line_delta"] == 100
+            assert result["context"]["content"].endswith("101: tail")
+            assert len(result["context"]["content"].splitlines()) <= 4
+            result = json.loads(
+                await workspace.replace_range({}, "one.md", 1, 101, "", result["revision"])
+            )
+            assert workspace.read("one.md") == ""
+            assert result["edit"]["added_lines"] == 0
+            assert result["context"]["content"] == ""
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["stale", "bounds", "unchanged", "validation"])
+def test_rejected_range_edit_preserves_successful_progress(tmp_path: Path, failure: str) -> None:
+    async def run() -> None:
+        with TemporaryFileTools({"one.md": "first\nsecond\n"}, directory=tmp_path) as workspace:
+            original_revision = text_revision(workspace.read("one.md"))
+            result = json.loads(
+                await workspace.replace_range({}, "one.md", 1, 1, "FIRST", original_revision)
+            )
+            source = workspace.read("one.md")
+
+            async def reject(state: State, path: str, content: str) -> None:
+                raise ValueError("domain rejected")
+
+            if failure == "validation":
+                workspace.validate = reject
+            with pytest.raises(
+                ValueError,
+                match={
+                    "stale": "latest revision",
+                    "bounds": "within lines 1..2",
+                    "unchanged": "Omit this edit",
+                    "validation": "domain rejected",
+                }[failure],
+            ):
+                await workspace.replace_range(
+                    {},
+                    "one.md",
+                    2,
+                    3 if failure == "bounds" else 1,
+                    "second" if failure == "unchanged" else "SECOND",
+                    original_revision if failure == "stale" else result["revision"],
+                )
+            assert workspace.read("one.md") == source
+            assert workspace.changes() == {"one.md": source}
+            assert workspace.recovery_path == ("one.md" if failure in {"stale", "bounds"} else None)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("invalid", [{"old_count": 0}, {"old_start": True}, {"path": "../one.md"}])
+def test_range_tool_rejects_invalid_arguments_before_editing(
+    tmp_path: Path, invalid: dict[str, object]
+) -> None:
+    with TemporaryFileTools({"one.md": "keep\n"}, directory=tmp_path) as workspace:
+        definition = bind(workspace, "replace_range")
+        assert definition.parameters["properties"]["old_count"]["minimum"] == 1
+        result = invoke(
+            definition,
+            {},
+            **{
+                "path": "one.md",
+                "old_start": 1,
+                "old_count": 1,
+                "new_text": "changed",
+                "expected_revision": text_revision(workspace.read("one.md")),
+                **invalid,
+            },
+        )
+        assert result.startswith("error:")
+        assert workspace.read("one.md") == "keep\n" and not workspace.written
+
+
 def test_sequential_replacements_use_latest_content_and_shifted_lines(tmp_path: Path) -> None:
     path = tmp_path / "one.md"
     path.write_text("first\nsecond\n", encoding="utf-8", newline="\n")
     with TemporaryFileTools({"one.md": "first\nsecond\n"}) as workspace:
         root = workspace.root
-        tool = bind(workspace, "replace_lines")
         state: State = {}
-        first = json.loads(invoke(tool, state, **edit("first", "FIRST\ninserted")))
-        assert first["applied"] and first["temporary"] and first["total_lines"] == 3
-        invoke(tool, state, **edit("second", "SECOND", start=3))
-        invoke(tool, state, **edit("inserted", "revised", start=2))
+        for start, new in [(1, "FIRST\ninserted"), (3, "SECOND"), (2, "revised")]:
+            result = json.loads(
+                invoke(
+                    bind(workspace, "replace_range"),
+                    state,
+                    **edit(workspace.read("one.md"), new, start=start),
+                )
+            )
+            assert result["applied"] and result["temporary"] and result["total_lines"] == 3
         assert workspace.changes() == {"one.md": "FIRST\nrevised\nSECOND\n"}
         assert path.read_text(encoding="utf-8") == workspace.originals["one.md"]
         assert not state
@@ -172,91 +331,65 @@ def test_custom_cache_cleanup_preserves_other_tasks_and_files(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize("new", ["first\ninserted", "", "FIRST"])
-def test_identical_retry_acknowledges_success_without_reapplying(new: str) -> None:
-    with TemporaryFileTools({"one.md": "first\nsecond\n"}) as workspace:
-        proposal = edit("first", new)
-        tool = bind(workspace, "replace_lines")
-        first = json.loads(invoke(tool, {}, **proposal))
+def test_repeated_range_edit_with_old_revision_is_rejected(new: str) -> None:
+    source = "first\nsecond\n"
+    with TemporaryFileTools({"one.md": source}) as workspace:
+        proposal = edit(source, new)
+        first = json.loads(invoke(bind(workspace, "replace_range"), {}, **proposal))
         saved = workspace.read("one.md")
-        # Schemas and tool handlers are recreated every model turn.
-        retry = json.loads(invoke(bind(workspace, "replace_lines"), {}, **proposal))
-        assert retry["already_applied"] and not retry["changed"]
-        assert retry["revision"] == first["revision"]
-        assert "Do not repeat" in retry["next_action"]
-        assert workspace.read("one.md") == saved
         for _ in range(2):
-            repeated = invoke(bind(workspace, "replace_lines"), {}, **proposal)
-            assert (
-                repeated.startswith("error:")
-                and "already succeeded and was acknowledged" in repeated
-            )
-            assert "submit_result" in repeated
+            repeated = invoke(bind(workspace, "replace_range"), {}, **proposal)
+            assert repeated.startswith("error:") and "stale" in repeated
             assert workspace.read("one.md") == saved
-            assert workspace.recovery_path is None
+            assert first["revision"] == text_revision(saved)
+            assert workspace.recovery_path == "one.md"
 
 
-@pytest.mark.parametrize("old,new", [("first", "first"), ("first", "first\n")])
-def test_unchanged_replacement_is_rejected_without_writing_or_forcing_reread(
-    old: str, new: str
-) -> None:
+@pytest.mark.parametrize("new", ["first", "first\n"])
+def test_unchanged_range_is_rejected_without_writing_or_forcing_reread(new: str) -> None:
     async def validate(state: State, path: str, content: str) -> None:
         pytest.fail("an unchanged replacement must not reach candidate validation")
 
-    def feedback(proposal: FileReplacement, error: ValueError) -> str:
-        assert isinstance(error, IneffectiveReplacementError)
-        return f"{proposal.path}: no actual change; rewrite new_text or submit_result"
-
-    with TemporaryFileTools({"one.md": "first\nsecond\n"}, validate=validate) as workspace:
-        error = invoke(bind(workspace, "replace_lines"), {}, **edit(old, new))
-        assert error.startswith("error:") and "unchanged" in error
-        assert "Rewrite new_text" in error and "submit_result" in error
-        workspace.replacement_error = feedback
-        error = invoke(bind(workspace, "replace_lines"), {}, **edit(old, new))
-        assert error == "error: one.md: no actual change; rewrite new_text or submit_result"
+    source = "first\nsecond\n"
+    with TemporaryFileTools({"one.md": source}, validate=validate) as workspace:
+        error = invoke(bind(workspace, "replace_range"), {}, **edit(source, new))
+        assert error.startswith("error:") and "already contain new_text" in error
+        assert "Omit this edit" in error and "submit_result" in error
         assert workspace.recovery_path is None
         assert not workspace.written and not workspace.changes()
-        assert workspace.read("one.md") == "first\nsecond\n"
+        assert workspace.read("one.md") == source
 
 
-def test_later_writes_and_distinct_ranges_are_not_mistaken_for_retries() -> None:
+def test_same_text_on_distinct_lines_requires_each_latest_revision() -> None:
     with TemporaryFileTools({"one.md": "first\nfirst\n"}) as workspace:
-        tool = bind(workspace, "replace_lines")
-        proposal = edit("first", "FIRST")
-        invoke(tool, {}, **proposal)
-        other = json.loads(invoke(tool, {}, **{**proposal, "old_start": 2}))
-        assert other["changed"] and not other.get("already_applied")
+        for start in (1, 2):
+            result = json.loads(
+                invoke(
+                    bind(workspace, "replace_range"),
+                    {},
+                    **edit(workspace.read("one.md"), "FIRST", start=start),
+                )
+            )
+            assert result["changed"]
         assert workspace.read("one.md") == "FIRST\nFIRST\n"
-        invoke(
-            bind(workspace, "write_file"),
-            {},
-            path="one.md",
-            content="first\nfirst\n",
-            expected_revision=text_revision("FIRST\nFIRST\n"),
-        )
-        reapplied = json.loads(invoke(tool, {}, **proposal))
-        assert reapplied["changed"] and not reapplied.get("already_applied")
 
 
-def test_rejections_preserve_progress_and_consumer_feedback() -> None:
+def test_rejections_preserve_progress_and_consumer_validation_feedback() -> None:
     async def validate(state: State, path: str, content: str) -> None:
         if "forbidden" in content:
             raise ValueError("forbidden content: preserve existing words")
 
-    def feedback(proposal: FileReplacement, error: ValueError) -> str:
-        return f"{proposal.path}:{proposal.old_start}: {error}; previous progress preserved"
-
-    with TemporaryFileTools(
-        {"one.md": "first\nsecond\n"}, validate=validate, replacement_error=feedback
-    ) as workspace:
-        tool = bind(workspace, "replace_lines")
-        invoke(tool, {}, **edit("first", "FIRST"))
+    with TemporaryFileTools({"one.md": "first\nsecond\n"}, validate=validate) as workspace:
+        invoke(bind(workspace, "replace_range"), {}, **edit(workspace.read("one.md"), "FIRST"))
         earlier = workspace.read("one.md")
-        error = invoke(tool, {}, **edit("missing", "different"))
-        assert error.startswith("error: one.md:1:") and "progress preserved" in error
+        error = invoke(bind(workspace, "replace_range"), {}, **edit("stale", "different"))
+        assert error.startswith("error:") and "earlier successful edits remain" in error
         assert workspace.recovery_path == "one.md"
-        assert "preserve existing words" in invoke(tool, {}, **edit("FIRST", "forbidden"))
+        assert "preserve existing words" in invoke(
+            bind(workspace, "replace_range"), {}, **edit(earlier, "forbidden")
+        )
         assert workspace.read("one.md") == earlier
-        invoke(tool, {}, **edit("second", "SECOND", start=2))
+        invoke(bind(workspace, "replace_range"), {}, **edit(earlier, "SECOND", start=2))
         assert workspace.recovery_path is None
 
 
@@ -295,11 +428,11 @@ def test_full_writes_require_latest_revision_and_validate_before_writing() -> No
             **{**arguments, "content": "revised", "expected_revision": text_revision("updated")},
         )
         assert workspace.changes() == {"one.md": "revised", "@output/summary.md": "summary"}
-        assert len(list(workspace.root.iterdir())) == 3
+        assert workspace.originals["one.md"] == "first"
         assert not (workspace.root / "@output").exists()
 
 
-@pytest.mark.parametrize("operation", ["write_file", "replace_lines"])
+@pytest.mark.parametrize("operation", ["write_file", "replace_range"])
 @pytest.mark.parametrize("invalid", ["../outside.md", "/absolute.md", "unknown.md"])
 def test_tools_reject_paths_outside_allowlist(operation: str, invalid: str) -> None:
     with TemporaryFileTools({"one.md": "first"}) as workspace:
@@ -338,14 +471,15 @@ def test_write_schema_enum_compatibility_and_extra_argument_rejection() -> None:
         {"old_start": True},
         {"old_count": -1},
         {"old_count": "1"},
-        {"old_text": ""},
+        {"expected_revision": ""},
+        {"old_text": "first"},
     ],
 )
 def test_inferred_replacement_constraints_reject_invalid_arguments(
     invalid: dict[str, object],
 ) -> None:
     with TemporaryFileTools({"one.md": "first"}) as workspace:
-        definition = bind(workspace, "replace_lines")
+        definition = bind(workspace, "replace_range")
         result = invoke(definition, {}, **{**edit("first", "updated"), **invalid})
         feedback = json.loads(result.removeprefix("error: invalid arguments: "))
         assert feedback["executed"] is False
@@ -389,7 +523,7 @@ def test_workspace_lifetime_spans_rounds_and_cleans_up_on_exit(
             )
             call.invocation_data["workspace"] = workspace
             roots.append(workspace.root)
-        call.tools.append(bind(workspace, "replace_lines"))
+        call.tools.append(bind(workspace, "replace_range"))
 
     async def llm(**kwargs: Any) -> LlmChatOutcome:
         call = calls[-1]
@@ -402,7 +536,7 @@ def test_workspace_lifetime_spans_rounds_and_cleans_up_on_exit(
                         id="edit",
                         type="function",
                         function={
-                            "name": "replace_lines",
+                            "name": "replace_range",
                             "arguments": json.dumps(edit("first", "updated")),
                         },
                     ),

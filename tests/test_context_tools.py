@@ -12,7 +12,7 @@ from test_structured_agent import SampleLlmConfig, _outcome
 
 from tiny_coder.agent_extensions import CallRecording, ResponseValidationError, StructuredOutput
 from tiny_coder.checkpoint import JsonCheckpointer
-from tiny_coder.context_tools import ContextFile, ContextTools
+from tiny_coder.context_tools import ContextFile, ContextTools, unread_context_paths
 from tiny_coder.graph import GraphError
 from tiny_coder.llm import LlmChatOutcome, ToolCall, tool_openai_spec
 from tiny_coder.structured_agent import (
@@ -21,10 +21,70 @@ from tiny_coder.structured_agent import (
     StructuredInput,
     create_structured_agent,
 )
+from tiny_coder.tool_node import Tool, tool
 
 
 class Answer(BaseModel):
     answer: str
+
+
+def test_tool_configuration_refreshes_constraints_and_removes_disabled_tools() -> None:
+    class ScopedContext(ContextTools):
+        def configure_tool(
+            self, call: AgentCall, definition: Tool[..., str]
+        ) -> Tool[..., str] | None:
+            if definition.name == "grep":
+                return None
+            if definition.name == "read_file":
+                paths = call.state["read_paths"]
+                return (
+                    definition.with_parameters(path={"type": "string", "enum": paths})
+                    if paths
+                    else None
+                )
+            return definition
+
+    async def finish() -> str:
+        return "done"
+
+    context = ScopedContext(
+        [
+            ContextFile(path="first.md", content="First"),
+            ContextFile(path="second.md", content="Second"),
+        ]
+    )
+    call = AgentCall(
+        state={"read_paths": ["first.md"]},
+        messages=[],
+        llm_config=SampleLlmConfig(),
+        system_prompt="",
+        attempt=1,
+        tools=[tool(finish)],
+    )
+
+    async def run() -> None:
+        await context.prepare(call)
+        reader = next(definition for definition in call.tools if definition.name == "read_file")
+        rejected = await reader.invoke(call.state, json.dumps({"path": "second.md"}))
+        assert '"executed": false' in rejected
+        assert "second.md" not in call.state.get("context_reads", {})
+        assert "First" in await reader.invoke(call.state, json.dumps({"path": "first.md"}))
+        call.state["read_paths"] = []
+        await context.prepare(call)
+        assert {definition.name for definition in call.tools} == {
+            "finish",
+            "list_files",
+            "read_required",
+        }
+        call.state["read_paths"] = ["second.md"]
+        await context.prepare(call)
+        enabled = next(definition for definition in call.tools if definition.name == "read_file")
+        assert enabled.model is reader.model
+        assert enabled.parameters["properties"]["path"]["enum"] == ["second.md"]
+        assert reader.parameters["properties"]["path"]["enum"] == ["first.md"]
+        assert "Second" in await enabled.invoke(call.state, json.dumps({"path": "second.md"}))
+
+    asyncio.run(run())
 
 
 def tool_call(name: str, **arguments: Any) -> ToolCall:
@@ -33,6 +93,67 @@ def tool_call(name: str, **arguments: Any) -> ToolCall:
         type="function",
         function={"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)},
     )
+
+
+def test_unread_paths_tracks_partial_reads_and_source_revisions(tmp_path: Path) -> None:
+    path = tmp_path / "draft.md"
+    path.write_text("First\nSecond\n", encoding="utf-8", newline="\n")
+    files = [
+        ContextFile(path="draft.md", source=path, required=True),
+        ContextFile(path="optional.md", content="Optional"),
+    ]
+    context = ContextTools(files)
+    call = AgentCall(
+        state={}, messages=[], llm_config=SampleLlmConfig(), system_prompt="", attempt=1
+    )
+
+    async def run() -> None:
+        await context.prepare(call)
+        read = next(tool for tool in call.tools if tool.name == "read_file")
+        assert unread_context_paths(call.state, files) == ["draft.md", "optional.md"]
+        await read.invoke(call.state, json.dumps({"path": "draft.md", "end_line": 1}))
+        assert unread_context_paths(call.state, files) == ["draft.md", "optional.md"]
+        await read.invoke(call.state, json.dumps({"path": "draft.md", "start_line": 2}))
+        assert unread_context_paths(call.state, files) == ["optional.md"]
+        await read.invoke(call.state, json.dumps({"path": "optional.md"}))
+        assert unread_context_paths(call.state, files) == []
+        path.write_text("Changed\n", encoding="utf-8", newline="\n")
+        assert unread_context_paths(call.state, files) == ["draft.md"]
+
+    asyncio.run(run())
+
+
+def test_file_context_reads_latest_disk_revision_across_stages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "draft.md"
+    path.write_text("first\n", encoding="utf-8", newline="\n")
+    file = ContextFile(path="draft.md", source=path, required=True)
+    reads: list[str] = []
+
+    async def llm(**kwargs: Any) -> LlmChatOutcome:
+        last = kwargs["messages"][-1]
+        if last.get("role") == "tool" and last.get("name") == "read_required":
+            data = json.loads(last["content"])
+            reads.append(data["files"][0]["content"])
+            return _outcome(tool_calls=(tool_call("submit_result", answer="read"),))
+        return _outcome(tool_calls=(tool_call("read_required"),))
+
+    monkeypatch.setattr("tiny_coder.structured_agent.stream_llm_chat", llm)
+
+    async def run() -> None:
+        for content in ("first\n", "second\n"):
+            path.write_text(content, encoding="utf-8", newline="\n")
+            agent = create_structured_agent(
+                llm_config=SampleLlmConfig(),
+                response_model=Answer,
+                extensions=(ContextTools([file]),),
+            )
+            await agent.invoke(StructuredInput(prompt="Read draft"))
+
+    asyncio.run(run())
+    assert reads == ["1: first", "1: second"]
+    assert file.content == ""
 
 
 @pytest.mark.parametrize("no_change_tool", ["list_files", "read_required"])
@@ -128,7 +249,7 @@ def test_catalog_refreshes_on_reads_and_source_changes_before_forcing_submission
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("path", ["", "first.md", "./first.md"])
+@pytest.mark.parametrize("path", ["", "first.md"])
 def test_grep_uses_a_strict_string_path_and_empty_searches_all_snapshots(path: str) -> None:
     call = AgentCall(
         state={}, messages=[], llm_config=SampleLlmConfig(), system_prompt="", attempt=1
@@ -394,7 +515,6 @@ def test_final_output_requires_complete_current_context(
         {"path": "unknown.md"},
         {"path": "note.md", "start_line": 3},
         {"path": "note.md", "start_line": 2, "end_line": 1},
-        {"path": "note.md", "end_line": 3},
         {"path": "note.md", "start_line": True},
     ],
 )
@@ -797,7 +917,7 @@ def test_required_reads_return_gaps_but_explicit_reads_return_the_requested_sour
         assert fill["missing_ranges"] == []
         assert fill["already_read"] is False
         assert fill["revision"] == first["revision"]
-        repeated = await invoke("read_file", path="./note.md", start_line=2, end_line=4)
+        repeated = await invoke("read_file", path="note.md", start_line=2, end_line=4)
         assert repeated["content"] == "2: second\n3: third\n4: fourth"
         assert repeated["already_read"] is True
         assert repeated["returned_ranges"] == [[2, 4]]
@@ -882,3 +1002,63 @@ def test_preparation_reuses_context_tools_and_reads_the_current_call() -> None:
         assert reply["files"][0]["content"] == "1: new"
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("content", ["first\nsecond", ""])
+def test_read_window_stops_at_eof_without_consuming_retry(content: str) -> None:
+    call = AgentCall(
+        state={}, messages=[], llm_config=SampleLlmConfig(), system_prompt="", attempt=1
+    )
+
+    async def run() -> None:
+        await ContextTools([ContextFile(path="note.md", content=content, required=True)]).prepare(
+            call
+        )
+        reader = next(tool for tool in call.tools if tool.name == "read_file")
+        reply = json.loads(
+            await reader.invoke(call.state, json.dumps({"path": "note.md", "end_line": 200}))
+        )
+        assert reply["content"] == ("1: first\n2: second" if content else "")
+        assert reply["end_line"] == reply["total_lines"] == (2 if content else 0)
+        assert reply["missing_ranges"] == []
+        assert reply["read_ranges"] == ([[1, 2]] if content else [])
+
+    asyncio.run(run())
+
+
+def test_context_path_schema_tracks_current_allowlist_and_rejects_invented_paths() -> None:
+    files = [ContextFile(path="chapters/brief/020.md", content="brief")]
+    context = ContextTools(lambda call: files)
+    call = AgentCall(
+        state={}, messages=[], llm_config=SampleLlmConfig(), system_prompt="", attempt=1
+    )
+
+    async def run() -> None:
+        await context.prepare(call)
+        reader = next(tool for tool in call.tools if tool.name == "read_file")
+        grep = next(tool for tool in call.tools if tool.name == "grep")
+        assert reader.parameters["properties"]["path"]["enum"] == ["chapters/brief/020.md"]
+        assert grep.parameters["properties"]["path"]["enum"] == ["", "chapters/brief/020.md"]
+        error = await reader.invoke(call.state, json.dumps({"path": "@chapters/brief/020.md"}))
+        assert error.startswith("error:")
+        assert "chapters/brief/020.md" in error
+        assert call.state.get("context_reads", {}) == {}
+        files[:] = [ContextFile(path="next.md", content="new")]
+        await context.prepare(call)
+        reader = next(tool for tool in call.tools if tool.name == "read_file")
+        assert reader.parameters["properties"]["path"]["enum"] == ["next.md"]
+        reply = json.loads(await reader.invoke(call.state, json.dumps({"path": "next.md"})))
+        assert reply["content"] == "1: new"
+
+    asyncio.run(run())
+
+
+def test_empty_context_catalog_does_not_expose_an_empty_path_enum() -> None:
+    call = AgentCall(
+        state={}, messages=[], llm_config=SampleLlmConfig(), system_prompt="", attempt=1
+    )
+    asyncio.run(ContextTools([]).prepare(call))
+    assert {tool.name for tool in call.tools} == {"list_files", "read_required", "grep"}
+    for definition in call.tools:
+        for field in definition.parameters.get("properties", {}).values():
+            assert field.get("enum") != []
